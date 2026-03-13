@@ -12,6 +12,10 @@ concurrency:
 
 env:
   FLUTTER_VERSION: 3.38.5
+  BUILD_NUMBER: ${{ github.run_number }}
+
+permissions:
+  contents: write
 
 jobs:
   quality:
@@ -68,7 +72,7 @@ jobs:
         run: flutter pub get
 
       - name: Build APK
-        run: flutter build apk --release
+        run: flutter build apk --release --build-number=${{ env.BUILD_NUMBER }}
 
       - name: Upload Android Artifact
         uses: actions/upload-artifact@v4
@@ -103,7 +107,7 @@ jobs:
         run: flutter pub get
 
       - name: Build Linux
-        run: flutter build linux --release
+        run: flutter build linux --release --build-number=${{ env.BUILD_NUMBER }}
 
       - name: Package Linux Artifact
         run: tar -czf netmax-linux-x64.tar.gz -C build/linux/x64/release bundle
@@ -136,7 +140,7 @@ jobs:
         run: flutter pub get
 
       - name: Build Windows
-        run: flutter build windows --release
+        run: flutter build windows --release --build-number=${{ env.BUILD_NUMBER }}
 
       - name: Package Windows Artifact
         shell: pwsh
@@ -170,13 +174,13 @@ jobs:
         run: flutter pub get
 
       - name: Build macOS
-        run: flutter build macos --release
+        run: flutter build macos --release --build-number=${{ env.BUILD_NUMBER }}
 
       - name: Package macOS Artifact
         run: ditto -c -k --sequesterRsrc --keepParent "build/macos/Build/Products/Release/netmax_messenger.app" "netmax-macos.app.zip"
 
       - name: Build iOS (Unsigned)
-        run: flutter build ios --release --no-codesign
+        run: flutter build ios --release --no-codesign --build-number=${{ env.BUILD_NUMBER }}
 
       - name: Package iOS Artifact
         run: ditto -c -k --sequesterRsrc --keepParent "build/ios/iphoneos/Runner.app" "netmax-ios.app.zip"
@@ -196,3 +200,160 @@ jobs:
           path: netmax-ios.app.zip
           if-no-files-found: error
           retention-days: 14
+
+  build-web:
+    name: Build Web
+    needs: quality
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Flutter Pub Get
+        run: flutter pub get
+
+      - name: Build Web
+        run: flutter build web --release --base-href / --build-number=${{ env.BUILD_NUMBER }}
+
+      - name: Package Web Artifact
+        run: cd build/web && zip -r ../../netmax-web.zip .
+
+      - name: Upload Web Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-bundle
+          path: netmax-web.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  release-and-manifest:
+    name: Publish Release And Update Manifest
+    needs:
+      - build-android
+      - build-linux
+      - build-windows
+      - build-apple
+      - build-web
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download Android Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: android-apk
+          path: artifacts/android
+
+      - name: Download Linux Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-bundle
+          path: artifacts/linux
+
+      - name: Download Windows Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-bundle
+          path: artifacts/windows
+
+      - name: Download macOS Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-app
+          path: artifacts/macos
+
+      - name: Download iOS Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-app-unsigned
+          path: artifacts/ios
+
+      - name: Download Web Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: web-bundle
+          path: artifacts/web
+
+      - name: Prepare Release Metadata
+        run: |
+          VERSION_LINE=$(grep '^version:' pubspec.yaml | head -n 1 | awk '{print $2}')
+          VERSION_NAME=$(echo "$VERSION_LINE" | cut -d'+' -f1)
+          TAG="v${VERSION_NAME}-build.${BUILD_NUMBER}"
+
+          echo "VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+
+          cp artifacts/android/app-release.apk netmax-android.apk
+          cp artifacts/linux/netmax-linux-x64.tar.gz netmax-linux-x64.tar.gz
+          cp artifacts/windows/netmax-windows-x64.zip netmax-windows-x64.zip
+          cp artifacts/macos/netmax-macos.app.zip netmax-macos.app.zip
+          cp artifacts/ios/netmax-ios.app.zip netmax-ios.app.zip
+          cp artifacts/web/netmax-web.zip netmax-web.zip
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: NetMax ${{ env.TAG }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            netmax-android.apk
+            netmax-linux-x64.tar.gz
+            netmax-windows-x64.zip
+            netmax-macos.app.zip
+            netmax-ios.app.zip
+            netmax-web.zip
+
+      - name: Update update_manifest.json
+        run: |
+          ANDROID_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/netmax-android.apk"
+          IOS_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/netmax-ios.app.zip"
+          MACOS_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/netmax-macos.app.zip"
+          WINDOWS_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/netmax-windows-x64.zip"
+          LINUX_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/netmax-linux-x64.tar.gz"
+          WEB_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/netmax-web.zip"
+
+          cat > backend/config/update_manifest.json <<JSON
+          {
+            "version": "${VERSION_NAME}",
+            "build": ${BUILD_NUMBER},
+            "notes": "CI build ${BUILD_NUMBER}",
+            "downloads": {
+              "android": "${ANDROID_URL}",
+              "ios": "${IOS_URL}",
+              "macos": "${MACOS_URL}",
+              "windows": "${WINDOWS_URL}",
+              "linux": "${LINUX_URL}",
+              "web": "${WEB_URL}"
+            }
+          }
+          JSON
+
+      - name: Commit Updated Manifest
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add backend/config/update_manifest.json
+          if git diff --cached --quiet; then
+            echo "No manifest changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore(ci): update update_manifest for ${TAG} [skip ci]"
+          git push

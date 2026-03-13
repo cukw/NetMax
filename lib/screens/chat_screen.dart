@@ -3,6 +3,7 @@ import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
 
 import '../models/app_notification.dart';
+import '../models/chat_message.dart';
 import '../providers/chat_provider.dart';
 import '../widgets/message_bubble.dart';
 
@@ -15,12 +16,21 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> {
   final TextEditingController _messageController = TextEditingController();
+  final TextEditingController _scheduledTextController =
+      TextEditingController();
   final ScrollController _scrollController = ScrollController();
+
   int _lastMessageCount = 0;
+  int _selectedTab = 0;
+
+  bool _scheduledEnabledDraft = false;
+  String _scheduledTimeDraft = '09:00';
+  String _scheduleSignature = '';
 
   @override
   void dispose() {
     _messageController.dispose();
+    _scheduledTextController.dispose();
     _scrollController.dispose();
     super.dispose();
   }
@@ -50,6 +60,92 @@ class _ChatScreenState extends State<ChatScreen> {
     _scrollToBottom();
   }
 
+  Future<void> _checkForUpdates(ChatProvider chatProvider) async {
+    await chatProvider.checkForUpdates(notifyIfNoUpdate: true);
+    if (!mounted) {
+      return;
+    }
+
+    final error = chatProvider.updateError;
+    if (error != null && error.isNotEmpty) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error)));
+    }
+  }
+
+  Future<void> _installUpdate(ChatProvider chatProvider) async {
+    final error = await chatProvider.openUpdateDownload();
+    if (!mounted) {
+      return;
+    }
+
+    final message =
+        error ??
+        'Ссылка на обновление открыта. Завершите установку на устройстве.';
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  Future<void> _pickScheduleTime() async {
+    final parts = _scheduledTimeDraft.split(':');
+    final initial = TimeOfDay(
+      hour: int.tryParse(parts.first) ?? 9,
+      minute: int.tryParse(parts.length > 1 ? parts[1] : '0') ?? 0,
+    );
+
+    final result = await showTimePicker(
+      context: context,
+      initialTime: initial,
+      helpText: 'Время отправки',
+    );
+    if (result == null) {
+      return;
+    }
+
+    setState(() {
+      _scheduledTimeDraft =
+          '${result.hour.toString().padLeft(2, '0')}:${result.minute.toString().padLeft(2, '0')}';
+    });
+  }
+
+  Future<void> _saveSchedule(ChatProvider chatProvider) async {
+    final error = await chatProvider.saveScheduledMessageConfig(
+      enabled: _scheduledEnabledDraft,
+      text: _scheduledTextController.text,
+      time: _scheduledTimeDraft,
+    );
+
+    if (!mounted) {
+      return;
+    }
+
+    final message =
+        error ??
+        'Расписание сохранено. Сервер отправит сообщение в заданное время.';
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  void _syncScheduleDraft(ChatProvider chatProvider) {
+    final signature =
+        '${chatProvider.scheduledEnabled}|${chatProvider.scheduledText}|${chatProvider.scheduledTime}|${chatProvider.scheduledLastSentDate}|${chatProvider.scheduledUpdatedAt?.millisecondsSinceEpoch ?? 0}';
+
+    if (signature == _scheduleSignature) {
+      return;
+    }
+
+    _scheduleSignature = signature;
+    _scheduledEnabledDraft = chatProvider.scheduledEnabled;
+    _scheduledTimeDraft = chatProvider.scheduledTime;
+
+    if (_scheduledTextController.text != chatProvider.scheduledText) {
+      _scheduledTextController.text = chatProvider.scheduledText;
+    }
+  }
+
   void _scrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_scrollController.hasClients) {
@@ -75,6 +171,8 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   Widget build(BuildContext context) {
     final chatProvider = context.watch<ChatProvider>();
+    _syncScheduleDraft(chatProvider);
+
     final messages = chatProvider.messages;
     final latestNotification = chatProvider.latestNotification;
     final canSend = _messageController.text.trim().isNotEmpty;
@@ -97,6 +195,35 @@ class _ChatScreenState extends State<ChatScreen> {
           ],
         ),
         actions: [
+          IconButton(
+            tooltip: 'Проверить обновления',
+            onPressed: chatProvider.isCheckingUpdates
+                ? null
+                : () => _checkForUpdates(chatProvider),
+            icon: Stack(
+              clipBehavior: Clip.none,
+              children: [
+                Icon(
+                  chatProvider.isCheckingUpdates
+                      ? Icons.sync_rounded
+                      : Icons.system_update_alt_rounded,
+                ),
+                if (chatProvider.isUpdateAvailable)
+                  Positioned(
+                    right: -4,
+                    top: -4,
+                    child: Container(
+                      width: 9,
+                      height: 9,
+                      decoration: BoxDecoration(
+                        color: Colors.redAccent,
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
           IconButton(
             tooltip: 'Настройки подключения',
             onPressed: () => _openConnectionSheet(chatProvider),
@@ -169,32 +296,219 @@ class _ChatScreenState extends State<ChatScreen> {
         ],
       ),
       body: SafeArea(
-        child: Center(
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 980),
-            child: Column(
-              children: [
-                if (latestNotification != null)
-                  _buildActivityBanner(latestNotification),
-                Expanded(
-                  child: ListView.builder(
-                    controller: _scrollController,
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 10,
-                    ),
-                    itemCount: messages.length,
-                    itemBuilder: (context, index) {
-                      final message = messages[index];
-                      final isMine = message.senderId == chatProvider.me.id;
-                      return MessageBubble(message: message, isMine: isMine);
-                    },
-                  ),
-                ),
-                _buildComposer(chatProvider, canSend),
-              ],
-            ),
+        child: _selectedTab == 0
+            ? _buildChatTab(chatProvider, messages, latestNotification, canSend)
+            : _buildSettingsTab(chatProvider),
+      ),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _selectedTab,
+        onDestinationSelected: (index) {
+          setState(() {
+            _selectedTab = index;
+          });
+        },
+        destinations: const [
+          NavigationDestination(
+            icon: Icon(Icons.chat_bubble_outline_rounded),
+            selectedIcon: Icon(Icons.chat_bubble_rounded),
+            label: 'Чат',
           ),
+          NavigationDestination(
+            icon: Icon(Icons.settings_outlined),
+            selectedIcon: Icon(Icons.settings_rounded),
+            label: 'Настройки',
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildChatTab(
+    ChatProvider chatProvider,
+    List<ChatMessage> messages,
+    AppNotification? latestNotification,
+    bool canSend,
+  ) {
+    return Center(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 980),
+        child: Column(
+          children: [
+            if (latestNotification != null)
+              _buildActivityBanner(latestNotification),
+            if (chatProvider.isUpdateAvailable)
+              _buildUpdateBanner(chatProvider),
+            if (chatProvider.isCheckingUpdates)
+              const Padding(
+                padding: EdgeInsets.fromLTRB(12, 8, 12, 0),
+                child: LinearProgressIndicator(minHeight: 2),
+              ),
+            Expanded(
+              child: ListView.builder(
+                controller: _scrollController,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 10,
+                ),
+                itemCount: messages.length,
+                itemBuilder: (context, index) {
+                  final message = messages[index];
+                  final isMine = message.senderId == chatProvider.me.id;
+                  return MessageBubble(message: message, isMine: isMine);
+                },
+              ),
+            ),
+            _buildComposer(chatProvider, canSend),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSettingsTab(ChatProvider chatProvider) {
+    final theme = Theme.of(context);
+    final lastSent = chatProvider.scheduledLastSentDate;
+    final updatedAt = chatProvider.scheduledUpdatedAt;
+
+    return Center(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 980),
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(12, 10, 12, 16),
+          children: [
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Подключение',
+                      style: TextStyle(
+                        fontWeight: FontWeight.w700,
+                        fontSize: 17,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text('Сервер: ${chatProvider.serverUrl}'),
+                    const SizedBox(height: 4),
+                    Text('Пользователь: ${chatProvider.userName}'),
+                    const SizedBox(height: 10),
+                    FilledButton.tonalIcon(
+                      onPressed: () => _openConnectionSheet(chatProvider),
+                      icon: const Icon(Icons.cloud_outlined),
+                      label: const Text('Изменить подключение'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 10),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Отправка по времени',
+                      style: TextStyle(
+                        fontWeight: FontWeight.w700,
+                        fontSize: 17,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    SwitchListTile.adaptive(
+                      contentPadding: EdgeInsets.zero,
+                      value: _scheduledEnabledDraft,
+                      title: const Text('Отправлять сообщение по времени'),
+                      subtitle: const Text(
+                        'Сервер сам отправит сообщение в указанное время.',
+                      ),
+                      onChanged: (value) {
+                        setState(() {
+                          _scheduledEnabledDraft = value;
+                        });
+                      },
+                    ),
+                    if (_scheduledEnabledDraft) ...[
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: _scheduledTextController,
+                        minLines: 2,
+                        maxLines: 4,
+                        decoration: const InputDecoration(
+                          labelText: 'Текст сообщения',
+                          hintText: 'Введите сообщение для автo-отправки',
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: InputDecorator(
+                              decoration: const InputDecoration(
+                                labelText: 'Время отправки',
+                              ),
+                              child: Text(
+                                _scheduledTimeDraft,
+                                style: theme.textTheme.titleMedium,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          OutlinedButton.icon(
+                            onPressed: _pickScheduleTime,
+                            icon: const Icon(Icons.access_time_rounded),
+                            label: const Text('Выбрать'),
+                          ),
+                        ],
+                      ),
+                    ],
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        FilledButton.icon(
+                          onPressed: chatProvider.isSavingScheduledConfig
+                              ? null
+                              : () => _saveSchedule(chatProvider),
+                          icon: chatProvider.isSavingScheduledConfig
+                              ? const SizedBox(
+                                  width: 14,
+                                  height: 14,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              : const Icon(Icons.save_rounded),
+                          label: const Text('Сохранить в JSON'),
+                        ),
+                        const SizedBox(width: 10),
+                        if (chatProvider.isSavingScheduledConfig)
+                          const Text('Сохраняем...'),
+                      ],
+                    ),
+                    if (chatProvider.scheduledConfigError != null) ...[
+                      const SizedBox(height: 8),
+                      Text(
+                        chatProvider.scheduledConfigError!,
+                        style: TextStyle(color: theme.colorScheme.error),
+                      ),
+                    ],
+                    if (lastSent != null || updatedAt != null) ...[
+                      const SizedBox(height: 10),
+                      if (lastSent != null)
+                        Text('Последняя автоотправка: $lastSent'),
+                      if (updatedAt != null)
+                        Text(
+                          'Обновлено: ${DateFormat('dd.MM.yyyy HH:mm').format(updatedAt)}',
+                        ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+          ],
         ),
       ),
     );
@@ -238,6 +552,83 @@ class _ChatScreenState extends State<ChatScreen> {
                 color: theme.colorScheme.onPrimaryContainer.withAlpha(190),
                 fontSize: 11,
               ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildUpdateBanner(ChatProvider chatProvider) {
+    final theme = Theme.of(context);
+    final latestBuild = chatProvider.latestBuild ?? 0;
+    final latestVersion = '${chatProvider.latestVersion}+$latestBuild';
+    final notes = chatProvider.updateNotes;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+        decoration: BoxDecoration(
+          color: theme.colorScheme.tertiaryContainer.withAlpha(200),
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  Icons.system_update_alt_rounded,
+                  size: 18,
+                  color: theme.colorScheme.onTertiaryContainer,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Доступна новая версия: $latestVersion',
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: theme.colorScheme.onTertiaryContainer,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Text(
+              'Текущая версия: ${chatProvider.currentVersionLabel}',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onTertiaryContainer.withAlpha(210),
+              ),
+            ),
+            if (notes != null && notes.trim().isNotEmpty) ...[
+              const SizedBox(height: 4),
+              Text(
+                notes,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onTertiaryContainer.withAlpha(210),
+                ),
+              ),
+            ],
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                OutlinedButton.icon(
+                  onPressed: chatProvider.isCheckingUpdates
+                      ? null
+                      : () => _checkForUpdates(chatProvider),
+                  icon: const Icon(Icons.sync_rounded),
+                  label: const Text('Проверить'),
+                ),
+                const SizedBox(width: 8),
+                FilledButton.icon(
+                  onPressed: () => _installUpdate(chatProvider),
+                  icon: const Icon(Icons.download_rounded),
+                  label: const Text('Установить'),
+                ),
+              ],
             ),
           ],
         ),

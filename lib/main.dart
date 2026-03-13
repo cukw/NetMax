@@ -3,10 +3,12 @@ import 'package:provider/provider.dart';
 
 import 'providers/chat_provider.dart';
 import 'screens/chat_screen.dart';
+import 'services/system_notification_service.dart';
 import 'theme/app_theme.dart';
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await SystemNotificationService.instance.initialize();
   runApp(const NetMaxMessengerApp());
 }
 

@@ -76,9 +76,34 @@ class MessageBubble extends StatelessWidget {
                 style: TextStyle(color: textColor, fontSize: 15),
               ),
             const SizedBox(height: 4),
-            Text(
-              DateFormat('HH:mm').format(message.createdAt),
-              style: TextStyle(color: textColor.withAlpha(170), fontSize: 11),
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (message.isScheduled) ...[
+                  Icon(
+                    Icons.schedule_rounded,
+                    size: 12,
+                    color: textColor.withAlpha(185),
+                  ),
+                  const SizedBox(width: 4),
+                  Text(
+                    'по времени',
+                    style: TextStyle(
+                      color: textColor.withAlpha(185),
+                      fontSize: 10,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                ],
+                Text(
+                  DateFormat('HH:mm').format(message.createdAt),
+                  style: TextStyle(
+                    color: textColor.withAlpha(170),
+                    fontSize: 11,
+                  ),
+                ),
+              ],
             ),
           ],
         ),

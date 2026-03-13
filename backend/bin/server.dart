@@ -12,6 +12,9 @@ import 'package:shelf_web_socket/shelf_web_socket.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 const String _authConfigRelativePath = 'config/authorized_users.json';
+const String _updateManifestRelativePath = 'config/update_manifest.json';
+const String _scheduledConfigRelativePath = 'config/scheduled_messages.json';
+const Duration _scheduleTickInterval = Duration(seconds: 20);
 
 final RoomState _group = RoomState();
 final Random _random = Random();
@@ -19,6 +22,11 @@ final Random _random = Random();
 late final Directory _storageDir;
 late final List<String> _allowedUsers;
 late final Map<String, String> _allowedUsersByLower;
+late final File _scheduledConfigFile;
+final Map<String, ScheduledMessageRule> _scheduledRulesByUserLower =
+    <String, ScheduledMessageRule>{};
+
+Timer? _scheduledDispatchTimer;
 
 Future<void> main() async {
   _storageDir = Directory(p.join(Directory.current.path, 'storage'));
@@ -26,11 +34,19 @@ Future<void> main() async {
     _storageDir.createSync(recursive: true);
   }
 
+  _scheduledConfigFile = File(
+    p.join(Directory.current.path, _scheduledConfigRelativePath),
+  );
+
   _loadAuthorizedUsers();
+  _loadScheduledRules();
+  _startScheduledDispatcher();
 
   final router = Router()
     ..get('/health', _healthHandler)
     ..get('/authorized-users', _authorizedUsersHandler)
+    ..get('/scheduled-messages', _scheduledMessagesHandler)
+    ..get('/update-manifest', _updateManifestHandler)
     ..get(
       '/ws',
       webSocketHandler(
@@ -62,6 +78,9 @@ Future<void> main() async {
   stdout.writeln('WebSocket endpoint: ws://<host>:${server.port}/ws');
   stdout.writeln('Files endpoint: http://<host>:${server.port}/files/<file>');
   stdout.writeln('Authorized users loaded: ${_allowedUsers.length}');
+  stdout.writeln(
+    'Scheduled rules loaded: ${_scheduledRulesByUserLower.length}',
+  );
 }
 
 void _loadAuthorizedUsers() {
@@ -110,11 +129,145 @@ void _loadAuthorizedUsers() {
   };
 }
 
+void _loadScheduledRules() {
+  if (!_scheduledConfigFile.existsSync()) {
+    _scheduledConfigFile.createSync(recursive: true);
+    _scheduledConfigFile.writeAsStringSync(
+      const JsonEncoder.withIndent('  ').convert({'schedules': <Object>[]}),
+    );
+  }
+
+  try {
+    final decoded = jsonDecode(_scheduledConfigFile.readAsStringSync());
+    final root = _asMap(decoded);
+    final rawSchedules = root['schedules'];
+
+    _scheduledRulesByUserLower.clear();
+    if (rawSchedules is List) {
+      for (final item in rawSchedules) {
+        final map = _asMap(item);
+        final rule = ScheduledMessageRule.fromJson(map);
+        if (rule == null) {
+          continue;
+        }
+
+        final authorizedName =
+            _allowedUsersByLower[rule.userName.toLowerCase()];
+        if (authorizedName == null) {
+          continue;
+        }
+
+        final normalized = rule.copyWith(userName: authorizedName);
+        _scheduledRulesByUserLower[authorizedName.toLowerCase()] = normalized;
+      }
+    }
+  } catch (_) {
+    _scheduledRulesByUserLower.clear();
+    _saveScheduledRules();
+  }
+}
+
+void _saveScheduledRules() {
+  final schedules = _scheduledRulesByUserLower.values.toList()
+    ..sort((a, b) => a.userName.compareTo(b.userName));
+
+  final payload = {
+    'schedules': schedules.map((rule) => rule.toJson()).toList(),
+  };
+  _scheduledConfigFile.writeAsStringSync(
+    const JsonEncoder.withIndent('  ').convert(payload),
+  );
+}
+
+void _startScheduledDispatcher() {
+  _scheduledDispatchTimer?.cancel();
+  _scheduledDispatchTimer = Timer.periodic(_scheduleTickInterval, (_) {
+    _dispatchScheduledMessages();
+  });
+}
+
+void _dispatchScheduledMessages() {
+  if (_scheduledRulesByUserLower.isEmpty) {
+    return;
+  }
+
+  var changed = false;
+  final nowUtc = DateTime.now().toUtc();
+
+  for (final key in _scheduledRulesByUserLower.keys.toList(growable: false)) {
+    final rule = _scheduledRulesByUserLower[key];
+    if (rule == null || !rule.enabled) {
+      continue;
+    }
+
+    final text = rule.text.trim();
+    if (text.isEmpty) {
+      continue;
+    }
+
+    final localNow = nowUtc.add(Duration(minutes: rule.timezoneOffsetMinutes));
+    final localDate = _formatDate(localNow);
+    final localTime = _formatHm(localNow);
+
+    if (localTime != rule.time || localDate == rule.lastSentDate) {
+      continue;
+    }
+
+    final senderId =
+        _findOnlineUserIdByName(rule.userName) ??
+        'scheduled-${_safeIdentity(rule.userName)}';
+
+    final message = <String, dynamic>{
+      'id': _normalizeMessageId(null),
+      'senderId': senderId,
+      'senderName': rule.userName,
+      'createdAt': nowUtc.toIso8601String(),
+      'type': 'text',
+      'text': text,
+      'scheduled': true,
+    };
+
+    _appendMessage(message);
+    _broadcast(type: 'message', payload: message);
+
+    _scheduledRulesByUserLower[key] = rule.copyWith(
+      lastSentDate: localDate,
+      updatedAt: nowUtc.toIso8601String(),
+    );
+    changed = true;
+  }
+
+  if (changed) {
+    _saveScheduledRules();
+  }
+}
+
+String? _findOnlineUserIdByName(String userName) {
+  final expected = userName.toLowerCase();
+  for (final entry in _group.userNames.entries) {
+    if (entry.value.toLowerCase() == expected) {
+      return entry.key;
+    }
+  }
+  return null;
+}
+
 Response _healthHandler(Request request) {
+  final updateManifestFile = File(
+    p.join(Directory.current.path, _updateManifestRelativePath),
+  );
+
+  final enabledRules = _scheduledRulesByUserLower.values
+      .where((rule) => rule.enabled)
+      .length;
+
   return _json({
     'status': 'ok',
     'onlineUsers': _group.clients.length,
     'authorizedUsers': _allowedUsers.length,
+    'updateManifestAvailable': updateManifestFile.existsSync(),
+    'scheduledRules': _scheduledRulesByUserLower.length,
+    'scheduledEnabled': enabledRules,
     'messagesInMemory': _group.messages.length,
     'timestamp': DateTime.now().toUtc().toIso8601String(),
   });
@@ -122,6 +275,41 @@ Response _healthHandler(Request request) {
 
 Response _authorizedUsersHandler(Request request) {
   return _json({'count': _allowedUsers.length, 'users': _allowedUsers});
+}
+
+Response _scheduledMessagesHandler(Request request) {
+  final schedules = _scheduledRulesByUserLower.values.toList()
+    ..sort((a, b) => a.userName.compareTo(b.userName));
+
+  return _json({
+    'count': schedules.length,
+    'schedules': schedules.map((rule) => rule.toJson()).toList(),
+  });
+}
+
+Response _updateManifestHandler(Request request) {
+  final manifestFile = File(
+    p.join(Directory.current.path, _updateManifestRelativePath),
+  );
+
+  if (!manifestFile.existsSync()) {
+    return _json({
+      'error': 'Update manifest not found.',
+      'path': _updateManifestRelativePath,
+    }, statusCode: 404);
+  }
+
+  try {
+    final decoded = jsonDecode(manifestFile.readAsStringSync());
+    if (decoded is! Map<String, dynamic>) {
+      return _json({
+        'error': 'Invalid update manifest format.',
+      }, statusCode: 500);
+    }
+    return _json(decoded);
+  } catch (_) {
+    return _json({'error': 'Unable to read update manifest.'}, statusCode: 500);
+  }
 }
 
 void _handleSocket(WebSocketChannel channel, String? protocol) {
@@ -212,6 +400,8 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
               },
             );
 
+            _sendScheduledConfig(channel: channel, userName: userName!);
+
             _broadcast(
               type: 'presence',
               payload: {
@@ -240,6 +430,7 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
               'createdAt': _normalizeIsoTimestamp(payload['createdAt']),
               'type': 'text',
               'text': text,
+              'scheduled': false,
             };
 
             _appendMessage(message);
@@ -270,6 +461,24 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
             _handleFileMessage(
               channel: channel,
               userId: userId!,
+              userName: userName!,
+              payload: payload,
+            );
+            break;
+
+          case 'scheduled_config_get':
+            if (!joined || userName == null) {
+              return;
+            }
+            _sendScheduledConfig(channel: channel, userName: userName!);
+            break;
+
+          case 'scheduled_config_set':
+            if (!joined || userName == null) {
+              return;
+            }
+            _handleScheduledConfigSet(
+              channel: channel,
               userName: userName!,
               payload: payload,
             );
@@ -355,6 +564,7 @@ void _handleFileMessage({
     'createdAt': _normalizeIsoTimestamp(payload['createdAt']),
     'type': 'file',
     'text': (payload['text']?.toString() ?? 'Отправлен файл').trim(),
+    'scheduled': false,
     'attachment': {
       'name': fileName,
       'path': '/files/$storedName',
@@ -365,6 +575,84 @@ void _handleFileMessage({
 
   _appendMessage(message);
   _broadcast(type: 'message', payload: message);
+}
+
+void _handleScheduledConfigSet({
+  required WebSocketChannel channel,
+  required String userName,
+  required Map<String, dynamic> payload,
+}) {
+  final enabled = payload['enabled'] == true;
+  final text = (payload['text']?.toString() ?? '').trim();
+  final time = _normalizeScheduleTime(payload['time']) ?? '09:00';
+  final timezoneOffsetMinutes = _clampTimezoneOffset(
+    _toInt(payload['timezoneOffsetMinutes']) ?? 0,
+  );
+
+  if (enabled && text.isEmpty) {
+    _sendEnvelope(
+      channel,
+      type: 'error',
+      payload: {'message': 'Введите текст для отправки по времени.'},
+    );
+    return;
+  }
+
+  if (enabled && _normalizeScheduleTime(payload['time']) == null) {
+    _sendEnvelope(
+      channel,
+      type: 'error',
+      payload: {'message': 'Укажите время в формате HH:mm.'},
+    );
+    return;
+  }
+
+  final key = userName.toLowerCase();
+  final current = _scheduledRulesByUserLower[key];
+  final normalizedText = text;
+  final normalizedTime = time;
+
+  final resetLastDate =
+      current == null ||
+      current.time != normalizedTime ||
+      current.text != normalizedText ||
+      current.timezoneOffsetMinutes != timezoneOffsetMinutes ||
+      current.enabled != enabled;
+
+  _scheduledRulesByUserLower[key] = ScheduledMessageRule(
+    userName: userName,
+    enabled: enabled,
+    text: normalizedText,
+    time: normalizedTime,
+    timezoneOffsetMinutes: timezoneOffsetMinutes,
+    lastSentDate: resetLastDate ? null : current?.lastSentDate,
+    updatedAt: DateTime.now().toUtc().toIso8601String(),
+  );
+
+  _saveScheduledRules();
+
+  _sendScheduledConfig(channel: channel, userName: userName);
+}
+
+void _sendScheduledConfig({
+  required WebSocketChannel channel,
+  required String userName,
+}) {
+  final rule = _scheduledRulesByUserLower[userName.toLowerCase()];
+
+  _sendEnvelope(
+    channel,
+    type: 'scheduled_config',
+    payload: {
+      'userName': userName,
+      'enabled': rule?.enabled ?? false,
+      'text': rule?.text ?? '',
+      'time': rule?.time ?? '09:00',
+      'timezoneOffsetMinutes': rule?.timezoneOffsetMinutes ?? 0,
+      'lastSentDate': rule?.lastSentDate,
+      'updatedAt': rule?.updatedAt,
+    },
+  );
 }
 
 void _cleanupConnection({
@@ -491,6 +779,59 @@ String _safeFileName(String original) {
   return safe;
 }
 
+String _safeIdentity(String raw) {
+  final safe = raw.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]+'), '_');
+  if (safe.isEmpty) {
+    return 'user';
+  }
+  return safe;
+}
+
+String? _normalizeScheduleTime(Object? value) {
+  final text = (value?.toString() ?? '').trim();
+  final match = RegExp(r'^([01]?\d|2[0-3]):([0-5]\d)$').firstMatch(text);
+  if (match == null) {
+    return null;
+  }
+
+  final hour = int.parse(match.group(1)!);
+  final minute = int.parse(match.group(2)!);
+  return '${hour.toString().padLeft(2, '0')}:${minute.toString().padLeft(2, '0')}';
+}
+
+int _clampTimezoneOffset(int value) {
+  if (value < -840) {
+    return -840;
+  }
+  if (value > 840) {
+    return 840;
+  }
+  return value;
+}
+
+int? _toInt(Object? raw) {
+  if (raw is int) {
+    return raw;
+  }
+  if (raw is num) {
+    return raw.toInt();
+  }
+  return int.tryParse(raw?.toString() ?? '');
+}
+
+String _formatDate(DateTime dateTime) {
+  final year = dateTime.year.toString().padLeft(4, '0');
+  final month = dateTime.month.toString().padLeft(2, '0');
+  final day = dateTime.day.toString().padLeft(2, '0');
+  return '$year-$month-$day';
+}
+
+String _formatHm(DateTime dateTime) {
+  final hour = dateTime.hour.toString().padLeft(2, '0');
+  final minute = dateTime.minute.toString().padLeft(2, '0');
+  return '$hour:$minute';
+}
+
 Middleware _cors() {
   const corsHeaders = <String, String>{
     'access-control-allow-origin': '*',
@@ -525,4 +866,83 @@ class RoomState {
   final Map<String, WebSocketChannel> clients = <String, WebSocketChannel>{};
   final Map<String, String> userNames = <String, String>{};
   final List<Map<String, dynamic>> messages = <Map<String, dynamic>>[];
+}
+
+class ScheduledMessageRule {
+  const ScheduledMessageRule({
+    required this.userName,
+    required this.enabled,
+    required this.text,
+    required this.time,
+    required this.timezoneOffsetMinutes,
+    this.lastSentDate,
+    this.updatedAt,
+  });
+
+  final String userName;
+  final bool enabled;
+  final String text;
+  final String time;
+  final int timezoneOffsetMinutes;
+  final String? lastSentDate;
+  final String? updatedAt;
+
+  ScheduledMessageRule copyWith({
+    String? userName,
+    bool? enabled,
+    String? text,
+    String? time,
+    int? timezoneOffsetMinutes,
+    String? lastSentDate,
+    String? updatedAt,
+  }) {
+    return ScheduledMessageRule(
+      userName: userName ?? this.userName,
+      enabled: enabled ?? this.enabled,
+      text: text ?? this.text,
+      time: time ?? this.time,
+      timezoneOffsetMinutes:
+          timezoneOffsetMinutes ?? this.timezoneOffsetMinutes,
+      lastSentDate: lastSentDate,
+      updatedAt: updatedAt ?? this.updatedAt,
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'userName': userName,
+      'enabled': enabled,
+      'text': text,
+      'time': time,
+      'timezoneOffsetMinutes': timezoneOffsetMinutes,
+      'lastSentDate': lastSentDate,
+      'updatedAt': updatedAt,
+    };
+  }
+
+  static ScheduledMessageRule? fromJson(Map<String, dynamic> json) {
+    final userName = (json['userName']?.toString() ?? '').trim();
+    final time = _normalizeScheduleTime(json['time']);
+    if (userName.isEmpty || time == null) {
+      return null;
+    }
+
+    final text = (json['text']?.toString() ?? '').trim();
+    final enabled = json['enabled'] == true;
+    final timezoneOffsetMinutes = _clampTimezoneOffset(
+      _toInt(json['timezoneOffsetMinutes']) ?? 0,
+    );
+    final lastSentDate = (json['lastSentDate']?.toString() ?? '').trim();
+    final updatedAt = (json['updatedAt']?.toString() ?? '').trim();
+
+    return ScheduledMessageRule(
+      userName: userName,
+      enabled: enabled,
+      text: text,
+      time: time,
+      timezoneOffsetMinutes: timezoneOffsetMinutes,
+      lastSentDate: lastSentDate.isEmpty ? null : lastSentDate,
+      updatedAt: updatedAt.isEmpty ? null : updatedAt,
+    );
+  }
 }

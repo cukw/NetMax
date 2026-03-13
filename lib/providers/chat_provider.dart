@@ -1,18 +1,21 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 import 'dart:math';
 
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:web_socket_channel/io.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../models/app_notification.dart';
 import '../models/chat_message.dart';
 import '../models/chat_user.dart';
+import '../services/system_notification_service.dart';
 
 enum ChatConnectionStatus { disconnected, connecting, connected }
 
@@ -27,6 +30,7 @@ class ChatProvider extends ChangeNotifier {
   static const String _userIdKey = 'user_id';
 
   static const String _defaultServerUrl = 'ws://localhost:8080/ws';
+  static const Duration _updateCheckInterval = Duration(minutes: 15);
 
   final List<ChatMessage> _messages = <ChatMessage>[];
   final List<AppNotification> _notifications = <AppNotification>[];
@@ -38,6 +42,7 @@ class ChatProvider extends ChangeNotifier {
   WebSocketChannel? _channel;
   StreamSubscription<dynamic>? _channelSubscription;
   Timer? _typingStopTimer;
+  Timer? _updateCheckTimer;
 
   ThemeMode _themeMode = ThemeMode.light;
   ChatConnectionStatus _connectionStatus = ChatConnectionStatus.disconnected;
@@ -50,6 +55,29 @@ class ChatProvider extends ChangeNotifier {
   bool _isPickingFile = false;
   bool _isMeTyping = false;
   bool _disposed = false;
+  bool _isCheckingUpdates = false;
+  bool _isUpdateAvailable = false;
+  bool _isSavingScheduledConfig = false;
+
+  String _appVersion = '0.0.0';
+  int _appBuild = 0;
+  String? _latestVersion;
+  int? _latestBuild;
+  String? _updateNotes;
+  Uri? _updateDownloadUri;
+  String? _updateError;
+  DateTime? _lastUpdateCheckAt;
+
+  bool _scheduledEnabled = false;
+  String _scheduledText = '';
+  String _scheduledTime = '09:00';
+  int _scheduledTimezoneOffsetMinutes = 0;
+  String? _scheduledLastSentDate;
+  DateTime? _scheduledUpdatedAt;
+  String? _scheduledConfigError;
+
+  DateTime _lastTypingSystemNotificationAt =
+      DateTime.fromMillisecondsSinceEpoch(0);
 
   ThemeMode get themeMode => _themeMode;
   ChatConnectionStatus get connectionStatus => _connectionStatus;
@@ -63,6 +91,24 @@ class ChatProvider extends ChangeNotifier {
   bool get isPickingFile => _isPickingFile;
   int get onlineUsersCount => _onlineUsers.length + (isConnected ? 1 : 0);
   List<String> get typingUsers => _typingUsers.values.toList(growable: false);
+  bool get isCheckingUpdates => _isCheckingUpdates;
+  bool get isUpdateAvailable => _isUpdateAvailable;
+  bool get isSavingScheduledConfig => _isSavingScheduledConfig;
+  String get currentVersionLabel => '$_appVersion+$_appBuild';
+  String? get latestVersion => _latestVersion;
+  int? get latestBuild => _latestBuild;
+  String? get updateNotes => _updateNotes;
+  String? get updateDownloadUrl => _updateDownloadUri?.toString();
+  String? get updateError => _updateError;
+  DateTime? get lastUpdateCheckAt => _lastUpdateCheckAt;
+
+  bool get scheduledEnabled => _scheduledEnabled;
+  String get scheduledText => _scheduledText;
+  String get scheduledTime => _scheduledTime;
+  int get scheduledTimezoneOffsetMinutes => _scheduledTimezoneOffsetMinutes;
+  String? get scheduledLastSentDate => _scheduledLastSentDate;
+  DateTime? get scheduledUpdatedAt => _scheduledUpdatedAt;
+  String? get scheduledConfigError => _scheduledConfigError;
 
   ChatUser get me => ChatUser(id: _userId, name: _userName, isMe: true);
 
@@ -93,6 +139,7 @@ class ChatProvider extends ChangeNotifier {
 
   Future<void> _bootstrap() async {
     await _loadPreferences();
+    await _loadAppInfo();
     if (_disposed) {
       return;
     }
@@ -108,9 +155,31 @@ class ChatProvider extends ChangeNotifier {
     );
     notifyListeners();
 
+    _startUpdateChecks();
+    await checkForUpdates();
+
     if (_userName.isNotEmpty) {
       await connect();
     }
+  }
+
+  Future<void> _loadAppInfo() async {
+    try {
+      final package = await PackageInfo.fromPlatform();
+      final version = package.version.trim();
+      _appVersion = version.isEmpty ? '0.0.0' : version;
+      _appBuild = int.tryParse(package.buildNumber.trim()) ?? 0;
+    } catch (_) {
+      _appVersion = '0.0.0';
+      _appBuild = 0;
+    }
+  }
+
+  void _startUpdateChecks() {
+    _updateCheckTimer?.cancel();
+    _updateCheckTimer = Timer.periodic(_updateCheckInterval, (_) {
+      unawaited(checkForUpdates());
+    });
   }
 
   Future<void> _loadPreferences() async {
@@ -166,6 +235,7 @@ class ChatProvider extends ChangeNotifier {
     await prefs.setString(_userNameKey, _userName);
 
     await connect(force: true);
+    await checkForUpdates();
   }
 
   Future<void> connect({bool force = false}) async {
@@ -186,6 +256,7 @@ class ChatProvider extends ChangeNotifier {
         kind: NotificationKind.system,
         title: 'Авторизация',
         description: 'Введите имя пользователя из whitelist.',
+        showInSystem: false,
       );
       notifyListeners();
       return;
@@ -199,10 +270,7 @@ class ChatProvider extends ChangeNotifier {
 
     try {
       final uri = Uri.parse(_serverUrl);
-      _channel = IOWebSocketChannel.connect(
-        uri,
-        pingInterval: const Duration(seconds: 20),
-      );
+      _channel = WebSocketChannel.connect(uri);
 
       _channelSubscription = _channel!.stream.listen(
         _onSocketData,
@@ -222,6 +290,7 @@ class ChatProvider extends ChangeNotifier {
         kind: NotificationKind.system,
         title: 'Ошибка подключения',
         description: 'Не удалось подключиться к серверу.',
+        showInSystem: true,
       );
       notifyListeners();
     }
@@ -244,6 +313,7 @@ class ChatProvider extends ChangeNotifier {
 
     _typingUsers.clear();
     _onlineUsers.clear();
+    _isSavingScheduledConfig = false;
 
     await _channelSubscription?.cancel();
     _channelSubscription = null;
@@ -288,6 +358,9 @@ class ChatProvider extends ChangeNotifier {
         case 'message':
           _handleMessage(payload);
           break;
+        case 'scheduled_config':
+          _handleScheduledConfig(payload);
+          break;
         case 'error':
           _handleServerError(payload);
           break;
@@ -299,6 +372,7 @@ class ChatProvider extends ChangeNotifier {
         kind: NotificationKind.system,
         title: 'Ошибка',
         description: 'Получены данные в неверном формате.',
+        showInSystem: true,
       );
       notifyListeners();
     }
@@ -320,7 +394,10 @@ class ChatProvider extends ChangeNotifier {
       kind: NotificationKind.system,
       title: 'Авторизация успешна',
       description: 'Пользователь: $_userName',
+      showInSystem: false,
     );
+
+    _sendEnvelope(type: 'scheduled_config_get', payload: <String, dynamic>{});
 
     SharedPreferences.getInstance().then((prefs) async {
       await prefs.setString(_userIdKey, _userId);
@@ -330,13 +407,38 @@ class ChatProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  void _handleScheduledConfig(Map<String, dynamic> payload) {
+    _scheduledEnabled = payload['enabled'] == true;
+    _scheduledText = (payload['text']?.toString() ?? '').trim();
+
+    final normalizedTime = _normalizeScheduleTime(
+      payload['time']?.toString() ?? '09:00',
+    );
+    _scheduledTime = normalizedTime ?? '09:00';
+
+    final timezone = _toInt(payload['timezoneOffsetMinutes']);
+    _scheduledTimezoneOffsetMinutes = timezone ?? 0;
+
+    final lastSent = (payload['lastSentDate']?.toString() ?? '').trim();
+    _scheduledLastSentDate = lastSent.isEmpty ? null : lastSent;
+
+    final updatedAtRaw = (payload['updatedAt']?.toString() ?? '').trim();
+    _scheduledUpdatedAt = DateTime.tryParse(updatedAtRaw)?.toLocal();
+
+    _scheduledConfigError = null;
+    _isSavingScheduledConfig = false;
+    notifyListeners();
+  }
+
   void _onSocketError(Object error) {
     _lastError = error.toString();
     _setConnectionStatus(ChatConnectionStatus.disconnected);
+    _isSavingScheduledConfig = false;
     _pushNotification(
       kind: NotificationKind.system,
       title: 'Соединение потеряно',
       description: 'Ошибка: $_lastError',
+      showInSystem: true,
     );
     notifyListeners();
   }
@@ -344,6 +446,7 @@ class ChatProvider extends ChangeNotifier {
   void _onSocketDone() {
     _typingUsers.clear();
     _onlineUsers.clear();
+    _isSavingScheduledConfig = false;
 
     if (_connectionStatus != ChatConnectionStatus.disconnected) {
       _setConnectionStatus(ChatConnectionStatus.disconnected);
@@ -351,6 +454,7 @@ class ChatProvider extends ChangeNotifier {
         kind: NotificationKind.system,
         title: 'Отключено',
         description: 'Соединение с сервером закрыто.',
+        showInSystem: true,
       );
       notifyListeners();
     }
@@ -431,6 +535,7 @@ class ChatProvider extends ChangeNotifier {
       kind: NotificationKind.presence,
       title: 'Статус пользователя',
       description: isOnline ? '$userName подключился' : '$userName отключился',
+      showInSystem: true,
     );
 
     notifyListeners();
@@ -451,6 +556,7 @@ class ChatProvider extends ChangeNotifier {
         kind: NotificationKind.typing,
         title: 'Действие пользователя',
         description: '$userName печатает...',
+        showInSystem: true,
       );
     } else {
       _typingUsers.remove(userId);
@@ -468,17 +574,23 @@ class ChatProvider extends ChangeNotifier {
     _messageIds.add(message.id);
     _messages.add(message);
 
-    if (message.senderId != _userId) {
+    final isMineByName =
+        message.senderName.trim().toLowerCase() == _userName.toLowerCase();
+
+    if (!isMineByName && message.senderId != _userId) {
       _pushNotification(
         kind: message.type == MessageType.file
             ? NotificationKind.file
             : NotificationKind.message,
         title: message.type == MessageType.file
             ? 'Новый файл'
-            : 'Новое сообщение',
+            : (message.isScheduled
+                  ? 'Сообщение по времени'
+                  : 'Новое сообщение'),
         description: message.type == MessageType.file
             ? '${message.senderName}: ${message.attachment?.name ?? 'Файл'}'
             : '${message.senderName}: ${message.text ?? ''}',
+        showInSystem: true,
       );
     }
 
@@ -488,21 +600,79 @@ class ChatProvider extends ChangeNotifier {
   void _handleServerError(Map<String, dynamic> payload) {
     final message = payload['message']?.toString() ?? 'Неизвестная ошибка.';
     _lastError = message;
+    _scheduledConfigError = message;
+    _isSavingScheduledConfig = false;
 
-    _typingUsers.clear();
-    _onlineUsers.clear();
-    _setConnectionStatus(ChatConnectionStatus.disconnected);
+    final shouldDisconnect =
+        _connectionStatus == ChatConnectionStatus.connecting ||
+        message.toLowerCase().contains('авторизация');
+
+    if (shouldDisconnect) {
+      _typingUsers.clear();
+      _onlineUsers.clear();
+      _setConnectionStatus(ChatConnectionStatus.disconnected);
+
+      _pushNotification(
+        kind: NotificationKind.system,
+        title: 'Ошибка сервера',
+        description: message,
+        showInSystem: true,
+      );
+
+      _channel?.sink.close();
+      _channel = null;
+      notifyListeners();
+      return;
+    }
 
     _pushNotification(
       kind: NotificationKind.system,
-      title: 'Ошибка сервера',
+      title: 'Ошибка',
       description: message,
+      showInSystem: false,
+    );
+    notifyListeners();
+  }
+
+  Future<String?> saveScheduledMessageConfig({
+    required bool enabled,
+    required String text,
+    required String time,
+  }) async {
+    if (!isConnected) {
+      return 'Подключитесь к серверу, чтобы сохранить расписание.';
+    }
+
+    final normalizedText = text.trim();
+    final normalizedTime = _normalizeScheduleTime(time);
+
+    if (enabled && normalizedText.isEmpty) {
+      return 'Введите текст сообщения для отправки по времени.';
+    }
+
+    if (enabled && normalizedTime == null) {
+      return 'Укажите корректное время в формате HH:mm.';
+    }
+
+    _scheduledEnabled = enabled;
+    _scheduledText = normalizedText;
+    _scheduledTime = normalizedTime ?? _scheduledTime;
+    _scheduledTimezoneOffsetMinutes = DateTime.now().timeZoneOffset.inMinutes;
+    _scheduledConfigError = null;
+    _isSavingScheduledConfig = true;
+    notifyListeners();
+
+    _sendEnvelope(
+      type: 'scheduled_config_set',
+      payload: {
+        'enabled': _scheduledEnabled,
+        'text': _scheduledText,
+        'time': _scheduledTime,
+        'timezoneOffsetMinutes': _scheduledTimezoneOffsetMinutes,
+      },
     );
 
-    _channel?.sink.close();
-    _channel = null;
-
-    notifyListeners();
+    return null;
   }
 
   void sendText(String rawText) {
@@ -516,6 +686,7 @@ class ChatProvider extends ChangeNotifier {
         kind: NotificationKind.system,
         title: 'Нет соединения',
         description: 'Подключитесь к серверу, чтобы отправить сообщение.',
+        showInSystem: false,
       );
       notifyListeners();
       return;
@@ -556,7 +727,7 @@ class ChatProvider extends ChangeNotifier {
       }
 
       final picked = result.files.single;
-      final bytes = await _resolveBytes(picked);
+      final bytes = _resolveBytes(picked);
       if (bytes == null || bytes.isEmpty) {
         return 'Не удалось прочитать файл.';
       }
@@ -588,6 +759,7 @@ class ChatProvider extends ChangeNotifier {
         kind: NotificationKind.file,
         title: 'Отправка файла',
         description: picked.name,
+        showInSystem: false,
       );
       notifyListeners();
 
@@ -600,15 +772,11 @@ class ChatProvider extends ChangeNotifier {
     }
   }
 
-  Future<List<int>?> _resolveBytes(PlatformFile file) async {
-    if (file.bytes != null && file.bytes!.isNotEmpty) {
-      return file.bytes;
+  List<int>? _resolveBytes(PlatformFile file) {
+    final bytes = file.bytes;
+    if (bytes != null && bytes.isNotEmpty) {
+      return bytes;
     }
-
-    if (file.path != null && file.path!.isNotEmpty) {
-      return File(file.path!).readAsBytes();
-    }
-
     return null;
   }
 
@@ -652,6 +820,8 @@ class ChatProvider extends ChangeNotifier {
       _channel?.sink.add(jsonEncode(envelope));
     } catch (_) {
       _lastError = 'Не удалось отправить событие: $type';
+      _scheduledConfigError = _lastError;
+      _isSavingScheduledConfig = false;
     }
   }
 
@@ -671,6 +841,7 @@ class ChatProvider extends ChangeNotifier {
     required NotificationKind kind,
     required String title,
     required String description,
+    required bool showInSystem,
   }) {
     _notifications.add(
       AppNotification(
@@ -685,6 +856,33 @@ class ChatProvider extends ChangeNotifier {
     if (_notifications.length > 80) {
       _notifications.removeRange(0, _notifications.length - 80);
     }
+
+    if (showInSystem) {
+      _showSystemNotification(
+        kind: kind,
+        title: title,
+        description: description,
+      );
+    }
+  }
+
+  void _showSystemNotification({
+    required NotificationKind kind,
+    required String title,
+    required String description,
+  }) {
+    if (kind == NotificationKind.typing) {
+      final now = DateTime.now();
+      if (now.difference(_lastTypingSystemNotificationAt) <
+          const Duration(seconds: 25)) {
+        return;
+      }
+      _lastTypingSystemNotificationAt = now;
+    }
+
+    unawaited(
+      SystemNotificationService.instance.show(title: title, body: description),
+    );
   }
 
   String _nextId() {
@@ -715,6 +913,226 @@ class ChatProvider extends ChangeNotifier {
     return uri.toString();
   }
 
+  Future<void> checkForUpdates({bool notifyIfNoUpdate = false}) async {
+    if (_isCheckingUpdates || _disposed) {
+      return;
+    }
+
+    _isCheckingUpdates = true;
+    _updateError = null;
+    notifyListeners();
+
+    try {
+      final manifestUri = _updateManifestUriFromServerUrl(_serverUrl);
+      final payload = await _loadJson(manifestUri);
+      final latestVersion = (payload['version']?.toString() ?? '').trim();
+      final latestBuild = _toInt(payload['build']);
+      final notes = (payload['notes']?.toString() ?? '').trim();
+      final downloads = _asMap(payload['downloads']);
+      final platformKey = _platformKey();
+      var downloadUrl = (downloads[platformKey]?.toString() ?? '').trim();
+
+      if (downloadUrl.isEmpty) {
+        downloadUrl = (downloads['all']?.toString() ?? '').trim();
+      }
+      final downloadUri = Uri.tryParse(downloadUrl);
+
+      if (latestVersion.isEmpty || latestBuild == null) {
+        throw const FormatException(
+          'Version/build not found in update manifest.',
+        );
+      }
+      if (downloadUri == null || downloadUri.toString().isEmpty) {
+        throw FormatException(
+          'Download URL for platform "$platformKey" is missing in update manifest.',
+        );
+      }
+
+      final hasUpdate = _isRemoteVersionNewer(
+        remoteVersion: latestVersion,
+        remoteBuild: latestBuild,
+      );
+      final previousVersion = _latestVersion;
+      final previousBuild = _latestBuild;
+
+      if (hasUpdate) {
+        _isUpdateAvailable = true;
+        _latestVersion = latestVersion;
+        _latestBuild = latestBuild;
+        _updateDownloadUri = downloadUri;
+        _updateNotes = notes.isEmpty ? null : notes;
+
+        final isNewRelease =
+            previousVersion != latestVersion || previousBuild != latestBuild;
+        if (isNewRelease) {
+          _pushNotification(
+            kind: NotificationKind.system,
+            title: 'Доступно обновление',
+            description: 'Новая версия: $latestVersion+$latestBuild',
+            showInSystem: true,
+          );
+        }
+      } else {
+        _isUpdateAvailable = false;
+        _latestVersion = null;
+        _latestBuild = null;
+        _updateNotes = null;
+        _updateDownloadUri = null;
+
+        if (notifyIfNoUpdate) {
+          _pushNotification(
+            kind: NotificationKind.system,
+            title: 'Обновлений нет',
+            description: 'Установлена актуальная версия $currentVersionLabel',
+            showInSystem: false,
+          );
+        }
+      }
+    } catch (error) {
+      _updateError = _readableUpdateError(error);
+      if (notifyIfNoUpdate) {
+        _pushNotification(
+          kind: NotificationKind.system,
+          title: 'Ошибка проверки обновления',
+          description: _updateError!,
+          showInSystem: false,
+        );
+      }
+    } finally {
+      _lastUpdateCheckAt = DateTime.now();
+      _isCheckingUpdates = false;
+      notifyListeners();
+    }
+  }
+
+  Future<String?> openUpdateDownload() async {
+    if (!_isUpdateAvailable || _updateDownloadUri == null) {
+      return 'Сейчас нет доступного обновления.';
+    }
+
+    final launched = await launchUrl(
+      _updateDownloadUri!,
+      mode: LaunchMode.externalApplication,
+    );
+    if (!launched) {
+      return 'Не удалось открыть ссылку на обновление.';
+    }
+    return null;
+  }
+
+  Future<Map<String, dynamic>> _loadJson(Uri uri) async {
+    final response = await http
+        .get(uri, headers: const {'accept': 'application/json'})
+        .timeout(const Duration(seconds: 10));
+
+    if (response.statusCode != 200) {
+      throw Exception(
+        'HTTP ${response.statusCode} while loading update manifest.',
+      );
+    }
+
+    final decoded = jsonDecode(response.body);
+    return _asMap(decoded);
+  }
+
+  Uri _updateManifestUriFromServerUrl(String wsUrl) {
+    final wsUri = Uri.parse(wsUrl);
+    final scheme = wsUri.scheme == 'wss' ? 'https' : 'http';
+    return wsUri.replace(
+      scheme: scheme,
+      path: '/update-manifest',
+      query: '',
+      fragment: '',
+    );
+  }
+
+  String _platformKey() {
+    if (kIsWeb) {
+      return 'web';
+    }
+
+    return switch (defaultTargetPlatform) {
+      TargetPlatform.android => 'android',
+      TargetPlatform.iOS => 'ios',
+      TargetPlatform.macOS => 'macos',
+      TargetPlatform.windows => 'windows',
+      TargetPlatform.linux => 'linux',
+      _ => 'linux',
+    };
+  }
+
+  bool _isRemoteVersionNewer({
+    required String remoteVersion,
+    required int remoteBuild,
+  }) {
+    final versionCmp = _compareVersionParts(remoteVersion, _appVersion);
+    if (versionCmp > 0) {
+      return true;
+    }
+    if (versionCmp < 0) {
+      return false;
+    }
+    return remoteBuild > _appBuild;
+  }
+
+  int _compareVersionParts(String left, String right) {
+    final leftParts = _extractVersionParts(left);
+    final rightParts = _extractVersionParts(right);
+    final length = max(leftParts.length, rightParts.length);
+
+    for (var i = 0; i < length; i++) {
+      final l = i < leftParts.length ? leftParts[i] : 0;
+      final r = i < rightParts.length ? rightParts[i] : 0;
+      if (l != r) {
+        return l.compareTo(r);
+      }
+    }
+
+    return 0;
+  }
+
+  List<int> _extractVersionParts(String version) {
+    final rawParts = version.split(RegExp(r'[^0-9]+'));
+    final parts = <int>[];
+    for (final part in rawParts) {
+      if (part.isEmpty) {
+        continue;
+      }
+      parts.add(int.tryParse(part) ?? 0);
+    }
+    return parts.isEmpty ? <int>[0] : parts;
+  }
+
+  int? _toInt(Object? raw) {
+    if (raw is int) {
+      return raw;
+    }
+    if (raw is num) {
+      return raw.toInt();
+    }
+    return int.tryParse(raw?.toString() ?? '');
+  }
+
+  String _readableUpdateError(Object error) {
+    final text = error.toString().trim();
+    if (text.isEmpty) {
+      return 'Не удалось проверить обновления.';
+    }
+    return text;
+  }
+
+  String? _normalizeScheduleTime(String raw) {
+    final text = raw.trim();
+    final match = RegExp(r'^([01]?\d|2[0-3]):([0-5]\d)$').firstMatch(text);
+    if (match == null) {
+      return null;
+    }
+
+    final hour = int.parse(match.group(1)!);
+    final minute = int.parse(match.group(2)!);
+    return '${hour.toString().padLeft(2, '0')}:${minute.toString().padLeft(2, '0')}';
+  }
+
   Map<String, dynamic> _asMap(Object? value) {
     if (value is Map<String, dynamic>) {
       return value;
@@ -729,6 +1147,7 @@ class ChatProvider extends ChangeNotifier {
   void dispose() {
     _disposed = true;
     _typingStopTimer?.cancel();
+    _updateCheckTimer?.cancel();
     _sendTyping(isTyping: false);
     _channelSubscription?.cancel();
     _channel?.sink.close();

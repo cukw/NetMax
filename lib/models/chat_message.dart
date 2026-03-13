@@ -58,6 +58,7 @@ class ChatMessage {
     required this.senderName,
     required this.createdAt,
     required this.type,
+    required this.isScheduled,
     this.text,
     this.attachment,
   });
@@ -73,6 +74,7 @@ class ChatMessage {
           DateTime.tryParse(json['createdAt']?.toString() ?? '') ??
           DateTime.now(),
       type: MessageTypeX.fromValue(json['type']?.toString() ?? 'text'),
+      isScheduled: json['scheduled'] == true,
       text: json['text']?.toString(),
       attachment: attachmentJson is Map<String, dynamic>
           ? MessageAttachment.fromJson(attachmentJson)
@@ -95,6 +97,7 @@ class ChatMessage {
       senderName: senderName,
       createdAt: createdAt,
       type: MessageType.text,
+      isScheduled: false,
       text: text,
     );
   }
@@ -113,6 +116,7 @@ class ChatMessage {
       senderName: senderName,
       createdAt: createdAt,
       type: MessageType.file,
+      isScheduled: false,
       text: text,
       attachment: attachment,
     );
@@ -129,6 +133,7 @@ class ChatMessage {
       senderName: 'System',
       createdAt: createdAt,
       type: MessageType.system,
+      isScheduled: false,
       text: text,
     );
   }
@@ -138,6 +143,7 @@ class ChatMessage {
   final String senderName;
   final DateTime createdAt;
   final MessageType type;
+  final bool isScheduled;
   final String? text;
   final MessageAttachment? attachment;
 
@@ -148,6 +154,7 @@ class ChatMessage {
       'senderName': senderName,
       'createdAt': createdAt.toUtc().toIso8601String(),
       'type': type.value,
+      'scheduled': isScheduled,
       'text': text,
       'attachment': attachment?.toJson(),
     };
