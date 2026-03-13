@@ -35,6 +35,16 @@ jobs:
       - name: Analyze
         run: flutter analyze
 
+      - name: Backend Pub Get
+        run: |
+          cd backend
+          dart pub get
+
+      - name: Analyze Backend
+        run: |
+          cd backend
+          dart analyze
+
       - name: Test
         run: flutter test
 
