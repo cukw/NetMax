@@ -29,6 +29,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final text = _messageController.text;
     chatProvider.sendText(text);
     _messageController.clear();
+    chatProvider.updateTypingStatus('');
     setState(() {});
     _scrollToBottom();
   }
@@ -90,12 +91,28 @@ class _ChatScreenState extends State<ChatScreen> {
               style: TextStyle(fontWeight: FontWeight.w600, fontSize: 20),
             ),
             Text(
-              _buildPeerStatus(chatProvider),
+              chatProvider.connectionStatusLine,
               style: TextStyle(fontSize: 12, color: _statusColor(chatProvider)),
             ),
           ],
         ),
         actions: [
+          IconButton(
+            tooltip: 'Настройки подключения',
+            onPressed: () => _openConnectionSheet(chatProvider),
+            icon: const Icon(Icons.cloud_outlined),
+          ),
+          IconButton(
+            tooltip: chatProvider.isConnected ? 'Отключиться' : 'Подключиться',
+            onPressed: chatProvider.isConnected
+                ? chatProvider.disconnect
+                : () => chatProvider.connect(force: true),
+            icon: Icon(
+              chatProvider.isConnected
+                  ? Icons.link_off_rounded
+                  : Icons.link_rounded,
+            ),
+          ),
           IconButton(
             tooltip: 'Уведомления',
             onPressed: () => _openNotificationsSheet(chatProvider),
@@ -253,9 +270,16 @@ class _ChatScreenState extends State<ChatScreen> {
               minLines: 1,
               maxLines: 5,
               textInputAction: TextInputAction.send,
-              onChanged: (_) => setState(() {}),
+              onChanged: (value) {
+                chatProvider.updateTypingStatus(value);
+                setState(() {});
+              },
               onSubmitted: (_) => _sendMessage(chatProvider),
-              decoration: const InputDecoration(hintText: 'Введите сообщение'),
+              decoration: InputDecoration(
+                hintText: chatProvider.isConnected
+                    ? 'Введите сообщение'
+                    : 'Сначала подключитесь к серверу',
+              ),
             ),
           ),
           const SizedBox(width: 8),
@@ -266,6 +290,106 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
         ],
       ),
+    );
+  }
+
+  Future<void> _openConnectionSheet(ChatProvider chatProvider) {
+    final serverController = TextEditingController(
+      text: chatProvider.serverUrl,
+    );
+    final userController = TextEditingController(text: chatProvider.userName);
+
+    return showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (context) {
+        return Padding(
+          padding: EdgeInsets.only(
+            left: 16,
+            right: 16,
+            top: 8,
+            bottom: MediaQuery.of(context).viewInsets.bottom + 16,
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Подключение к серверу',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Укажите WebSocket URL сервера и имя пользователя. Группа одна и выбирается автоматически.',
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: serverController,
+                keyboardType: TextInputType.url,
+                decoration: const InputDecoration(
+                  labelText: 'Server URL',
+                  hintText: 'ws://localhost:8080/ws',
+                ),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: userController,
+                decoration: const InputDecoration(
+                  labelText: 'Имя пользователя',
+                ),
+              ),
+              const SizedBox(height: 14),
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton(
+                      onPressed: () {
+                        Navigator.of(context).pop();
+                      },
+                      child: const Text('Отмена'),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: FilledButton(
+                      onPressed: () async {
+                        try {
+                          await chatProvider.applyConnectionSettings(
+                            serverUrl: serverController.text,
+                            userName: userController.text,
+                          );
+                          if (!context.mounted) {
+                            return;
+                          }
+                          Navigator.of(context).pop();
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                              content: Text(
+                                'Настройки сохранены. Выполнено подключение.',
+                              ),
+                            ),
+                          );
+                        } catch (_) {
+                          if (!context.mounted) {
+                            return;
+                          }
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                              content: Text('Некорректный URL сервера.'),
+                            ),
+                          );
+                        }
+                      },
+                      child: const Text('Сохранить и подключить'),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        );
+      },
     );
   }
 
@@ -342,22 +466,15 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  String _buildPeerStatus(ChatProvider chatProvider) {
-    if (!chatProvider.isPeerOnline) {
-      return '${chatProvider.peer.name} не в сети';
-    }
-    if (chatProvider.isPeerTyping) {
-      return '${chatProvider.peer.name} печатает...';
-    }
-    return '${chatProvider.peer.name} в сети';
-  }
-
   Color _statusColor(ChatProvider chatProvider) {
-    if (!chatProvider.isPeerOnline) {
+    if (chatProvider.connectionStatus == ChatConnectionStatus.disconnected) {
       return Colors.redAccent;
     }
-    if (chatProvider.isPeerTyping) {
+    if (chatProvider.connectionStatus == ChatConnectionStatus.connecting) {
       return Colors.orange;
+    }
+    if (chatProvider.typingUsers.isNotEmpty) {
+      return Colors.lightBlueAccent;
     }
     return Colors.green;
   }

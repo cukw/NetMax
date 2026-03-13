@@ -9,7 +9,7 @@ void main() {
     SharedPreferences.setMockInitialValues(<String, Object>{});
 
     await tester.pumpWidget(const NetMaxMessengerApp());
-    await tester.pumpAndSettle();
+    await tester.pump(const Duration(milliseconds: 200));
 
     expect(find.text('NetMax Messenger'), findsOneWidget);
     expect(find.byIcon(Icons.attach_file_rounded), findsOneWidget);
