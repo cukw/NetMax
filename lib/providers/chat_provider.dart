@@ -43,7 +43,7 @@ class ChatProvider extends ChangeNotifier {
   ChatConnectionStatus _connectionStatus = ChatConnectionStatus.disconnected;
 
   String _serverUrl = _defaultServerUrl;
-  String _userName = 'User';
+  String _userName = '';
   String _userId = '';
 
   String? _lastError;
@@ -77,7 +77,7 @@ class ChatProvider extends ChangeNotifier {
 
   String get connectionStatusLine {
     if (_connectionStatus == ChatConnectionStatus.connecting) {
-      return 'Подключение к серверу...';
+      return 'Авторизация на сервере...';
     }
 
     if (_connectionStatus == ChatConnectionStatus.disconnected) {
@@ -88,7 +88,7 @@ class ChatProvider extends ChangeNotifier {
       return '${typingUsers.join(', ')} печатает...';
     }
 
-    return 'Общая группа • В сети: $onlineUsersCount';
+    return 'Авторизован: $_userName • В сети: $onlineUsersCount';
   }
 
   Future<void> _bootstrap() async {
@@ -101,12 +101,16 @@ class ChatProvider extends ChangeNotifier {
       ChatMessage.system(
         id: _nextId(),
         createdAt: DateTime.now(),
-        text: 'NetMax Messenger готов. Подключение к серверу...',
+        text: _userName.isEmpty
+            ? 'Выберите имя из списка авторизованных пользователей и подключитесь к серверу.'
+            : 'NetMax Messenger готов. Выполняется подключение к серверу...',
       ),
     );
     notifyListeners();
 
-    await connect();
+    if (_userName.isNotEmpty) {
+      await connect();
+    }
   }
 
   Future<void> _loadPreferences() async {
@@ -120,18 +124,11 @@ class ChatProvider extends ChangeNotifier {
     };
 
     _serverUrl = prefs.getString(_serverUrlKey) ?? _defaultServerUrl;
+    _userName = (prefs.getString(_userNameKey) ?? '').trim();
 
-    final storedUserName = prefs.getString(_userNameKey);
-    _userName = (storedUserName == null || storedUserName.trim().isEmpty)
-        ? 'User-${1000 + _random.nextInt(9000)}'
-        : storedUserName;
+    final storedUserId = (prefs.getString(_userIdKey) ?? '').trim();
+    _userId = storedUserId.isEmpty ? _nextId() : storedUserId;
 
-    final storedUserId = prefs.getString(_userIdKey);
-    _userId = (storedUserId == null || storedUserId.trim().isEmpty)
-        ? _nextId()
-        : storedUserId;
-
-    await prefs.setString(_userNameKey, _userName);
     await prefs.setString(_userIdKey, _userId);
     await prefs.setString(_serverUrlKey, _serverUrl);
   }
@@ -153,9 +150,13 @@ class ChatProvider extends ChangeNotifier {
     required String userName,
   }) async {
     final normalizedServerUrl = _normalizeServerUrl(serverUrl);
-    final normalizedUserName = userName.trim().isEmpty
-        ? 'User-${1000 + _random.nextInt(9000)}'
-        : userName.trim();
+    final normalizedUserName = userName.trim();
+
+    if (normalizedUserName.isEmpty) {
+      throw const FormatException(
+        'Введите имя пользователя из списка 30 авторизованных.',
+      );
+    }
 
     _serverUrl = normalizedServerUrl;
     _userName = normalizedUserName;
@@ -180,9 +181,21 @@ class ChatProvider extends ChangeNotifier {
       return;
     }
 
+    if (_userName.trim().isEmpty) {
+      _pushNotification(
+        kind: NotificationKind.system,
+        title: 'Авторизация',
+        description: 'Введите имя пользователя из whitelist.',
+      );
+      notifyListeners();
+      return;
+    }
+
     await _closeSocket(sendTypingOff: false, notify: false);
 
     _setConnectionStatus(ChatConnectionStatus.connecting);
+    _lastError = null;
+    notifyListeners();
 
     try {
       final uri = Uri.parse(_serverUrl);
@@ -198,18 +211,10 @@ class ChatProvider extends ChangeNotifier {
         cancelOnError: true,
       );
 
-      _setConnectionStatus(ChatConnectionStatus.connected);
       _sendEnvelope(
         type: 'join',
         payload: {'userId': _userId, 'userName': _userName},
       );
-
-      _pushNotification(
-        kind: NotificationKind.system,
-        title: 'Подключено',
-        description: 'Сервер: $_serverUrl',
-      );
-      notifyListeners();
     } catch (error) {
       _setConnectionStatus(ChatConnectionStatus.disconnected);
       _lastError = error.toString();
@@ -268,6 +273,9 @@ class ChatProvider extends ChangeNotifier {
       final payload = _asMap(decoded['payload']);
 
       switch (type) {
+        case 'auth_ok':
+          _handleAuthOk(payload);
+          break;
         case 'snapshot':
           _handleSnapshot(payload);
           break;
@@ -294,6 +302,32 @@ class ChatProvider extends ChangeNotifier {
       );
       notifyListeners();
     }
+  }
+
+  void _handleAuthOk(Map<String, dynamic> payload) {
+    final authorizedUserId = (payload['userId']?.toString() ?? '').trim();
+    final authorizedUserName = (payload['userName']?.toString() ?? '').trim();
+
+    if (authorizedUserId.isNotEmpty) {
+      _userId = authorizedUserId;
+    }
+    if (authorizedUserName.isNotEmpty) {
+      _userName = authorizedUserName;
+    }
+
+    _setConnectionStatus(ChatConnectionStatus.connected);
+    _pushNotification(
+      kind: NotificationKind.system,
+      title: 'Авторизация успешна',
+      description: 'Пользователь: $_userName',
+    );
+
+    SharedPreferences.getInstance().then((prefs) async {
+      await prefs.setString(_userIdKey, _userId);
+      await prefs.setString(_userNameKey, _userName);
+    });
+
+    notifyListeners();
   }
 
   void _onSocketError(Object error) {
@@ -454,11 +488,20 @@ class ChatProvider extends ChangeNotifier {
   void _handleServerError(Map<String, dynamic> payload) {
     final message = payload['message']?.toString() ?? 'Неизвестная ошибка.';
     _lastError = message;
+
+    _typingUsers.clear();
+    _onlineUsers.clear();
+    _setConnectionStatus(ChatConnectionStatus.disconnected);
+
     _pushNotification(
       kind: NotificationKind.system,
       title: 'Ошибка сервера',
       description: message,
     );
+
+    _channel?.sink.close();
+    _channel = null;
+
     notifyListeners();
   }
 

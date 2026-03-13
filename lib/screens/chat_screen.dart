@@ -321,7 +321,7 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
               const SizedBox(height: 8),
               const Text(
-                'Укажите WebSocket URL сервера и имя пользователя. Группа одна и выбирается автоматически.',
+                'Укажите WebSocket URL сервера и имя пользователя из списка авторизованных.',
               ),
               const SizedBox(height: 12),
               TextField(
@@ -370,15 +370,14 @@ class _ChatScreenState extends State<ChatScreen> {
                               ),
                             ),
                           );
-                        } catch (_) {
+                        } catch (error) {
                           if (!context.mounted) {
                             return;
                           }
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(
-                              content: Text('Некорректный URL сервера.'),
-                            ),
-                          );
+                          final message = _readableErrorMessage(error);
+                          ScaffoldMessenger.of(
+                            context,
+                          ).showSnackBar(SnackBar(content: Text(message)));
                         }
                       },
                       child: const Text('Сохранить и подключить'),
@@ -495,5 +494,17 @@ class _ChatScreenState extends State<ChatScreen> {
       NotificationKind.file => Icons.attach_file_rounded,
       NotificationKind.system => Icons.info_outline_rounded,
     };
+  }
+
+  String _readableErrorMessage(Object error) {
+    final raw = error.toString().trim();
+    const prefix = 'FormatException:';
+    if (raw.startsWith(prefix)) {
+      return raw.substring(prefix.length).trim();
+    }
+    if (raw.isEmpty) {
+      return 'Некорректные параметры подключения.';
+    }
+    return raw;
   }
 }

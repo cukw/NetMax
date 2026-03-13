@@ -11,10 +11,14 @@ import 'package:shelf_static/shelf_static.dart';
 import 'package:shelf_web_socket/shelf_web_socket.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+const String _authConfigRelativePath = 'config/authorized_users.json';
+
 final RoomState _group = RoomState();
 final Random _random = Random();
 
 late final Directory _storageDir;
+late final List<String> _allowedUsers;
+late final Map<String, String> _allowedUsersByLower;
 
 Future<void> main() async {
   _storageDir = Directory(p.join(Directory.current.path, 'storage'));
@@ -22,8 +26,11 @@ Future<void> main() async {
     _storageDir.createSync(recursive: true);
   }
 
+  _loadAuthorizedUsers();
+
   final router = Router()
     ..get('/health', _healthHandler)
+    ..get('/authorized-users', _authorizedUsersHandler)
     ..get(
       '/ws',
       webSocketHandler(
@@ -54,15 +61,67 @@ Future<void> main() async {
   );
   stdout.writeln('WebSocket endpoint: ws://<host>:${server.port}/ws');
   stdout.writeln('Files endpoint: http://<host>:${server.port}/files/<file>');
+  stdout.writeln('Authorized users loaded: ${_allowedUsers.length}');
+}
+
+void _loadAuthorizedUsers() {
+  final configFile = File(
+    p.join(Directory.current.path, _authConfigRelativePath),
+  );
+  if (!configFile.existsSync()) {
+    throw StateError(
+      'Authorization config not found: ${configFile.path}. '
+      'Create $_authConfigRelativePath with allowedUsers list.',
+    );
+  }
+
+  final raw = configFile.readAsStringSync();
+  final decoded = jsonDecode(raw);
+  if (decoded is! Map<String, dynamic>) {
+    throw StateError(
+      'Invalid authorization config format. Expected JSON object.',
+    );
+  }
+
+  final usersRaw = decoded['allowedUsers'];
+  if (usersRaw is! List) {
+    throw StateError(
+      'Invalid authorization config: "allowedUsers" must be a list.',
+    );
+  }
+
+  final users =
+      usersRaw
+          .map((value) => value.toString().trim())
+          .where((value) => value.isNotEmpty)
+          .toSet()
+          .toList()
+        ..sort();
+
+  if (users.length < 30) {
+    throw StateError(
+      'At least 30 authorized users expected. Current count: ${users.length}.',
+    );
+  }
+
+  _allowedUsers = List<String>.unmodifiable(users);
+  _allowedUsersByLower = {
+    for (final name in _allowedUsers) name.toLowerCase(): name,
+  };
 }
 
 Response _healthHandler(Request request) {
   return _json({
     'status': 'ok',
     'onlineUsers': _group.clients.length,
+    'authorizedUsers': _allowedUsers.length,
     'messagesInMemory': _group.messages.length,
     'timestamp': DateTime.now().toUtc().toIso8601String(),
   });
+}
+
+Response _authorizedUsersHandler(Request request) {
+  return _json({'count': _allowedUsers.length, 'users': _allowedUsers});
 }
 
 void _handleSocket(WebSocketChannel channel, String? protocol) {
@@ -98,12 +157,49 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
 
         switch (type) {
           case 'join':
-            userId = _normalizeUserId(payload['userId']);
-            userName = _normalizeUserName(payload['userName']);
+            final requestedName = _normalizeUserName(payload['userName']);
+            if (requestedName.isEmpty) {
+              _denyAndClose(
+                channel,
+                'Авторизация отклонена: укажите имя пользователя.',
+              );
+              return;
+            }
+
+            final authorizedName =
+                _allowedUsersByLower[requestedName.toLowerCase()];
+            if (authorizedName == null) {
+              _denyAndClose(
+                channel,
+                'Авторизация отклонена: пользователь "$requestedName" не в списке.',
+              );
+              return;
+            }
+
+            final nameAlreadyOnline = _group.userNames.values.any(
+              (currentName) =>
+                  currentName.toLowerCase() == authorizedName.toLowerCase(),
+            );
+            if (nameAlreadyOnline) {
+              _denyAndClose(
+                channel,
+                'Авторизация отклонена: "$authorizedName" уже в сети.',
+              );
+              return;
+            }
+
+            userId = _createConnectionUserId();
+            userName = authorizedName;
 
             _group.clients[userId!] = channel;
             _group.userNames[userId!] = userName!;
             joined = true;
+
+            _sendEnvelope(
+              channel,
+              type: 'auth_ok',
+              payload: {'userId': userId, 'userName': userName},
+            );
 
             _sendEnvelope(
               channel,
@@ -336,6 +432,11 @@ void _sendEnvelope(
   channel.sink.add(jsonEncode({'type': type, 'payload': payload}));
 }
 
+void _denyAndClose(WebSocketChannel channel, String reason) {
+  _sendEnvelope(channel, type: 'error', payload: {'message': reason});
+  channel.sink.close(WebSocketStatus.policyViolation, reason);
+}
+
 Map<String, dynamic> _asMap(Object? value) {
   if (value is Map<String, dynamic>) {
     return value;
@@ -346,20 +447,12 @@ Map<String, dynamic> _asMap(Object? value) {
   return <String, dynamic>{};
 }
 
-String _normalizeUserId(Object? value) {
-  final id = (value?.toString() ?? '').trim();
-  if (id.isNotEmpty) {
-    return id;
-  }
+String _createConnectionUserId() {
   return '${DateTime.now().millisecondsSinceEpoch}-${_random.nextInt(99999)}';
 }
 
 String _normalizeUserName(Object? value) {
-  final name = (value?.toString() ?? '').trim();
-  if (name.isNotEmpty) {
-    return name;
-  }
-  return 'Guest-${1000 + _random.nextInt(9000)}';
+  return (value?.toString() ?? '').trim();
 }
 
 String _normalizeMessageId(Object? value) {
