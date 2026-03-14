@@ -49,6 +49,9 @@ dart run bin/server.dart
 - Расписания автоотправки: `http://<HOST>:8080/scheduled-messages`
 - Манифест обновлений: `http://<HOST>:8080/update-manifest`
 
+Если запускаете backend на другом порту, меняйте URL подключения по формуле:
+- `ws://<HOST>:<PORT>/ws`
+
 ## Отправка сообщения по времени
 Реализовано через JSON на сервере:
 - Файл: `/Users/cukw/NetMax/backend/config/scheduled_messages.json`
@@ -76,17 +79,64 @@ dart run bin/server.dart
 - Reverse proxy с TLS (Nginx/Caddy) для `wss://`
 - Регулярные бэкапы `backend/storage` и `backend/config`
 
-## Как подключить клиентов через интернет (не только локальная сеть)
-1. Разместите сервер на машине с публичным IP или доменом (VPS/облако).
-2. Откройте порт `8080` в firewall/security group.
-3. В приложении откройте **Настройки подключения** (иконка облака в шапке).
-4. Укажите:
-   - `Server URL`: `ws://<PUBLIC_HOST>:8080/ws`
-   - `Имя пользователя`: только из JSON whitelist (список из 30 человек выше)
-5. Подключите минимум два клиента к одному `Server URL`.
+## Nginx в backend
+- В самом backend (`/backend`) `nginx` не встроен и не запускается.
+- Backend реализован на Dart `shelf` и слушает порт напрямую (`8080` по умолчанию).
+- `nginx` ставится отдельно только как reverse-proxy (опционально, обычно для TLS и `wss://`).
 
-Пример для TLS:
-- `wss://chat.example.com/ws`
+Минимальный пример reverse-proxy для WebSocket:
+```nginx
+server {
+    listen 443 ssl;
+    server_name chat.example.com;
+
+    location /ws {
+        proxy_pass http://127.0.0.1:8080/ws;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+    }
+}
+```
+
+## Подключение клиентов (точно для всех сборок)
+### 1) Определите правильный URL
+- Без reverse-proxy и TLS: `ws://<PUBLIC_IP>:8080/ws`
+- С доменом и TLS через Nginx/Caddy: `wss://<DOMAIN>/ws`
+- Локально на самой серверной машине: `ws://127.0.0.1:8080/ws`
+
+Важно:
+- Путь должен быть именно `/ws`.
+- Порт должен совпадать с портом запуска backend (`PORT`, если переопределяли).
+- Если ранее в клиенте был сохранен старый адрес (например `:8000`), замените его вручную в настройках подключения.
+
+### 2) Что указать в приложении
+1. Откройте **Настройки подключения** (иконка облака).
+2. В поле `Server URL` введите один из форматов выше.
+3. В поле пользователя укажите имя строго из `backend/config/authorized_users.json`.
+4. Нажмите подключение и дождитесь статуса `Подключено`.
+
+### 3) Особенности по платформам
+- Android: поддерживаются `ws://` и `wss://`.
+- iOS: поддерживаются `ws://` и `wss://` (в проекте добавлены настройки ATS для небезопасного трафика).
+- macOS: поддерживаются `ws://` и `wss://` (включены network entitlements для клиента).
+- Windows: поддерживаются `ws://` и `wss://`.
+- Linux: поддерживаются `ws://` и `wss://`.
+- Web: если сайт открыт по `https://`, подключаться нужно только через `wss://`. `ws://` в этом случае браузер блокирует как mixed content.
+
+### 4) Проверка сети перед подключением
+1. Убедитесь, что backend запущен и пишет `NetMax backend is running on ...`.
+2. Откройте inbound `8080/tcp` в firewall/security group (или `443`, если используете Nginx с TLS).
+3. Проверьте доступ снаружи:
+```bash
+curl http://<PUBLIC_IP>:8080/health
+```
 
 ## Системные уведомления (OS notifications)
 Уведомления теперь приходят не только внутри приложения, но и в систему (Android/iOS/macOS/Windows/Linux):
