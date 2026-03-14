@@ -192,7 +192,12 @@ class ChatProvider extends ChangeNotifier {
       _ => ThemeMode.system,
     };
 
-    _serverUrl = prefs.getString(_serverUrlKey) ?? _defaultServerUrl;
+    final storedServerUrl = prefs.getString(_serverUrlKey) ?? _defaultServerUrl;
+    try {
+      _serverUrl = _normalizeServerUrl(storedServerUrl);
+    } catch (_) {
+      _serverUrl = _defaultServerUrl;
+    }
     _userName = (prefs.getString(_userNameKey) ?? '').trim();
 
     final storedUserId = (prefs.getString(_userIdKey) ?? '').trim();
@@ -908,9 +913,14 @@ class ChatProvider extends ChangeNotifier {
     }
 
     final path = uri.path.isEmpty || uri.path == '/' ? '/ws' : uri.path;
-    uri = uri.replace(path: path, query: '', fragment: '');
-
-    return uri.toString();
+    final cleaned = Uri(
+      scheme: uri.scheme,
+      userInfo: uri.userInfo,
+      host: uri.host,
+      port: uri.hasPort ? uri.port : null,
+      path: path,
+    );
+    return cleaned.toString();
   }
 
   Future<void> checkForUpdates({bool notifyIfNoUpdate = false}) async {
