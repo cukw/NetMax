@@ -15,6 +15,9 @@ const String _authConfigRelativePath = 'config/authorized_users.json';
 const String _updateManifestRelativePath = 'config/update_manifest.json';
 const String _scheduledConfigRelativePath = 'config/scheduled_messages.json';
 const Duration _scheduleTickInterval = Duration(seconds: 20);
+const Duration _storageCleanupInterval = Duration(minutes: 30);
+const Duration _storageFileMaxAge = Duration(days: 14);
+const int _storageMaxBytes = 1024 * 1024 * 1024;
 
 final RoomState _group = RoomState();
 final Random _random = Random();
@@ -27,6 +30,7 @@ final Map<String, ScheduledMessageRule> _scheduledRulesByUserLower =
     <String, ScheduledMessageRule>{};
 
 Timer? _scheduledDispatchTimer;
+Timer? _storageCleanupTimer;
 
 Future<void> main() async {
   _storageDir = Directory(p.join(Directory.current.path, 'storage'));
@@ -41,6 +45,8 @@ Future<void> main() async {
   _loadAuthorizedUsers();
   _loadScheduledRules();
   _startScheduledDispatcher();
+  _cleanupStorage();
+  _startStorageCleanup();
 
   final router = Router()
     ..get('/health', _healthHandler)
@@ -80,6 +86,11 @@ Future<void> main() async {
   stdout.writeln('Authorized users loaded: ${_allowedUsers.length}');
   stdout.writeln(
     'Scheduled rules loaded: ${_scheduledRulesByUserLower.length}',
+  );
+  stdout.writeln(
+    'Storage cleanup: every ${_storageCleanupInterval.inMinutes}m, '
+    'max age ${_storageFileMaxAge.inDays}d, max size '
+    '${(_storageMaxBytes / (1024 * 1024)).round()} MB',
   );
 }
 
@@ -184,6 +195,100 @@ void _startScheduledDispatcher() {
   _scheduledDispatchTimer = Timer.periodic(_scheduleTickInterval, (_) {
     _dispatchScheduledMessages();
   });
+}
+
+void _startStorageCleanup() {
+  _storageCleanupTimer?.cancel();
+  _storageCleanupTimer = Timer.periodic(_storageCleanupInterval, (_) {
+    _cleanupStorage();
+  });
+}
+
+void _cleanupStorage() {
+  final now = DateTime.now();
+  final entries = _listStorageFiles();
+
+  var activeTotalBytes = 0;
+  var deletedFiles = 0;
+  var freedBytes = 0;
+
+  final active = <_StorageFileRecord>[];
+
+  for (final entry in entries) {
+    final age = now.difference(entry.modifiedAt);
+    if (age > _storageFileMaxAge) {
+      if (_deleteStorageFile(entry.file)) {
+        deletedFiles++;
+        freedBytes += entry.sizeBytes;
+      }
+      continue;
+    }
+
+    active.add(entry);
+    activeTotalBytes += entry.sizeBytes;
+  }
+
+  if (activeTotalBytes > _storageMaxBytes) {
+    active.sort((a, b) => a.modifiedAt.compareTo(b.modifiedAt));
+    for (final entry in active) {
+      if (activeTotalBytes <= _storageMaxBytes) {
+        break;
+      }
+      if (_deleteStorageFile(entry.file)) {
+        deletedFiles++;
+        freedBytes += entry.sizeBytes;
+        activeTotalBytes -= entry.sizeBytes;
+      }
+    }
+  }
+
+  if (deletedFiles > 0) {
+    stdout.writeln(
+      'Storage cleanup removed $deletedFiles file(s), '
+      'freed ${(freedBytes / (1024 * 1024)).toStringAsFixed(2)} MB.',
+    );
+  }
+}
+
+List<_StorageFileRecord> _listStorageFiles() {
+  final files = <_StorageFileRecord>[];
+  final entries = _storageDir.listSync(followLinks: false);
+
+  for (final entity in entries) {
+    if (entity is! File) {
+      continue;
+    }
+
+    try {
+      final stat = entity.statSync();
+      if (stat.type != FileSystemEntityType.file) {
+        continue;
+      }
+      files.add(
+        _StorageFileRecord(
+          file: entity,
+          sizeBytes: stat.size,
+          modifiedAt: stat.modified,
+        ),
+      );
+    } catch (_) {
+      // Best effort: inaccessible file will be skipped.
+    }
+  }
+
+  return files;
+}
+
+bool _deleteStorageFile(File file) {
+  try {
+    if (!file.existsSync()) {
+      return false;
+    }
+    file.deleteSync();
+    return true;
+  } catch (_) {
+    return false;
+  }
 }
 
 void _dispatchScheduledMessages() {
@@ -556,6 +661,7 @@ void _handleFileMessage({
   final targetPath = p.join(_storageDir.path, storedName);
 
   File(targetPath).writeAsBytesSync(bytes);
+  _cleanupStorage();
 
   final message = <String, dynamic>{
     'id': _normalizeMessageId(payload['id']),
@@ -866,6 +972,18 @@ class RoomState {
   final Map<String, WebSocketChannel> clients = <String, WebSocketChannel>{};
   final Map<String, String> userNames = <String, String>{};
   final List<Map<String, dynamic>> messages = <Map<String, dynamic>>[];
+}
+
+class _StorageFileRecord {
+  const _StorageFileRecord({
+    required this.file,
+    required this.sizeBytes,
+    required this.modifiedAt,
+  });
+
+  final File file;
+  final int sizeBytes;
+  final DateTime modifiedAt;
 }
 
 class ScheduledMessageRule {

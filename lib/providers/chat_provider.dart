@@ -153,7 +153,7 @@ class ChatProvider extends ChangeNotifier {
             : 'NetMax Messenger готов. Выполняется подключение к серверу...',
       ),
     );
-    notifyListeners();
+    _safeNotify();
 
     _startUpdateChecks();
     await checkForUpdates();
@@ -208,7 +208,7 @@ class ChatProvider extends ChangeNotifier {
     }
 
     _themeMode = mode;
-    notifyListeners();
+    _safeNotify();
 
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_themeModeKey, mode.name);
@@ -258,7 +258,7 @@ class ChatProvider extends ChangeNotifier {
         description: 'Введите имя пользователя из whitelist.',
         showInSystem: false,
       );
-      notifyListeners();
+      _safeNotify();
       return;
     }
 
@@ -266,7 +266,7 @@ class ChatProvider extends ChangeNotifier {
 
     _setConnectionStatus(ChatConnectionStatus.connecting);
     _lastError = null;
-    notifyListeners();
+    _safeNotify();
 
     try {
       final uri = Uri.parse(_serverUrl);
@@ -292,7 +292,7 @@ class ChatProvider extends ChangeNotifier {
         description: 'Не удалось подключиться к серверу.',
         showInSystem: true,
       );
-      notifyListeners();
+      _safeNotify();
     }
   }
 
@@ -324,7 +324,7 @@ class ChatProvider extends ChangeNotifier {
     _setConnectionStatus(ChatConnectionStatus.disconnected);
 
     if (notify) {
-      notifyListeners();
+      _safeNotify();
     }
   }
 
@@ -374,7 +374,7 @@ class ChatProvider extends ChangeNotifier {
         description: 'Получены данные в неверном формате.',
         showInSystem: true,
       );
-      notifyListeners();
+      _safeNotify();
     }
   }
 
@@ -404,7 +404,7 @@ class ChatProvider extends ChangeNotifier {
       await prefs.setString(_userNameKey, _userName);
     });
 
-    notifyListeners();
+    _safeNotify();
   }
 
   void _handleScheduledConfig(Map<String, dynamic> payload) {
@@ -427,7 +427,7 @@ class ChatProvider extends ChangeNotifier {
 
     _scheduledConfigError = null;
     _isSavingScheduledConfig = false;
-    notifyListeners();
+    _safeNotify();
   }
 
   void _onSocketError(Object error) {
@@ -440,7 +440,7 @@ class ChatProvider extends ChangeNotifier {
       description: 'Ошибка: $_lastError',
       showInSystem: true,
     );
-    notifyListeners();
+    _safeNotify();
   }
 
   void _onSocketDone() {
@@ -456,7 +456,7 @@ class ChatProvider extends ChangeNotifier {
         description: 'Соединение с сервером закрыто.',
         showInSystem: true,
       );
-      notifyListeners();
+      _safeNotify();
     }
   }
 
@@ -504,7 +504,7 @@ class ChatProvider extends ChangeNotifier {
       );
     }
 
-    notifyListeners();
+    _safeNotify();
   }
 
   void _handlePresence(Map<String, dynamic> payload) {
@@ -538,7 +538,7 @@ class ChatProvider extends ChangeNotifier {
       showInSystem: true,
     );
 
-    notifyListeners();
+    _safeNotify();
   }
 
   void _handleTyping(Map<String, dynamic> payload) {
@@ -562,7 +562,7 @@ class ChatProvider extends ChangeNotifier {
       _typingUsers.remove(userId);
     }
 
-    notifyListeners();
+    _safeNotify();
   }
 
   void _handleMessage(Map<String, dynamic> payload) {
@@ -594,7 +594,7 @@ class ChatProvider extends ChangeNotifier {
       );
     }
 
-    notifyListeners();
+    _safeNotify();
   }
 
   void _handleServerError(Map<String, dynamic> payload) {
@@ -621,7 +621,7 @@ class ChatProvider extends ChangeNotifier {
 
       _channel?.sink.close();
       _channel = null;
-      notifyListeners();
+      _safeNotify();
       return;
     }
 
@@ -631,7 +631,7 @@ class ChatProvider extends ChangeNotifier {
       description: message,
       showInSystem: false,
     );
-    notifyListeners();
+    _safeNotify();
   }
 
   Future<String?> saveScheduledMessageConfig({
@@ -660,7 +660,7 @@ class ChatProvider extends ChangeNotifier {
     _scheduledTimezoneOffsetMinutes = DateTime.now().timeZoneOffset.inMinutes;
     _scheduledConfigError = null;
     _isSavingScheduledConfig = true;
-    notifyListeners();
+    _safeNotify();
 
     _sendEnvelope(
       type: 'scheduled_config_set',
@@ -688,7 +688,7 @@ class ChatProvider extends ChangeNotifier {
         description: 'Подключитесь к серверу, чтобы отправить сообщение.',
         showInSystem: false,
       );
-      notifyListeners();
+      _safeNotify();
       return;
     }
 
@@ -714,7 +714,7 @@ class ChatProvider extends ChangeNotifier {
     }
 
     _isPickingFile = true;
-    notifyListeners();
+    _safeNotify();
 
     try {
       final result = await FilePicker.platform.pickFiles(
@@ -761,14 +761,14 @@ class ChatProvider extends ChangeNotifier {
         description: picked.name,
         showInSystem: false,
       );
-      notifyListeners();
+      _safeNotify();
 
       return null;
     } catch (_) {
       return 'Не удалось выбрать файл. Проверьте доступ к файловой системе.';
     } finally {
       _isPickingFile = false;
-      notifyListeners();
+      _safeNotify();
     }
   }
 
@@ -830,7 +830,7 @@ class ChatProvider extends ChangeNotifier {
       return;
     }
     _notifications.clear();
-    notifyListeners();
+    _safeNotify();
   }
 
   void _setConnectionStatus(ChatConnectionStatus status) {
@@ -920,7 +920,7 @@ class ChatProvider extends ChangeNotifier {
 
     _isCheckingUpdates = true;
     _updateError = null;
-    notifyListeners();
+    _safeNotify();
 
     try {
       final manifestUri = _updateManifestUriFromServerUrl(_serverUrl);
@@ -1001,7 +1001,7 @@ class ChatProvider extends ChangeNotifier {
     } finally {
       _lastUpdateCheckAt = DateTime.now();
       _isCheckingUpdates = false;
-      notifyListeners();
+      _safeNotify();
     }
   }
 
@@ -1141,6 +1141,13 @@ class ChatProvider extends ChangeNotifier {
       return value.cast<String, dynamic>();
     }
     return <String, dynamic>{};
+  }
+
+  void _safeNotify() {
+    if (_disposed) {
+      return;
+    }
+    notifyListeners();
   }
 
   @override
