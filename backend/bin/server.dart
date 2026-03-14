@@ -17,6 +17,7 @@ const Duration _scheduleTickInterval = Duration(seconds: 20);
 const Duration _storageCleanupInterval = Duration(minutes: 30);
 const Duration _storageFileMaxAge = Duration(days: 14);
 const int _storageMaxBytes = 1024 * 1024 * 1024;
+const Set<String> _scheduledRestrictedUsersLower = <String>{'юлия сергеевна'};
 
 final RoomState _group = RoomState();
 final Random _random = Random();
@@ -167,6 +168,7 @@ void _loadScheduledRules() {
     final decoded = jsonDecode(_scheduledConfigFile.readAsStringSync());
     final root = _asMap(decoded);
     final rawSchedules = root['schedules'];
+    var droppedInvalidRule = false;
 
     _scheduledRulesByUserLower.clear();
     if (rawSchedules is List) {
@@ -180,12 +182,21 @@ void _loadScheduledRules() {
         final authorizedName =
             _allowedUsersByLower[rule.userName.toLowerCase()];
         if (authorizedName == null) {
+          droppedInvalidRule = true;
+          continue;
+        }
+
+        if (!_isScheduledAllowedForUser(authorizedName)) {
+          droppedInvalidRule = true;
           continue;
         }
 
         final normalized = rule.copyWith(userName: authorizedName);
         _scheduledRulesByUserLower[authorizedName.toLowerCase()] = normalized;
       }
+    }
+    if (droppedInvalidRule) {
+      _saveScheduledRules();
     }
   } catch (_) {
     _scheduledRulesByUserLower.clear();
@@ -317,6 +328,12 @@ void _dispatchScheduledMessages() {
   for (final key in _scheduledRulesByUserLower.keys.toList(growable: false)) {
     final rule = _scheduledRulesByUserLower[key];
     if (rule == null || !rule.enabled) {
+      continue;
+    }
+
+    if (!_isScheduledAllowedForUser(rule.userName)) {
+      _scheduledRulesByUserLower.remove(key);
+      changed = true;
       continue;
     }
 
@@ -472,8 +489,7 @@ Response _filesHandler(Request request, String file) {
     HttpHeaders.contentLengthHeader: stat.size.toString(),
   };
   if (forceDownload) {
-    headers['content-disposition'] =
-        'attachment; filename="$downloadName"';
+    headers['content-disposition'] = 'attachment; filename="$downloadName"';
   }
 
   return Response.ok(target.openRead(), headers: headers);
@@ -767,6 +783,23 @@ void _handleScheduledConfigSet({
   required String userName,
   required Map<String, dynamic> payload,
 }) {
+  if (!_isScheduledAllowedForUser(userName)) {
+    final removed = _scheduledRulesByUserLower.remove(userName.toLowerCase());
+    if (removed != null) {
+      _saveScheduledRules();
+    }
+    _sendScheduledConfig(channel: channel, userName: userName);
+    _sendEnvelope(
+      channel,
+      type: 'error',
+      payload: {
+        'message':
+            'Для пользователя "$userName" отправка по времени отключена.',
+      },
+    );
+    return;
+  }
+
   final enabled = payload['enabled'] == true;
   final text = (payload['text']?.toString() ?? '').trim();
   final time = _normalizeScheduleTime(payload['time']) ?? '09:00';
@@ -810,7 +843,7 @@ void _handleScheduledConfigSet({
     text: normalizedText,
     time: normalizedTime,
     timezoneOffsetMinutes: timezoneOffsetMinutes,
-    lastSentDate: resetLastDate ? null : current?.lastSentDate,
+    lastSentDate: resetLastDate ? null : current.lastSentDate,
     updatedAt: DateTime.now().toUtc().toIso8601String(),
   );
 
@@ -823,13 +856,17 @@ void _sendScheduledConfig({
   required WebSocketChannel channel,
   required String userName,
 }) {
-  final rule = _scheduledRulesByUserLower[userName.toLowerCase()];
+  final isAllowed = _isScheduledAllowedForUser(userName);
+  final rule = isAllowed
+      ? _scheduledRulesByUserLower[userName.toLowerCase()]
+      : null;
 
   _sendEnvelope(
     channel,
     type: 'scheduled_config',
     payload: {
       'userName': userName,
+      'allowed': isAllowed,
       'enabled': rule?.enabled ?? false,
       'text': rule?.text ?? '',
       'time': rule?.time ?? '09:00',
@@ -1027,6 +1064,12 @@ String _formatHm(DateTime dateTime) {
   final hour = dateTime.hour.toString().padLeft(2, '0');
   final minute = dateTime.minute.toString().padLeft(2, '0');
   return '$hour:$minute';
+}
+
+bool _isScheduledAllowedForUser(String userName) {
+  return !_scheduledRestrictedUsersLower.contains(
+    userName.trim().toLowerCase(),
+  );
 }
 
 Middleware _cors() {

@@ -242,14 +242,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   void _syncScheduleDraft(ChatProvider chatProvider) {
     final signature =
-        '${chatProvider.scheduledEnabled}|${chatProvider.scheduledText}|${chatProvider.scheduledTime}|${chatProvider.scheduledLastSentDate}|${chatProvider.scheduledUpdatedAt?.millisecondsSinceEpoch ?? 0}';
+        '${chatProvider.canUseScheduledMessages}|${chatProvider.scheduledEnabled}|${chatProvider.scheduledText}|${chatProvider.scheduledTime}|${chatProvider.scheduledLastSentDate}|${chatProvider.scheduledUpdatedAt?.millisecondsSinceEpoch ?? 0}';
 
     if (signature == _scheduleSignature) {
       return;
     }
 
     _scheduleSignature = signature;
-    _scheduledEnabledDraft = chatProvider.scheduledEnabled;
+    _scheduledEnabledDraft =
+        chatProvider.canUseScheduledMessages && chatProvider.scheduledEnabled;
     _scheduledTimeDraft = chatProvider.scheduledTime;
 
     if (_scheduledTextController.text != chatProvider.scheduledText) {
@@ -489,6 +490,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final theme = Theme.of(context);
     final lastSent = chatProvider.scheduledLastSentDate;
     final updatedAt = chatProvider.scheduledUpdatedAt;
+    final canUseScheduledMessages = chatProvider.canUseScheduledMessages;
 
     return Center(
       child: ConstrainedBox(
@@ -523,111 +525,113 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 ),
               ),
             ),
-            const SizedBox(height: 10),
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      'Отправка по времени',
-                      style: TextStyle(
-                        fontWeight: FontWeight.w700,
-                        fontSize: 17,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    SwitchListTile.adaptive(
-                      contentPadding: EdgeInsets.zero,
-                      value: _scheduledEnabledDraft,
-                      title: const Text('Отправлять сообщение по времени'),
-                      subtitle: const Text(
-                        'Сервер сам отправит сообщение в указанное время.',
-                      ),
-                      onChanged: (value) {
-                        setState(() {
-                          _scheduledEnabledDraft = value;
-                        });
-                      },
-                    ),
-                    if (_scheduledEnabledDraft) ...[
-                      const SizedBox(height: 8),
-                      TextField(
-                        controller: _scheduledTextController,
-                        minLines: 2,
-                        maxLines: 4,
-                        decoration: const InputDecoration(
-                          labelText: 'Текст сообщения',
-                          hintText: 'Введите сообщение для автo-отправки',
+            if (canUseScheduledMessages) ...[
+              const SizedBox(height: 10),
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Отправка по времени',
+                        style: TextStyle(
+                          fontWeight: FontWeight.w700,
+                          fontSize: 17,
                         ),
                       ),
-                      const SizedBox(height: 10),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: InputDecorator(
-                              decoration: const InputDecoration(
-                                labelText: 'Время отправки',
-                              ),
-                              child: Text(
-                                _scheduledTimeDraft,
-                                style: theme.textTheme.titleMedium,
+                      const SizedBox(height: 8),
+                      SwitchListTile.adaptive(
+                        contentPadding: EdgeInsets.zero,
+                        value: _scheduledEnabledDraft,
+                        title: const Text('Отправлять сообщение по времени'),
+                        subtitle: const Text(
+                          'Сервер сам отправит сообщение в указанное время.',
+                        ),
+                        onChanged: (value) {
+                          setState(() {
+                            _scheduledEnabledDraft = value;
+                          });
+                        },
+                      ),
+                      if (_scheduledEnabledDraft) ...[
+                        const SizedBox(height: 8),
+                        TextField(
+                          controller: _scheduledTextController,
+                          minLines: 2,
+                          maxLines: 4,
+                          decoration: const InputDecoration(
+                            labelText: 'Текст сообщения',
+                            hintText: 'Введите сообщение для автo-отправки',
+                          ),
+                        ),
+                        const SizedBox(height: 10),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: InputDecorator(
+                                decoration: const InputDecoration(
+                                  labelText: 'Время отправки',
+                                ),
+                                child: Text(
+                                  _scheduledTimeDraft,
+                                  style: theme.textTheme.titleMedium,
+                                ),
                               ),
                             ),
+                            const SizedBox(width: 8),
+                            OutlinedButton.icon(
+                              onPressed: _pickScheduleTime,
+                              icon: const Icon(Icons.access_time_rounded),
+                              label: const Text('Выбрать'),
+                            ),
+                          ],
+                        ),
+                      ],
+                      const SizedBox(height: 12),
+                      Row(
+                        children: [
+                          FilledButton.icon(
+                            onPressed: chatProvider.isSavingScheduledConfig
+                                ? null
+                                : () => _saveSchedule(chatProvider),
+                            icon: chatProvider.isSavingScheduledConfig
+                                ? const SizedBox(
+                                    width: 14,
+                                    height: 14,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
+                                  )
+                                : const Icon(Icons.save_rounded),
+                            label: const Text('Сохранить в JSON'),
                           ),
-                          const SizedBox(width: 8),
-                          OutlinedButton.icon(
-                            onPressed: _pickScheduleTime,
-                            icon: const Icon(Icons.access_time_rounded),
-                            label: const Text('Выбрать'),
-                          ),
+                          const SizedBox(width: 10),
+                          if (chatProvider.isSavingScheduledConfig)
+                            const Text('Сохраняем...'),
                         ],
                       ),
-                    ],
-                    const SizedBox(height: 12),
-                    Row(
-                      children: [
-                        FilledButton.icon(
-                          onPressed: chatProvider.isSavingScheduledConfig
-                              ? null
-                              : () => _saveSchedule(chatProvider),
-                          icon: chatProvider.isSavingScheduledConfig
-                              ? const SizedBox(
-                                  width: 14,
-                                  height: 14,
-                                  child: CircularProgressIndicator(
-                                    strokeWidth: 2,
-                                  ),
-                                )
-                              : const Icon(Icons.save_rounded),
-                          label: const Text('Сохранить в JSON'),
-                        ),
-                        const SizedBox(width: 10),
-                        if (chatProvider.isSavingScheduledConfig)
-                          const Text('Сохраняем...'),
-                      ],
-                    ),
-                    if (chatProvider.scheduledConfigError != null) ...[
-                      const SizedBox(height: 8),
-                      Text(
-                        chatProvider.scheduledConfigError!,
-                        style: TextStyle(color: theme.colorScheme.error),
-                      ),
-                    ],
-                    if (lastSent != null || updatedAt != null) ...[
-                      const SizedBox(height: 10),
-                      if (lastSent != null)
-                        Text('Последняя автоотправка: $lastSent'),
-                      if (updatedAt != null)
+                      if (chatProvider.scheduledConfigError != null) ...[
+                        const SizedBox(height: 8),
                         Text(
-                          'Обновлено: ${DateFormat('dd.MM.yyyy HH:mm').format(updatedAt)}',
+                          chatProvider.scheduledConfigError!,
+                          style: TextStyle(color: theme.colorScheme.error),
                         ),
+                      ],
+                      if (lastSent != null || updatedAt != null) ...[
+                        const SizedBox(height: 10),
+                        if (lastSent != null)
+                          Text('Последняя автоотправка: $lastSent'),
+                        if (updatedAt != null)
+                          Text(
+                            'Обновлено: ${DateFormat('dd.MM.yyyy HH:mm').format(updatedAt)}',
+                          ),
+                      ],
                     ],
-                  ],
+                  ),
                 ),
               ),
-            ),
+            ],
           ],
         ),
       ),

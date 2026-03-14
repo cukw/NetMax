@@ -50,6 +50,9 @@ class ChatProvider extends ChangeNotifier {
   static const Duration _updateCheckInterval = Duration(minutes: 15);
   static const Duration _reconnectBaseDelay = Duration(seconds: 3);
   static const Duration _reconnectMaxDelay = Duration(seconds: 30);
+  static const Set<String> _scheduledRestrictedUsersLower = <String>{
+    'юлия сергеевна',
+  };
 
   final List<ChatMessage> _messages = <ChatMessage>[];
   final List<AppNotification> _notifications = <AppNotification>[];
@@ -98,6 +101,7 @@ class ChatProvider extends ChangeNotifier {
   String? _scheduledLastSentDate;
   DateTime? _scheduledUpdatedAt;
   String? _scheduledConfigError;
+  bool _isScheduledAllowedByServer = true;
 
   DateTime _lastTypingSystemNotificationAt =
       DateTime.fromMillisecondsSinceEpoch(0);
@@ -135,11 +139,16 @@ class ChatProvider extends ChangeNotifier {
   String? get scheduledLastSentDate => _scheduledLastSentDate;
   DateTime? get scheduledUpdatedAt => _scheduledUpdatedAt;
   String? get scheduledConfigError => _scheduledConfigError;
+  bool get canUseScheduledMessages =>
+      _isScheduledAllowedByServer && _isScheduledAllowedForUser(_userName);
   bool get hasSavedPasswordForCurrentUser => hasSavedPasswordForUser(_userName);
 
   ChatUser get me => ChatUser(id: _userId, name: _userName, isMe: true);
 
   bool hasSavedPasswordForUser(String userName) {
+    if (!_canPersistPasswordLocally) {
+      return false;
+    }
     final key = _passwordCacheKey(userName);
     if (key.isEmpty) {
       return false;
@@ -229,9 +238,12 @@ class ChatProvider extends ChangeNotifier {
     };
 
     _dismissedUpdateSignature = prefs.getString(_dismissedUpdateSignatureKey);
-    _passwordsByUserLower
-      ..clear()
-      ..addAll(_decodePasswordMap(prefs.getString(_passwordsByUserKey)));
+    _passwordsByUserLower.clear();
+    if (_canPersistPasswordLocally) {
+      _passwordsByUserLower.addAll(
+        _decodePasswordMap(prefs.getString(_passwordsByUserKey)),
+      );
+    }
 
     final storedServerUrl = prefs.getString(_serverUrlKey) ?? _defaultServerUrl;
     try {
@@ -276,7 +288,7 @@ class ChatProvider extends ChangeNotifier {
 
     final cacheKey = _passwordCacheKey(normalizedUserName);
     final typedPassword = password.trim();
-    final cachedPassword = cacheKey.isEmpty
+    final cachedPassword = !_canPersistPasswordLocally || cacheKey.isEmpty
         ? ''
         : (_passwordsByUserLower[cacheKey] ?? '');
     final effectivePassword = typedPassword.isNotEmpty
@@ -288,6 +300,7 @@ class ChatProvider extends ChangeNotifier {
 
     _serverUrl = normalizedServerUrl;
     _userName = normalizedUserName;
+    _isScheduledAllowedByServer = _isScheduledAllowedForUser(_userName);
     _pendingPasswordForAuth = effectivePassword;
 
     final prefs = await SharedPreferences.getInstance();
@@ -472,6 +485,7 @@ class ChatProvider extends ChangeNotifier {
     if (authorizedUserName.isNotEmpty) {
       _userName = authorizedUserName;
     }
+    _isScheduledAllowedByServer = _isScheduledAllowedForUser(_userName);
 
     _setConnectionStatus(ChatConnectionStatus.connected);
     _manualDisconnectRequested = false;
@@ -488,15 +502,17 @@ class ChatProvider extends ChangeNotifier {
     SharedPreferences.getInstance().then((prefs) async {
       await prefs.setString(_userIdKey, _userId);
       await prefs.setString(_userNameKey, _userName);
-      final password = _pendingPasswordForAuth?.trim();
-      if (password != null && password.isNotEmpty) {
-        final key = _passwordCacheKey(_userName);
-        if (key.isNotEmpty) {
-          _passwordsByUserLower[key] = password;
-          await prefs.setString(
-            _passwordsByUserKey,
-            jsonEncode(_passwordsByUserLower),
-          );
+      if (_canPersistPasswordLocally) {
+        final password = _pendingPasswordForAuth?.trim();
+        if (password != null && password.isNotEmpty) {
+          final key = _passwordCacheKey(_userName);
+          if (key.isNotEmpty) {
+            _passwordsByUserLower[key] = password;
+            await prefs.setString(
+              _passwordsByUserKey,
+              jsonEncode(_passwordsByUserLower),
+            );
+          }
         }
       }
     });
@@ -506,6 +522,14 @@ class ChatProvider extends ChangeNotifier {
   }
 
   void _handleScheduledConfig(Map<String, dynamic> payload) {
+    final payloadUserName = (payload['userName']?.toString() ?? '').trim();
+    final userNameForPolicy = payloadUserName.isEmpty
+        ? _userName
+        : payloadUserName;
+    final allowedByServer = payload['allowed'] != false;
+    _isScheduledAllowedByServer =
+        allowedByServer && _isScheduledAllowedForUser(userNameForPolicy);
+
     _scheduledEnabled = payload['enabled'] == true;
     _scheduledText = (payload['text']?.toString() ?? '').trim();
 
@@ -522,6 +546,10 @@ class ChatProvider extends ChangeNotifier {
 
     final updatedAtRaw = (payload['updatedAt']?.toString() ?? '').trim();
     _scheduledUpdatedAt = DateTime.tryParse(updatedAtRaw)?.toLocal();
+
+    if (!_isScheduledAllowedByServer) {
+      _scheduledEnabled = false;
+    }
 
     _scheduledConfigError = null;
     _isSavingScheduledConfig = false;
@@ -684,9 +712,7 @@ class ChatProvider extends ChangeNotifier {
             : NotificationKind.message,
         title: message.type == MessageType.file
             ? 'Новый файл'
-            : (message.isScheduled
-                  ? 'Сообщение по времени'
-                  : 'Новое сообщение'),
+            : 'Новое сообщение',
         description: message.type == MessageType.file
             ? '${message.senderName}: ${message.attachment?.name ?? 'Файл'}'
             : '${message.senderName}: ${message.text ?? ''}',
@@ -717,7 +743,8 @@ class ChatProvider extends ChangeNotifier {
         _cancelReconnect();
         _pendingPasswordForAuth = null;
         final cacheKey = _passwordCacheKey(_userName);
-        if (cacheKey.isNotEmpty &&
+        if (_canPersistPasswordLocally &&
+            cacheKey.isNotEmpty &&
             _passwordsByUserLower.remove(cacheKey) != null) {
           unawaited(_savePasswordCache());
         }
@@ -752,6 +779,10 @@ class ChatProvider extends ChangeNotifier {
     required String text,
     required String time,
   }) async {
+    if (!canUseScheduledMessages) {
+      return 'Для пользователя $_userName отправка по времени отключена.';
+    }
+
     if (!isConnected) {
       return 'Подключитесь к серверу, чтобы сохранить расписание.';
     }
@@ -985,6 +1016,9 @@ class ChatProvider extends ChangeNotifier {
     if (pending != null && pending.isNotEmpty) {
       return pending;
     }
+    if (!_canPersistPasswordLocally) {
+      return '';
+    }
     final key = _passwordCacheKey(_userName);
     if (key.isEmpty) {
       return '';
@@ -999,6 +1033,16 @@ class ChatProvider extends ChangeNotifier {
   String _passwordCacheKey(String userName) {
     return userName.trim().toLowerCase();
   }
+
+  bool _isScheduledAllowedForUser(String userName) {
+    final key = userName.trim().toLowerCase();
+    if (key.isEmpty) {
+      return true;
+    }
+    return !_scheduledRestrictedUsersLower.contains(key);
+  }
+
+  bool get _canPersistPasswordLocally => true;
 
   Map<String, String> _decodePasswordMap(String? raw) {
     if (raw == null || raw.trim().isEmpty) {
@@ -1025,6 +1069,9 @@ class ChatProvider extends ChangeNotifier {
   }
 
   Future<void> _savePasswordCache() async {
+    if (!_canPersistPasswordLocally) {
+      return;
+    }
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(
       _passwordsByUserKey,
