@@ -1,13 +1,13 @@
 {
   "version": "1.0.0",
-  "build": 1,
-  "notes": "Initial release",
+  "build": 6,
+  "notes": "CI build 6",
   "downloads": {
-    "android": "https://example.com/netmax/android/app-release.apk",
-    "ios": "https://example.com/netmax/ios/netmax-ios.app.zip",
-    "macos": "https://example.com/netmax/macos/netmax-macos.app.zip",
-    "windows": "https://example.com/netmax/windows/netmax-windows-x64.zip",
-    "linux": "https://example.com/netmax/linux/netmax-linux-x64.tar.gz",
-    "web": "https://example.com/netmax/web/netmax-web.zip"
+    "android": "https://github.com/cukw/NetMax/releases/download/v1.0.0-build.6/netmax-android.apk",
+    "ios": "https://github.com/cukw/NetMax/releases/download/v1.0.0-build.6/netmax-ios.app.zip",
+    "macos": "https://github.com/cukw/NetMax/releases/download/v1.0.0-build.6/netmax-macos.app.zip",
+    "windows": "https://github.com/cukw/NetMax/releases/download/v1.0.0-build.6/netmax-windows-x64.zip",
+    "linux": "https://github.com/cukw/NetMax/releases/download/v1.0.0-build.6/netmax-linux-x64.tar.gz",
+    "web": "https://github.com/cukw/NetMax/releases/download/v1.0.0-build.6/netmax-web.zip"
   }
 }
