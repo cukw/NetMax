@@ -472,7 +472,7 @@ Response _filesHandler(Request request, String file) {
     HttpHeaders.contentLengthHeader: stat.size.toString(),
   };
   if (forceDownload) {
-    headers[HttpHeaders.contentDispositionHeader] =
+    headers['content-disposition'] =
         'attachment; filename="$downloadName"';
   }
 
