@@ -14,7 +14,7 @@ class ChatScreen extends StatefulWidget {
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends State<ChatScreen> {
+class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final TextEditingController _messageController = TextEditingController();
   final TextEditingController _scheduledTextController =
       TextEditingController();
@@ -28,11 +28,31 @@ class _ChatScreenState extends State<ChatScreen> {
   String _scheduleSignature = '';
 
   @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _messageController.dispose();
     _scheduledTextController.dispose();
     _scrollController.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed || !mounted) {
+      return;
+    }
+
+    final chatProvider = context.read<ChatProvider>();
+    if (chatProvider.userName.trim().isEmpty || chatProvider.isConnected) {
+      return;
+    }
+    chatProvider.connect(force: true);
   }
 
   void _sendMessage(ChatProvider chatProvider) {
@@ -45,7 +65,33 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _sendFile(ChatProvider chatProvider) async {
-    final error = await chatProvider.pickAndSendFile();
+    PreparedFileUpload? prepared;
+    try {
+      prepared = await chatProvider.pickFileForSending();
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      final message = _readableErrorMessage(error);
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(message)));
+      return;
+    }
+    if (!mounted) {
+      return;
+    }
+
+    if (prepared == null) {
+      return;
+    }
+
+    final caption = await _showFileCaptionDialog(prepared.name);
+    if (!mounted || caption == null) {
+      return;
+    }
+
+    final error = await chatProvider.sendPickedFile(prepared, caption: caption);
     if (!mounted) {
       return;
     }
@@ -58,6 +104,60 @@ class _ChatScreenState extends State<ChatScreen> {
     }
 
     _scrollToBottom();
+  }
+
+  Future<String?> _showFileCaptionDialog(String fileName) async {
+    final controller = TextEditingController();
+    String? result;
+
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: const Text('Подпись к файлу'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                fileName,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(
+                  dialogContext,
+                ).textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: controller,
+                minLines: 2,
+                maxLines: 4,
+                decoration: const InputDecoration(
+                  labelText: 'Сообщение к файлу',
+                  hintText: 'Например: Документ на согласование',
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('Отмена'),
+            ),
+            FilledButton(
+              onPressed: () {
+                result = controller.text.trim();
+                Navigator.of(dialogContext).pop();
+              },
+              child: const Text('Отправить'),
+            ),
+          ],
+        );
+      },
+    );
+
+    controller.dispose();
+    return result;
   }
 
   Future<void> _checkForUpdates(ChatProvider chatProvider) async {
@@ -86,6 +186,17 @@ class _ChatScreenState extends State<ChatScreen> {
     ScaffoldMessenger.of(
       context,
     ).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  Future<void> _openAttachment(
+    ChatProvider chatProvider,
+    MessageAttachment attachment,
+  ) async {
+    final error = await chatProvider.openAttachment(attachment);
+    if (!mounted || error == null) {
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(error)));
   }
 
   Future<void> _pickScheduleTime() async {
@@ -336,7 +447,7 @@ class _ChatScreenState extends State<ChatScreen> {
           children: [
             if (latestNotification != null)
               _buildActivityBanner(latestNotification),
-            if (chatProvider.isUpdateAvailable)
+            if (chatProvider.shouldShowUpdateBanner)
               _buildUpdateBanner(chatProvider),
             if (chatProvider.isCheckingUpdates)
               const Padding(
@@ -354,7 +465,16 @@ class _ChatScreenState extends State<ChatScreen> {
                 itemBuilder: (context, index) {
                   final message = messages[index];
                   final isMine = message.senderId == chatProvider.me.id;
-                  return MessageBubble(message: message, isMine: isMine);
+                  return MessageBubble(
+                    message: message,
+                    isMine: isMine,
+                    onAttachmentTap: message.attachment == null
+                        ? null
+                        : () => _openAttachment(
+                            chatProvider,
+                            message.attachment!,
+                          ),
+                  );
                 },
               ),
             ),
@@ -594,6 +714,15 @@ class _ChatScreenState extends State<ChatScreen> {
                     ),
                   ),
                 ),
+                IconButton(
+                  tooltip: 'Закрыть',
+                  onPressed: () => chatProvider.dismissUpdateBanner(),
+                  icon: Icon(
+                    Icons.close_rounded,
+                    size: 18,
+                    color: theme.colorScheme.onTertiaryContainer,
+                  ),
+                ),
               ],
             ),
             const SizedBox(height: 6),
@@ -689,98 +818,152 @@ class _ChatScreenState extends State<ChatScreen> {
       text: chatProvider.serverUrl,
     );
     final userController = TextEditingController(text: chatProvider.userName);
+    final passwordController = TextEditingController();
+    var hasSavedPassword = chatProvider.hasSavedPasswordForUser(
+      userController.text,
+    );
+    var obscurePassword = true;
 
-    return showModalBottomSheet<void>(
+    final future = showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
       showDragHandle: true,
       builder: (context) {
-        return Padding(
-          padding: EdgeInsets.only(
-            left: 16,
-            right: 16,
-            top: 8,
-            bottom: MediaQuery.of(context).viewInsets.bottom + 16,
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                'Подключение к серверу',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+        return StatefulBuilder(
+          builder: (context, setSheetState) {
+            return Padding(
+              padding: EdgeInsets.only(
+                left: 16,
+                right: 16,
+                top: 8,
+                bottom: MediaQuery.of(context).viewInsets.bottom + 16,
               ),
-              const SizedBox(height: 8),
-              const Text(
-                'Укажите WebSocket URL сервера и имя пользователя из списка авторизованных.',
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: serverController,
-                keyboardType: TextInputType.url,
-                decoration: const InputDecoration(
-                  labelText: 'Server URL',
-                  hintText: 'ws://localhost:8080/ws',
-                ),
-              ),
-              const SizedBox(height: 10),
-              TextField(
-                controller: userController,
-                decoration: const InputDecoration(
-                  labelText: 'Имя пользователя',
-                ),
-              ),
-              const SizedBox(height: 14),
-              Row(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Expanded(
-                    child: OutlinedButton(
-                      onPressed: () {
-                        Navigator.of(context).pop();
-                      },
-                      child: const Text('Отмена'),
+                  const Text(
+                    'Подключение к серверу',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Укажите WebSocket URL сервера, имя пользователя и пароль.',
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: serverController,
+                    keyboardType: TextInputType.url,
+                    decoration: const InputDecoration(
+                      labelText: 'Server URL',
+                      hintText: 'ws://localhost:8080/ws',
                     ),
                   ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: FilledButton(
-                      onPressed: () async {
-                        try {
-                          await chatProvider.applyConnectionSettings(
-                            serverUrl: serverController.text,
-                            userName: userController.text,
-                          );
-                          if (!context.mounted) {
-                            return;
-                          }
-                          Navigator.of(context).pop();
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(
-                              content: Text(
-                                'Настройки сохранены. Выполнено подключение.',
-                              ),
-                            ),
-                          );
-                        } catch (error) {
-                          if (!context.mounted) {
-                            return;
-                          }
-                          final message = _readableErrorMessage(error);
-                          ScaffoldMessenger.of(
-                            context,
-                          ).showSnackBar(SnackBar(content: Text(message)));
-                        }
-                      },
-                      child: const Text('Сохранить и подключить'),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: userController,
+                    onChanged: (value) {
+                      setSheetState(() {
+                        hasSavedPassword = chatProvider.hasSavedPasswordForUser(
+                          value,
+                        );
+                      });
+                    },
+                    decoration: const InputDecoration(
+                      labelText: 'Имя пользователя',
                     ),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: passwordController,
+                    obscureText: obscurePassword,
+                    autocorrect: false,
+                    enableSuggestions: false,
+                    decoration: InputDecoration(
+                      labelText: 'Пароль',
+                      hintText: hasSavedPassword
+                          ? 'Оставьте пустым, чтобы использовать сохраненный'
+                          : 'Введите пароль',
+                      suffixIcon: IconButton(
+                        onPressed: () {
+                          setSheetState(() {
+                            obscurePassword = !obscurePassword;
+                          });
+                        },
+                        icon: Icon(
+                          obscurePassword
+                              ? Icons.visibility_off_rounded
+                              : Icons.visibility_rounded,
+                        ),
+                      ),
+                    ),
+                  ),
+                  if (hasSavedPassword) ...[
+                    const SizedBox(height: 6),
+                    Text(
+                      'Пароль для этого пользователя уже сохранен на устройстве.',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ],
+                  const SizedBox(height: 14),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: () {
+                            Navigator.of(context).pop();
+                          },
+                          child: const Text('Отмена'),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: FilledButton(
+                          onPressed: () async {
+                            try {
+                              await chatProvider.applyConnectionSettings(
+                                serverUrl: serverController.text,
+                                userName: userController.text,
+                                password: passwordController.text,
+                              );
+                              if (!context.mounted) {
+                                return;
+                              }
+                              Navigator.of(context).pop();
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(
+                                  content: Text(
+                                    'Настройки сохранены. Выполнено подключение.',
+                                  ),
+                                ),
+                              );
+                            } catch (error) {
+                              if (!context.mounted) {
+                                return;
+                              }
+                              final message = _readableErrorMessage(error);
+                              ScaffoldMessenger.of(
+                                context,
+                              ).showSnackBar(SnackBar(content: Text(message)));
+                            }
+                          },
+                          child: const Text('Сохранить и подключить'),
+                        ),
+                      ),
+                    ],
                   ),
                 ],
               ),
-            ],
-          ),
+            );
+          },
         );
       },
     );
+    return future.whenComplete(() {
+      serverController.dispose();
+      userController.dispose();
+      passwordController.dispose();
+    });
   }
 
   Future<void> _openNotificationsSheet(ChatProvider chatProvider) {

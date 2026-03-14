@@ -7,7 +7,6 @@ import 'package:path/path.dart' as p;
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as shelf_io;
 import 'package:shelf_router/shelf_router.dart';
-import 'package:shelf_static/shelf_static.dart';
 import 'package:shelf_web_socket/shelf_web_socket.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
@@ -25,6 +24,7 @@ final Random _random = Random();
 late final Directory _storageDir;
 late final List<String> _allowedUsers;
 late final Map<String, String> _allowedUsersByLower;
+late final Map<String, String> _passwordsByUserLower;
 late final File _scheduledConfigFile;
 final Map<String, ScheduledMessageRule> _scheduledRulesByUserLower =
     <String, ScheduledMessageRule>{};
@@ -61,14 +61,7 @@ Future<void> main() async {
       ),
     );
 
-  final filesHandler = createStaticHandler(
-    _storageDir.path,
-    listDirectories: false,
-  );
-  router.get('/files/<file|.*>', (Request request, String file) {
-    final normalizedPath = file.trim().isEmpty ? '/' : file;
-    return filesHandler(request.change(path: normalizedPath));
-  });
+  router.get('/files/<file|.*>', _filesHandler);
 
   final handler = Pipeline()
       .addMiddleware(_cors())
@@ -101,7 +94,8 @@ void _loadAuthorizedUsers() {
   if (!configFile.existsSync()) {
     throw StateError(
       'Authorization config not found: ${configFile.path}. '
-      'Create $_authConfigRelativePath with allowedUsers list.',
+      'Create $_authConfigRelativePath with allowedUsers list containing '
+      '{"name","password"} entries.',
     );
   }
 
@@ -120,13 +114,35 @@ void _loadAuthorizedUsers() {
     );
   }
 
-  final users =
-      usersRaw
-          .map((value) => value.toString().trim())
-          .where((value) => value.isNotEmpty)
-          .toSet()
-          .toList()
-        ..sort();
+  final users = <String>[];
+  final usersByLower = <String, String>{};
+  final passwordsByLower = <String, String>{};
+
+  for (final rawUser in usersRaw) {
+    final map = _asMap(rawUser);
+    final name = (map['name']?.toString() ?? '').trim();
+    final password = (map['password']?.toString() ?? '').trim();
+
+    if (name.isEmpty) {
+      throw StateError(
+        'Invalid authorization config: each user must contain non-empty "name".',
+      );
+    }
+    if (password.isEmpty) {
+      throw StateError('Password is empty for user "$name".');
+    }
+
+    final lower = name.toLowerCase();
+    if (usersByLower.containsKey(lower)) {
+      throw StateError('Duplicate user in authorization config: "$name".');
+    }
+
+    usersByLower[lower] = name;
+    passwordsByLower[lower] = password;
+    users.add(name);
+  }
+
+  users.sort();
 
   if (users.length < 30) {
     throw StateError(
@@ -135,9 +151,8 @@ void _loadAuthorizedUsers() {
   }
 
   _allowedUsers = List<String>.unmodifiable(users);
-  _allowedUsersByLower = {
-    for (final name in _allowedUsers) name.toLowerCase(): name,
-  };
+  _allowedUsersByLower = Map<String, String>.unmodifiable(usersByLower);
+  _passwordsByUserLower = Map<String, String>.unmodifiable(passwordsByLower);
 }
 
 void _loadScheduledRules() {
@@ -417,6 +432,53 @@ Response _updateManifestHandler(Request request) {
   }
 }
 
+Response _filesHandler(Request request, String file) {
+  final normalized = p.normalize(file).replaceAll('\\', '/').trim();
+  final isUnsafePath =
+      normalized.isEmpty ||
+      normalized == '.' ||
+      normalized.startsWith('..') ||
+      normalized.contains('/..');
+  if (isUnsafePath) {
+    return _json({'error': 'Invalid file path.'}, statusCode: 400);
+  }
+
+  final target = File(p.join(_storageDir.path, normalized));
+  if (!target.existsSync()) {
+    return _json({'error': 'File not found.'}, statusCode: 404);
+  }
+
+  FileStat stat;
+  try {
+    stat = target.statSync();
+  } catch (_) {
+    return _json({'error': 'Unable to read file metadata.'}, statusCode: 500);
+  }
+
+  if (stat.type != FileSystemEntityType.file) {
+    return _json({'error': 'File not found.'}, statusCode: 404);
+  }
+
+  final downloadFlag = request.url.queryParameters['download']?.trim();
+  final forceDownload = downloadFlag == '1' || downloadFlag == 'true';
+  final requestedName = request.url.queryParameters['name']?.trim() ?? '';
+  final fallbackName = p.basename(normalized);
+  final downloadName = _safeDownloadName(
+    requestedName.isEmpty ? fallbackName : requestedName,
+  );
+
+  final headers = <String, String>{
+    HttpHeaders.contentTypeHeader: 'application/octet-stream',
+    HttpHeaders.contentLengthHeader: stat.size.toString(),
+  };
+  if (forceDownload) {
+    headers[HttpHeaders.contentDispositionHeader] =
+        'attachment; filename="$downloadName"';
+  }
+
+  return Response.ok(target.openRead(), headers: headers);
+}
+
 void _handleSocket(WebSocketChannel channel, String? protocol) {
   String? userId;
   String? userName;
@@ -466,6 +528,23 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
                 channel,
                 'Авторизация отклонена: пользователь "$requestedName" не в списке.',
               );
+              return;
+            }
+
+            final providedPassword = (payload['password']?.toString() ?? '')
+                .trim();
+            if (providedPassword.isEmpty) {
+              _denyAndClose(
+                channel,
+                'Авторизация отклонена: пароль обязателен.',
+              );
+              return;
+            }
+            final expectedPassword =
+                _passwordsByUserLower[authorizedName.toLowerCase()];
+            if (expectedPassword == null ||
+                expectedPassword != providedPassword) {
+              _denyAndClose(channel, 'Авторизация отклонена: неверный пароль.');
               return;
             }
 
@@ -883,6 +962,18 @@ String _safeFileName(String original) {
     return 'file.bin';
   }
   return safe;
+}
+
+String _safeDownloadName(String original) {
+  final baseName = p.basename(original);
+  final sanitized = baseName
+      .replaceAll(RegExp(r'[\r\n"]'), '')
+      .replaceAll(RegExp(r'[^a-zA-Z0-9._ -]'), '_')
+      .trim();
+  if (sanitized.isEmpty) {
+    return 'file.bin';
+  }
+  return sanitized;
 }
 
 String _safeIdentity(String raw) {

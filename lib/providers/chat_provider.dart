@@ -19,6 +19,20 @@ import '../services/system_notification_service.dart';
 
 enum ChatConnectionStatus { disconnected, connecting, connected }
 
+class PreparedFileUpload {
+  const PreparedFileUpload({
+    required this.name,
+    required this.extension,
+    required this.sizeBytes,
+    required this.bytes,
+  });
+
+  final String name;
+  final String extension;
+  final int sizeBytes;
+  final List<int> bytes;
+}
+
 class ChatProvider extends ChangeNotifier {
   ChatProvider() {
     _bootstrap();
@@ -28,9 +42,14 @@ class ChatProvider extends ChangeNotifier {
   static const String _serverUrlKey = 'server_url';
   static const String _userNameKey = 'user_name';
   static const String _userIdKey = 'user_id';
+  static const String _passwordsByUserKey = 'passwords_by_user';
+  static const String _dismissedUpdateSignatureKey =
+      'dismissed_update_signature';
 
   static const String _defaultServerUrl = 'ws://localhost:8080/ws';
   static const Duration _updateCheckInterval = Duration(minutes: 15);
+  static const Duration _reconnectBaseDelay = Duration(seconds: 3);
+  static const Duration _reconnectMaxDelay = Duration(seconds: 30);
 
   final List<ChatMessage> _messages = <ChatMessage>[];
   final List<AppNotification> _notifications = <AppNotification>[];
@@ -43,6 +62,7 @@ class ChatProvider extends ChangeNotifier {
   StreamSubscription<dynamic>? _channelSubscription;
   Timer? _typingStopTimer;
   Timer? _updateCheckTimer;
+  Timer? _reconnectTimer;
 
   ThemeMode _themeMode = ThemeMode.light;
   ChatConnectionStatus _connectionStatus = ChatConnectionStatus.disconnected;
@@ -50,6 +70,8 @@ class ChatProvider extends ChangeNotifier {
   String _serverUrl = _defaultServerUrl;
   String _userName = '';
   String _userId = '';
+  String? _pendingPasswordForAuth;
+  final Map<String, String> _passwordsByUserLower = <String, String>{};
 
   String? _lastError;
   bool _isPickingFile = false;
@@ -67,6 +89,7 @@ class ChatProvider extends ChangeNotifier {
   Uri? _updateDownloadUri;
   String? _updateError;
   DateTime? _lastUpdateCheckAt;
+  String? _dismissedUpdateSignature;
 
   bool _scheduledEnabled = false;
   String _scheduledText = '';
@@ -78,6 +101,8 @@ class ChatProvider extends ChangeNotifier {
 
   DateTime _lastTypingSystemNotificationAt =
       DateTime.fromMillisecondsSinceEpoch(0);
+  int _reconnectAttempt = 0;
+  bool _manualDisconnectRequested = false;
 
   ThemeMode get themeMode => _themeMode;
   ChatConnectionStatus get connectionStatus => _connectionStatus;
@@ -101,6 +126,7 @@ class ChatProvider extends ChangeNotifier {
   String? get updateDownloadUrl => _updateDownloadUri?.toString();
   String? get updateError => _updateError;
   DateTime? get lastUpdateCheckAt => _lastUpdateCheckAt;
+  bool get shouldShowUpdateBanner => _isUpdateAvailable && !_isUpdateDismissed;
 
   bool get scheduledEnabled => _scheduledEnabled;
   String get scheduledText => _scheduledText;
@@ -109,8 +135,18 @@ class ChatProvider extends ChangeNotifier {
   String? get scheduledLastSentDate => _scheduledLastSentDate;
   DateTime? get scheduledUpdatedAt => _scheduledUpdatedAt;
   String? get scheduledConfigError => _scheduledConfigError;
+  bool get hasSavedPasswordForCurrentUser => hasSavedPasswordForUser(_userName);
 
   ChatUser get me => ChatUser(id: _userId, name: _userName, isMe: true);
+
+  bool hasSavedPasswordForUser(String userName) {
+    final key = _passwordCacheKey(userName);
+    if (key.isEmpty) {
+      return false;
+    }
+    final stored = _passwordsByUserLower[key];
+    return stored != null && stored.isNotEmpty;
+  }
 
   int get notificationCount => _notifications.length;
   AppNotification? get latestNotification =>
@@ -192,6 +228,11 @@ class ChatProvider extends ChangeNotifier {
       _ => ThemeMode.system,
     };
 
+    _dismissedUpdateSignature = prefs.getString(_dismissedUpdateSignatureKey);
+    _passwordsByUserLower
+      ..clear()
+      ..addAll(_decodePasswordMap(prefs.getString(_passwordsByUserKey)));
+
     final storedServerUrl = prefs.getString(_serverUrlKey) ?? _defaultServerUrl;
     try {
       _serverUrl = _normalizeServerUrl(storedServerUrl);
@@ -222,6 +263,7 @@ class ChatProvider extends ChangeNotifier {
   Future<void> applyConnectionSettings({
     required String serverUrl,
     required String userName,
+    required String password,
   }) async {
     final normalizedServerUrl = _normalizeServerUrl(serverUrl);
     final normalizedUserName = userName.trim();
@@ -232,8 +274,21 @@ class ChatProvider extends ChangeNotifier {
       );
     }
 
+    final cacheKey = _passwordCacheKey(normalizedUserName);
+    final typedPassword = password.trim();
+    final cachedPassword = cacheKey.isEmpty
+        ? ''
+        : (_passwordsByUserLower[cacheKey] ?? '');
+    final effectivePassword = typedPassword.isNotEmpty
+        ? typedPassword
+        : cachedPassword;
+    if (effectivePassword.isEmpty) {
+      throw const FormatException('Введите пароль пользователя.');
+    }
+
     _serverUrl = normalizedServerUrl;
     _userName = normalizedUserName;
+    _pendingPasswordForAuth = effectivePassword;
 
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_serverUrlKey, _serverUrl);
@@ -256,6 +311,9 @@ class ChatProvider extends ChangeNotifier {
       return;
     }
 
+    _manualDisconnectRequested = false;
+    _cancelReconnect(resetAttempt: false);
+
     if (_userName.trim().isEmpty) {
       _pushNotification(
         kind: NotificationKind.system,
@@ -263,6 +321,20 @@ class ChatProvider extends ChangeNotifier {
         description: 'Введите имя пользователя из whitelist.',
         showInSystem: false,
       );
+      _safeNotify();
+      return;
+    }
+
+    final passwordForAuth = _resolvedPasswordForCurrentUser;
+    if (passwordForAuth.isEmpty) {
+      _pushNotification(
+        kind: NotificationKind.system,
+        title: 'Требуется пароль',
+        description: 'Введите пароль пользователя в настройках подключения.',
+        showInSystem: false,
+      );
+      _setConnectionStatus(ChatConnectionStatus.disconnected);
+      _manualDisconnectRequested = true;
       _safeNotify();
       return;
     }
@@ -286,7 +358,11 @@ class ChatProvider extends ChangeNotifier {
 
       _sendEnvelope(
         type: 'join',
-        payload: {'userId': _userId, 'userName': _userName},
+        payload: {
+          'userId': _userId,
+          'userName': _userName,
+          'password': passwordForAuth,
+        },
       );
     } catch (error) {
       _setConnectionStatus(ChatConnectionStatus.disconnected);
@@ -297,11 +373,14 @@ class ChatProvider extends ChangeNotifier {
         description: 'Не удалось подключиться к серверу.',
         showInSystem: true,
       );
+      _scheduleReconnectIfNeeded();
       _safeNotify();
     }
   }
 
   Future<void> disconnect() async {
+    _manualDisconnectRequested = true;
+    _cancelReconnect();
     await _closeSocket(sendTypingOff: true, notify: true);
   }
 
@@ -395,6 +474,8 @@ class ChatProvider extends ChangeNotifier {
     }
 
     _setConnectionStatus(ChatConnectionStatus.connected);
+    _manualDisconnectRequested = false;
+    _cancelReconnect();
     _pushNotification(
       kind: NotificationKind.system,
       title: 'Авторизация успешна',
@@ -407,7 +488,19 @@ class ChatProvider extends ChangeNotifier {
     SharedPreferences.getInstance().then((prefs) async {
       await prefs.setString(_userIdKey, _userId);
       await prefs.setString(_userNameKey, _userName);
+      final password = _pendingPasswordForAuth?.trim();
+      if (password != null && password.isNotEmpty) {
+        final key = _passwordCacheKey(_userName);
+        if (key.isNotEmpty) {
+          _passwordsByUserLower[key] = password;
+          await prefs.setString(
+            _passwordsByUserKey,
+            jsonEncode(_passwordsByUserLower),
+          );
+        }
+      }
     });
+    _pendingPasswordForAuth = null;
 
     _safeNotify();
   }
@@ -445,6 +538,7 @@ class ChatProvider extends ChangeNotifier {
       description: 'Ошибка: $_lastError',
       showInSystem: true,
     );
+    _scheduleReconnectIfNeeded();
     _safeNotify();
   }
 
@@ -461,6 +555,7 @@ class ChatProvider extends ChangeNotifier {
         description: 'Соединение с сервером закрыто.',
         showInSystem: true,
       );
+      _scheduleReconnectIfNeeded();
       _safeNotify();
     }
   }
@@ -613,9 +708,22 @@ class ChatProvider extends ChangeNotifier {
         message.toLowerCase().contains('авторизация');
 
     if (shouldDisconnect) {
+      final isAuthIssue = message.toLowerCase().contains('авторизация');
       _typingUsers.clear();
       _onlineUsers.clear();
       _setConnectionStatus(ChatConnectionStatus.disconnected);
+      if (isAuthIssue) {
+        _manualDisconnectRequested = true;
+        _cancelReconnect();
+        _pendingPasswordForAuth = null;
+        final cacheKey = _passwordCacheKey(_userName);
+        if (cacheKey.isNotEmpty &&
+            _passwordsByUserLower.remove(cacheKey) != null) {
+          unawaited(_savePasswordCache());
+        }
+      } else {
+        _scheduleReconnectIfNeeded();
+      }
 
       _pushNotification(
         kind: NotificationKind.system,
@@ -709,13 +817,15 @@ class ChatProvider extends ChangeNotifier {
     updateTypingStatus('');
   }
 
-  Future<String?> pickAndSendFile() async {
+  Future<PreparedFileUpload?> pickFileForSending() async {
     if (!isConnected) {
-      return 'Нет подключения к серверу. Невозможно отправить файл.';
+      throw const FormatException(
+        'Нет подключения к серверу. Невозможно отправить файл.',
+      );
     }
 
     if (_isPickingFile) {
-      return 'Выбор файла уже выполняется.';
+      throw const FormatException('Выбор файла уже выполняется.');
     }
 
     _isPickingFile = true;
@@ -734,12 +844,12 @@ class ChatProvider extends ChangeNotifier {
       final picked = result.files.single;
       final bytes = _resolveBytes(picked);
       if (bytes == null || bytes.isEmpty) {
-        return 'Не удалось прочитать файл.';
+        throw const FormatException('Не удалось прочитать файл.');
       }
 
       const maxFileSize = 20 * 1024 * 1024;
       if (bytes.length > maxFileSize) {
-        return 'Файл слишком большой. Максимум 20 MB.';
+        throw const FormatException('Файл слишком большой. Максимум 20 MB.');
       }
 
       final extension = p.extension(picked.name).replaceFirst('.', '');
@@ -747,34 +857,74 @@ class ChatProvider extends ChangeNotifier {
           ? 'FILE'
           : extension.toUpperCase();
 
-      _sendEnvelope(
-        type: 'file',
-        payload: {
-          'id': _nextId(),
-          'name': picked.name,
-          'extension': safeExtension,
-          'sizeBytes': bytes.length,
-          'contentBase64': base64Encode(bytes),
-          'text': 'Отправлен файл',
-          'createdAt': DateTime.now().toUtc().toIso8601String(),
-        },
+      return PreparedFileUpload(
+        name: picked.name,
+        extension: safeExtension,
+        sizeBytes: bytes.length,
+        bytes: bytes,
       );
-
-      _pushNotification(
-        kind: NotificationKind.file,
-        title: 'Отправка файла',
-        description: picked.name,
-        showInSystem: false,
+    } catch (error) {
+      if (error is FormatException) {
+        rethrow;
+      }
+      throw const FormatException(
+        'Не удалось выбрать файл. Проверьте доступ к файловой системе.',
       );
-      _safeNotify();
-
-      return null;
-    } catch (_) {
-      return 'Не удалось выбрать файл. Проверьте доступ к файловой системе.';
     } finally {
       _isPickingFile = false;
       _safeNotify();
     }
+  }
+
+  Future<String?> sendPickedFile(
+    PreparedFileUpload file, {
+    String caption = '',
+  }) async {
+    if (!isConnected) {
+      return 'Нет подключения к серверу. Невозможно отправить файл.';
+    }
+
+    final normalizedCaption = caption.trim();
+
+    _sendEnvelope(
+      type: 'file',
+      payload: {
+        'id': _nextId(),
+        'name': file.name,
+        'extension': file.extension,
+        'sizeBytes': file.sizeBytes,
+        'contentBase64': base64Encode(file.bytes),
+        'text': normalizedCaption,
+        'createdAt': DateTime.now().toUtc().toIso8601String(),
+      },
+    );
+
+    _pushNotification(
+      kind: NotificationKind.file,
+      title: 'Отправка файла',
+      description: file.name,
+      showInSystem: false,
+    );
+    _safeNotify();
+
+    return null;
+  }
+
+  Future<String?> openAttachment(
+    MessageAttachment attachment, {
+    bool forceDownload = true,
+  }) async {
+    final uri = _attachmentUri(attachment, forceDownload: forceDownload);
+    final launched = await launchUrl(
+      uri,
+      mode: kIsWeb
+          ? LaunchMode.platformDefault
+          : LaunchMode.externalApplication,
+    );
+    if (!launched) {
+      return 'Не удалось открыть файл для скачивания.';
+    }
+    return null;
   }
 
   List<int>? _resolveBytes(PlatformFile file) {
@@ -828,6 +978,129 @@ class ChatProvider extends ChangeNotifier {
       _scheduledConfigError = _lastError;
       _isSavingScheduledConfig = false;
     }
+  }
+
+  String get _resolvedPasswordForCurrentUser {
+    final pending = _pendingPasswordForAuth?.trim();
+    if (pending != null && pending.isNotEmpty) {
+      return pending;
+    }
+    final key = _passwordCacheKey(_userName);
+    if (key.isEmpty) {
+      return '';
+    }
+    final cached = _passwordsByUserLower[key];
+    if (cached == null) {
+      return '';
+    }
+    return cached.trim();
+  }
+
+  String _passwordCacheKey(String userName) {
+    return userName.trim().toLowerCase();
+  }
+
+  Map<String, String> _decodePasswordMap(String? raw) {
+    if (raw == null || raw.trim().isEmpty) {
+      return <String, String>{};
+    }
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) {
+        return <String, String>{};
+      }
+      final map = <String, String>{};
+      decoded.forEach((key, value) {
+        final normalizedKey = key.toString().trim().toLowerCase();
+        final normalizedValue = value.toString().trim();
+        if (normalizedKey.isEmpty || normalizedValue.isEmpty) {
+          return;
+        }
+        map[normalizedKey] = normalizedValue;
+      });
+      return map;
+    } catch (_) {
+      return <String, String>{};
+    }
+  }
+
+  Future<void> _savePasswordCache() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      _passwordsByUserKey,
+      jsonEncode(_passwordsByUserLower),
+    );
+  }
+
+  void _scheduleReconnectIfNeeded() {
+    if (_disposed || _manualDisconnectRequested || _userName.trim().isEmpty) {
+      return;
+    }
+    if (_reconnectTimer?.isActive ?? false) {
+      return;
+    }
+
+    final maxPower = 4;
+    final attempt = _reconnectAttempt > maxPower ? maxPower : _reconnectAttempt;
+    final factor = 1 << attempt;
+    final rawSeconds = _reconnectBaseDelay.inSeconds * factor;
+    final delaySeconds = rawSeconds > _reconnectMaxDelay.inSeconds
+        ? _reconnectMaxDelay.inSeconds
+        : rawSeconds;
+    final delay = Duration(seconds: delaySeconds);
+    _reconnectAttempt = _reconnectAttempt + 1;
+    if (_reconnectAttempt > maxPower + 1) {
+      _reconnectAttempt = maxPower + 1;
+    }
+
+    _reconnectTimer = Timer(delay, () {
+      _reconnectTimer = null;
+      if (_disposed || _manualDisconnectRequested || _userName.trim().isEmpty) {
+        return;
+      }
+      unawaited(connect(force: true));
+    });
+  }
+
+  void _cancelReconnect({bool resetAttempt = true}) {
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    if (resetAttempt) {
+      _reconnectAttempt = 0;
+    }
+  }
+
+  Uri _attachmentUri(
+    MessageAttachment attachment, {
+    required bool forceDownload,
+  }) {
+    final path = attachment.path.trim();
+    final parsed = Uri.tryParse(path);
+    final resolved = parsed != null && parsed.hasScheme
+        ? parsed
+        : _httpBaseUriFromServer().replace(
+            path: path.startsWith('/') ? path : '/$path',
+          );
+
+    if (!forceDownload) {
+      return resolved;
+    }
+    final query = <String, String>{
+      ...resolved.queryParameters,
+      'download': '1',
+      'name': attachment.name,
+    };
+    return resolved.replace(queryParameters: query);
+  }
+
+  Uri _httpBaseUriFromServer() {
+    final wsUri = Uri.parse(_serverUrl);
+    final scheme = wsUri.scheme == 'wss' ? 'https' : 'http';
+    return Uri(
+      scheme: scheme,
+      host: wsUri.host,
+      port: wsUri.hasPort ? wsUri.port : null,
+    );
   }
 
   void clearNotifications() {
@@ -971,10 +1244,12 @@ class ChatProvider extends ChangeNotifier {
         _latestBuild = latestBuild;
         _updateDownloadUri = downloadUri;
         _updateNotes = notes.isEmpty ? null : notes;
+        final updateSignature = '$latestVersion+$latestBuild';
+        final isDismissed = _dismissedUpdateSignature == updateSignature;
 
         final isNewRelease =
             previousVersion != latestVersion || previousBuild != latestBuild;
-        if (isNewRelease) {
+        if (isNewRelease && !isDismissed) {
           _pushNotification(
             kind: NotificationKind.system,
             title: 'Доступно обновление',
@@ -1030,6 +1305,18 @@ class ChatProvider extends ChangeNotifier {
     return null;
   }
 
+  Future<void> dismissUpdateBanner() async {
+    final signature = _currentUpdateSignature;
+    if (signature == null) {
+      return;
+    }
+    _dismissedUpdateSignature = signature;
+    _safeNotify();
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_dismissedUpdateSignatureKey, signature);
+  }
+
   Future<Map<String, dynamic>> _loadJson(Uri uri) async {
     final response = await http
         .get(uri, headers: const {'accept': 'application/json'})
@@ -1048,11 +1335,12 @@ class ChatProvider extends ChangeNotifier {
   Uri _updateManifestUriFromServerUrl(String wsUrl) {
     final wsUri = Uri.parse(wsUrl);
     final scheme = wsUri.scheme == 'wss' ? 'https' : 'http';
-    return wsUri.replace(
-      scheme: scheme,
-      path: '/update-manifest',
-      query: '',
-      fragment: '',
+    final uri = wsUri.replace(scheme: scheme, path: '/update-manifest');
+    return Uri(
+      scheme: uri.scheme,
+      host: uri.host,
+      port: uri.hasPort ? uri.port : null,
+      path: uri.path,
     );
   }
 
@@ -1099,6 +1387,21 @@ class ChatProvider extends ChangeNotifier {
     }
 
     return 0;
+  }
+
+  String? get _currentUpdateSignature {
+    if (!_isUpdateAvailable || _latestVersion == null || _latestBuild == null) {
+      return null;
+    }
+    return '${_latestVersion!}+${_latestBuild!}';
+  }
+
+  bool get _isUpdateDismissed {
+    final current = _currentUpdateSignature;
+    if (current == null) {
+      return false;
+    }
+    return current == _dismissedUpdateSignature;
   }
 
   List<int> _extractVersionParts(String version) {
@@ -1163,6 +1466,8 @@ class ChatProvider extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
+    _manualDisconnectRequested = true;
+    _cancelReconnect();
     _typingStopTimer?.cancel();
     _updateCheckTimer?.cancel();
     _sendTyping(isTyping: false);

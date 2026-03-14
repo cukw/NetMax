@@ -4,10 +4,16 @@ import 'package:intl/intl.dart';
 import '../models/chat_message.dart';
 
 class MessageBubble extends StatelessWidget {
-  const MessageBubble({super.key, required this.message, required this.isMine});
+  const MessageBubble({
+    super.key,
+    required this.message,
+    required this.isMine,
+    this.onAttachmentTap,
+  });
 
   final ChatMessage message;
   final bool isMine;
+  final VoidCallback? onAttachmentTap;
 
   @override
   Widget build(BuildContext context) {
@@ -41,6 +47,7 @@ class MessageBubble extends StatelessWidget {
     final textColor = isMine
         ? theme.colorScheme.onPrimary
         : theme.colorScheme.onSurface;
+    final senderLabel = isMine ? 'Вы' : message.senderName;
 
     return Align(
       alignment: isMine ? Alignment.centerRight : Alignment.centerLeft,
@@ -57,11 +64,21 @@ class MessageBubble extends StatelessWidget {
               ? CrossAxisAlignment.end
               : CrossAxisAlignment.start,
           children: [
+            Text(
+              senderLabel,
+              style: TextStyle(
+                color: textColor.withAlpha(200),
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            const SizedBox(height: 5),
             if (hasFile) ...[
               _FileAttachmentView(
                 attachment: message.attachment!,
                 textColor: textColor,
                 isMine: isMine,
+                onTap: onAttachmentTap,
               ),
               if (message.text != null && message.text!.isNotEmpty) ...[
                 const SizedBox(height: 8),
@@ -79,23 +96,6 @@ class MessageBubble extends StatelessWidget {
             Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                if (message.isScheduled) ...[
-                  Icon(
-                    Icons.schedule_rounded,
-                    size: 12,
-                    color: textColor.withAlpha(185),
-                  ),
-                  const SizedBox(width: 4),
-                  Text(
-                    'по времени',
-                    style: TextStyle(
-                      color: textColor.withAlpha(185),
-                      fontSize: 10,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                  const SizedBox(width: 6),
-                ],
                 Text(
                   DateFormat('HH:mm').format(message.createdAt),
                   style: TextStyle(
@@ -117,11 +117,13 @@ class _FileAttachmentView extends StatelessWidget {
     required this.attachment,
     required this.textColor,
     required this.isMine,
+    required this.onTap,
   });
 
   final MessageAttachment attachment;
   final Color textColor;
   final bool isMine;
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
@@ -129,43 +131,53 @@ class _FileAttachmentView extends StatelessWidget {
         ? Colors.white.withAlpha(42)
         : Theme.of(context).colorScheme.primary.withAlpha(22);
 
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-      decoration: BoxDecoration(
-        color: background,
+    return Material(
+      color: background,
+      borderRadius: BorderRadius.circular(12),
+      child: InkWell(
         borderRadius: BorderRadius.circular(12),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(Icons.insert_drive_file_rounded, color: textColor, size: 20),
-          const SizedBox(width: 8),
-          Flexible(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  attachment.name,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    color: textColor,
-                    fontWeight: FontWeight.w600,
-                    fontSize: 13,
-                  ),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.insert_drive_file_rounded, color: textColor, size: 20),
+              const SizedBox(width: 8),
+              Flexible(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      attachment.name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: textColor,
+                        fontWeight: FontWeight.w600,
+                        fontSize: 13,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      '${attachment.extension} • ${_formatFileSize(attachment.sizeBytes)}',
+                      style: TextStyle(
+                        color: textColor.withAlpha(180),
+                        fontSize: 11,
+                      ),
+                    ),
+                  ],
                 ),
-                const SizedBox(height: 2),
-                Text(
-                  '${attachment.extension} • ${_formatFileSize(attachment.sizeBytes)}',
-                  style: TextStyle(
-                    color: textColor.withAlpha(180),
-                    fontSize: 11,
-                  ),
-                ),
-              ],
-            ),
+              ),
+              const SizedBox(width: 8),
+              Icon(
+                Icons.download_rounded,
+                color: textColor.withAlpha(220),
+                size: 18,
+              ),
+            ],
           ),
-        ],
+        ),
       ),
     );
   }
