@@ -52,6 +52,7 @@ class ChatProvider extends ChangeNotifier {
   static const Duration _reconnectMaxDelay = Duration(seconds: 30);
   static const Set<String> _scheduledRestrictedUsersLower = <String>{
     'юлия сергеевна',
+    'татьяна владимировна',
   };
 
   final List<ChatMessage> _messages = <ChatMessage>[];
@@ -140,7 +141,9 @@ class ChatProvider extends ChangeNotifier {
   DateTime? get scheduledUpdatedAt => _scheduledUpdatedAt;
   String? get scheduledConfigError => _scheduledConfigError;
   bool get canUseScheduledMessages =>
-      _isScheduledAllowedByServer && _isScheduledAllowedForUser(_userName);
+      isConnected &&
+      _isScheduledAllowedByServer &&
+      _isScheduledAllowedForUser(_userName);
   bool get hasSavedPasswordForCurrentUser => hasSavedPasswordForUser(_userName);
 
   ChatUser get me => ChatUser(id: _userId, name: _userName, isMe: true);

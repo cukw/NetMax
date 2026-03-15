@@ -17,7 +17,10 @@ const Duration _scheduleTickInterval = Duration(seconds: 20);
 const Duration _storageCleanupInterval = Duration(minutes: 30);
 const Duration _storageFileMaxAge = Duration(days: 14);
 const int _storageMaxBytes = 1024 * 1024 * 1024;
-const Set<String> _scheduledRestrictedUsersLower = <String>{'юлия сергеевна'};
+const Set<String> _scheduledRestrictedUsersLower = <String>{
+  'юлия сергеевна',
+  'татьяна владимировна',
+};
 
 final RoomState _group = RoomState();
 final Random _random = Random();
