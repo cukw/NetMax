@@ -732,16 +732,21 @@ class ChatProvider extends ChangeNotifier {
     _scheduledConfigError = message;
     _isSavingScheduledConfig = false;
 
+    final msgLower = message.toLowerCase();
+    final isHardAuthError =
+        msgLower.contains('авторизация') &&
+        !msgLower.contains('лимит сессий') &&
+        !msgLower.contains('уже в сети');
+
     final shouldDisconnect =
         _connectionStatus == ChatConnectionStatus.connecting ||
-        message.toLowerCase().contains('авторизация');
+        isHardAuthError;
 
     if (shouldDisconnect) {
-      final isAuthIssue = message.toLowerCase().contains('авторизация');
       _typingUsers.clear();
       _onlineUsers.clear();
       _setConnectionStatus(ChatConnectionStatus.disconnected);
-      if (isAuthIssue) {
+      if (isHardAuthError) {
         _manualDisconnectRequested = true;
         _cancelReconnect();
         _pendingPasswordForAuth = null;

@@ -1,4 +1,5 @@
 {
+  "maxSessionsPerUser": 3,
   "allowedUsers": [
     { "name": "Кан Юрий", "password": "kyv123" },
     { "name": "Батакова Екатерина", "password": "bea123" },
