@@ -13,10 +13,12 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 const String _authConfigRelativePath = 'config/authorized_users.json';
 const String _updateManifestRelativePath = 'config/update_manifest.json';
 const String _scheduledConfigRelativePath = 'config/scheduled_messages.json';
+const String _messagesConfigRelativePath = 'config/messages_history.json';
 const Duration _scheduleTickInterval = Duration(seconds: 20);
 const Duration _storageCleanupInterval = Duration(minutes: 30);
 const Duration _storageFileMaxAge = Duration(days: 14);
 const int _storageMaxBytes = 1024 * 1024 * 1024;
+const int _maxHistoryMessages = 200;
 const Set<String> _scheduledRestrictedUsersLower = <String>{
   'юлия сергеевна',
   'татьяна владимировна',
@@ -30,6 +32,7 @@ late final List<String> _allowedUsers;
 late final Map<String, String> _allowedUsersByLower;
 late final Map<String, String> _passwordsByUserLower;
 late final File _scheduledConfigFile;
+late final File _messagesConfigFile;
 final Map<String, ScheduledMessageRule> _scheduledRulesByUserLower =
     <String, ScheduledMessageRule>{};
 
@@ -48,8 +51,12 @@ Future<void> main() async {
   _scheduledConfigFile = File(
     p.join(Directory.current.path, _scheduledConfigRelativePath),
   );
+  _messagesConfigFile = File(
+    p.join(Directory.current.path, _messagesConfigRelativePath),
+  );
 
   _loadAuthorizedUsers();
+  _loadMessageHistory();
   _loadScheduledRules();
   _startScheduledDispatcher();
   _cleanupStorage();
@@ -91,6 +98,7 @@ Future<void> main() async {
   stdout.writeln(
     'Scheduled rules loaded: ${_scheduledRulesByUserLower.length}',
   );
+  stdout.writeln('Messages loaded: ${_group.messages.length}');
   stdout.writeln(
     'Storage cleanup: every ${_storageCleanupInterval.inMinutes}m, '
     'max age ${_storageFileMaxAge.inDays}d, max size '
@@ -216,6 +224,51 @@ void _loadScheduledRules() {
     _scheduledRulesByUserLower.clear();
     _saveScheduledRules();
   }
+}
+
+void _loadMessageHistory() {
+  if (!_messagesConfigFile.existsSync()) {
+    _messagesConfigFile.createSync(recursive: true);
+    _messagesConfigFile.writeAsStringSync(
+      const JsonEncoder.withIndent('  ').convert({'messages': <Object>[]}),
+    );
+  }
+
+  try {
+    final decoded = jsonDecode(_messagesConfigFile.readAsStringSync());
+    final root = _asMap(decoded);
+    final rawMessages = root['messages'];
+
+    _group.messages.clear();
+    if (rawMessages is List) {
+      for (final item in rawMessages) {
+        final message = _asMap(item);
+        final messageId = (message['id']?.toString() ?? '').trim();
+        if (messageId.isEmpty) {
+          continue;
+        }
+        _group.messages.add(message);
+      }
+    }
+
+    if (_group.messages.length > _maxHistoryMessages) {
+      _group.messages.removeRange(
+        0,
+        _group.messages.length - _maxHistoryMessages,
+      );
+      _saveMessageHistory();
+    }
+  } catch (_) {
+    _group.messages.clear();
+    _saveMessageHistory();
+  }
+}
+
+void _saveMessageHistory() {
+  final payload = {'messages': _group.messages};
+  _messagesConfigFile.writeAsStringSync(
+    const JsonEncoder.withIndent('  ').convert(payload),
+  );
 }
 
 void _saveScheduledRules() {
@@ -950,11 +1003,13 @@ void _cleanupConnection({
 
 void _appendMessage(Map<String, dynamic> message) {
   _group.messages.add(message);
-
-  const maxHistory = 200;
-  if (_group.messages.length > maxHistory) {
-    _group.messages.removeRange(0, _group.messages.length - maxHistory);
+  if (_group.messages.length > _maxHistoryMessages) {
+    _group.messages.removeRange(
+      0,
+      _group.messages.length - _maxHistoryMessages,
+    );
   }
+  _saveMessageHistory();
 }
 
 void _broadcast({
