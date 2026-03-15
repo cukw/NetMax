@@ -47,3 +47,6 @@ app.*.map.json
 # Backend runtime uploads
 /backend/storage/*
 !/backend/storage/.gitkeep
+
+# Backend secrets
+/backend/config/authorized_users.json
