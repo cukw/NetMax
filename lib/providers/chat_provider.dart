@@ -306,10 +306,18 @@ class ChatProvider extends ChangeNotifier {
     _isScheduledAllowedByServer = _isScheduledAllowedForUser(_userName);
     _pendingPasswordForAuth = effectivePassword;
 
+    if (_canPersistPasswordLocally && cacheKey.isNotEmpty) {
+      _passwordsByUserLower[cacheKey] = effectivePassword;
+    }
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_serverUrlKey, _serverUrl);
     await prefs.setString(_userNameKey, _userName);
-
+    if (_canPersistPasswordLocally && cacheKey.isNotEmpty) {
+      await prefs.setString(
+        _passwordsByUserKey,
+        jsonEncode(_passwordsByUserLower),
+      );
+    }
     await connect(force: true);
     await checkForUpdates();
   }
