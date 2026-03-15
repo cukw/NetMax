@@ -1,13 +1,13 @@
 {
   "version": "1.0.0",
-  "build": 18,
-  "notes": "CI build 18",
+  "build": 19,
+  "notes": "CI build 19",
   "downloads": {
-    "android": "https://github.com/cukw/NetMax/releases/download/v1.0.0-build.18/netmax-android.apk",
-    "ios": "https://github.com/cukw/NetMax/releases/download/v1.0.0-build.18/netmax-ios.ipa",
-    "macos": "https://github.com/cukw/NetMax/releases/download/v1.0.0-build.18/netmax-macos.app.zip",
-    "windows": "https://github.com/cukw/NetMax/releases/download/v1.0.0-build.18/netmax-windows-x64.zip",
-    "linux": "https://github.com/cukw/NetMax/releases/download/v1.0.0-build.18/netmax-linux-x64.tar.gz",
-    "web": "https://github.com/cukw/NetMax/releases/download/v1.0.0-build.18/netmax-web.zip"
+    "android": "https://github.com/cukw/NetMax/releases/download/v1.0.0-build.19/netmax-android.apk",
+    "ios": "https://github.com/cukw/NetMax/releases/download/v1.0.0-build.19/netmax-ios.ipa",
+    "macos": "https://github.com/cukw/NetMax/releases/download/v1.0.0-build.19/netmax-macos.app.zip",
+    "windows": "https://github.com/cukw/NetMax/releases/download/v1.0.0-build.19/netmax-windows-x64.zip",
+    "linux": "https://github.com/cukw/NetMax/releases/download/v1.0.0-build.19/netmax-linux-x64.tar.gz",
+    "web": "https://github.com/cukw/NetMax/releases/download/v1.0.0-build.19/netmax-web.zip"
   }
 }
