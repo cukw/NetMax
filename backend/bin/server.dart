@@ -33,6 +33,9 @@ late final File _scheduledConfigFile;
 final Map<String, ScheduledMessageRule> _scheduledRulesByUserLower =
     <String, ScheduledMessageRule>{};
 
+// 0 = без ограничений
+int _maxSessionsPerUser = 0;
+
 Timer? _scheduledDispatchTimer;
 Timer? _storageCleanupTimer;
 
@@ -82,6 +85,10 @@ Future<void> main() async {
   stdout.writeln('Files endpoint: http://<host>:${server.port}/files/<file>');
   stdout.writeln('Authorized users loaded: ${_allowedUsers.length}');
   stdout.writeln(
+    'Session limit per user: '
+    '${_maxSessionsPerUser == 0 ? "unlimited" : _maxSessionsPerUser.toString()}',
+  );
+  stdout.writeln(
     'Scheduled rules loaded: ${_scheduledRulesByUserLower.length}',
   );
   stdout.writeln(
@@ -110,6 +117,12 @@ void _loadAuthorizedUsers() {
       'Invalid authorization config format. Expected JSON object.',
     );
   }
+
+  // подгрузка лимита сессий
+  final maxSessions = _toInt(decoded['maxSessionsPerUser']);
+  _maxSessionsPerUser = (maxSessions != null && maxSessions >= 0)
+      ? maxSessions
+      : 0;
 
   final usersRaw = decoded['allowedUsers'];
   if (usersRaw is! List) {
@@ -380,6 +393,26 @@ void _dispatchScheduledMessages() {
   }
 }
 
+// кол-во сессий пользака
+int _sessionCountForUser(String userNameLower) {
+  return _group.userNames.values
+      .where((n) => n.toLowerCase() == userNameLower)
+      .length;
+}
+
+// уник список пользаков
+List<Map<String, dynamic>> _deduplicatedOnlineUsers() {
+  final seen = <String>{};
+  final result = <Map<String, dynamic>>[];
+  for (final entry in _group.userNames.entries) {
+    final nameLower = entry.value.toLowerCase();
+    if (seen.add(nameLower)) {
+      result.add({'id': entry.key, 'name': entry.value});
+    }
+  }
+  return result;
+}
+
 String? _findOnlineUserIdByName(String userName) {
   final expected = userName.toLowerCase();
   for (final entry in _group.userNames.entries) {
@@ -402,7 +435,9 @@ Response _healthHandler(Request request) {
   return _json({
     'status': 'ok',
     'onlineUsers': _group.clients.length,
+    'uniqueOnlineUsers': _deduplicatedOnlineUsers().length,
     'authorizedUsers': _allowedUsers.length,
+    'maxSessionsPerUser': _maxSessionsPerUser,
     'updateManifestAvailable': updateManifestFile.existsSync(),
     'scheduledRules': _scheduledRulesByUserLower.length,
     'scheduledEnabled': enabledRules,
@@ -565,18 +600,21 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
               return;
             }
 
-            final nameAlreadyOnline = _group.userNames.values.any(
-              (currentName) =>
-                  currentName.toLowerCase() == authorizedName.toLowerCase(),
+            // проверка лимита кол-ва сессий | _maxSessionsPerUser = 0 = без ограничений
+            final currentSessions = _sessionCountForUser(
+              authorizedName.toLowerCase(),
             );
-            if (nameAlreadyOnline) {
+            if (_maxSessionsPerUser > 0 &&
+                currentSessions >= _maxSessionsPerUser) {
               _denyAndClose(
                 channel,
-                'Авторизация отклонена: "$authorizedName" уже в сети.',
+                'Лимит сессий для "$authorizedName" '
+                '(макс: $_maxSessionsPerUser).',
               );
               return;
             }
 
+            final isFirstSession = currentSessions == 0;
             userId = _createConnectionUserId();
             userName = authorizedName;
 
@@ -590,28 +628,30 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
               payload: {'userId': userId, 'userName': userName},
             );
 
+            // список уникальных пользаков
             _sendEnvelope(
               channel,
               type: 'snapshot',
               payload: {
-                'onlineUsers': _group.userNames.entries
-                    .map((entry) => {'id': entry.key, 'name': entry.value})
-                    .toList(growable: false),
+                'onlineUsers': _deduplicatedOnlineUsers(),
                 'messages': _group.messages,
               },
             );
 
             _sendScheduledConfig(channel: channel, userName: userName!);
 
-            _broadcast(
-              type: 'presence',
-              payload: {
-                'userId': userId,
-                'userName': userName,
-                'isOnline': true,
-              },
-              exceptUserId: userId,
-            );
+            // уведа при первом конекте, я бы вообще нахуй дропнул уведы о коннекте если честнро но думай сам
+            if (isFirstSession) {
+              _broadcast(
+                type: 'presence',
+                payload: {
+                  'userId': userId,
+                  'userName': userName,
+                  'isOnline': true,
+                },
+                exceptUserId: userId,
+              );
+            }
             break;
 
           case 'message':
@@ -890,10 +930,17 @@ void _cleanupConnection({
   _group.clients.remove(userId);
   _group.userNames.remove(userId);
 
-  _broadcast(
-    type: 'presence',
-    payload: {'userId': userId, 'userName': userName, 'isOnline': false},
+  // проверка на наличия другихз сессии
+  final hasOtherSessions = _group.userNames.values.any(
+    (n) => n.toLowerCase() == userName.toLowerCase(),
   );
+  // уведа если все сессии отключились
+  if (!hasOtherSessions) {
+    _broadcast(
+      type: 'presence',
+      payload: {'userId': userId, 'userName': userName, 'isOnline': false},
+    );
+  }
 
   _broadcast(
     type: 'typing',
