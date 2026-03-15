@@ -465,7 +465,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 itemCount: messages.length,
                 itemBuilder: (context, index) {
                   final message = messages[index];
-                  final isMine = message.senderId == chatProvider.me.id;
+                  final isMine = chatProvider.isMyMessage(message);
                   return MessageBubble(
                     message: message,
                     isMine: isMine,

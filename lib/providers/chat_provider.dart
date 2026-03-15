@@ -169,6 +169,21 @@ class ChatProvider extends ChangeNotifier {
   List<AppNotification> get notifications =>
       List<AppNotification>.unmodifiable(_notifications.reversed);
 
+  bool isMyMessage(ChatMessage message) {
+    final senderId = message.senderId.trim();
+    if (senderId.isNotEmpty && senderId == _userId) {
+      return true;
+    }
+
+    final myName = _userName.trim().toLowerCase();
+    if (myName.isEmpty) {
+      return false;
+    }
+
+    final senderName = message.senderName.trim().toLowerCase();
+    return senderName.isNotEmpty && senderName == myName;
+  }
+
   String get connectionStatusLine {
     if (_connectionStatus == ChatConnectionStatus.connecting) {
       return 'Авторизация на сервере...';
@@ -713,10 +728,7 @@ class ChatProvider extends ChangeNotifier {
     _messageIds.add(message.id);
     _messages.add(message);
 
-    final isMineByName =
-        message.senderName.trim().toLowerCase() == _userName.toLowerCase();
-
-    if (!isMineByName && message.senderId != _userId) {
+    if (!isMyMessage(message)) {
       _pushNotification(
         kind: message.type == MessageType.file
             ? NotificationKind.file
@@ -747,8 +759,7 @@ class ChatProvider extends ChangeNotifier {
         !msgLower.contains('уже в сети');
 
     final shouldDisconnect =
-        _connectionStatus == ChatConnectionStatus.connecting ||
-        isHardAuthError;
+        _connectionStatus == ChatConnectionStatus.connecting || isHardAuthError;
 
     if (shouldDisconnect) {
       _typingUsers.clear();
