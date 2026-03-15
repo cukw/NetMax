@@ -148,10 +148,8 @@ void _loadAuthorizedUsers() {
 
   users.sort();
 
-  if (users.length < 30) {
-    throw StateError(
-      'At least 30 authorized users expected. Current count: ${users.length}.',
-    );
+  if (users.isEmpty) {
+    throw StateError('Authorization config must contain at least one user.');
   }
 
   _allowedUsers = List<String>.unmodifiable(users);
