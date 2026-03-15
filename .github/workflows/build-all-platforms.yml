@@ -183,7 +183,11 @@ jobs:
         run: flutter build ios --release --no-codesign --build-number=${{ env.BUILD_NUMBER }}
 
       - name: Package iOS Artifact
-        run: ditto -c -k --sequesterRsrc --keepParent "build/ios/iphoneos/Runner.app" "netmax-ios.app.zip"
+        run: |
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R "build/ios/iphoneos/Runner.app" "Payload/Runner.app"
+          ditto -c -k --sequesterRsrc --keepParent "Payload" "netmax-ios.ipa"
 
       - name: Upload macOS Artifact
         uses: actions/upload-artifact@v4
@@ -197,7 +201,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ios-app-unsigned
-          path: netmax-ios.app.zip
+          path: netmax-ios.ipa
           if-no-files-found: error
           retention-days: 14
 
@@ -299,7 +303,7 @@ jobs:
           cp artifacts/linux/netmax-linux-x64.tar.gz netmax-linux-x64.tar.gz
           cp artifacts/windows/netmax-windows-x64.zip netmax-windows-x64.zip
           cp artifacts/macos/netmax-macos.app.zip netmax-macos.app.zip
-          cp artifacts/ios/netmax-ios.app.zip netmax-ios.app.zip
+          cp artifacts/ios/netmax-ios.ipa netmax-ios.ipa
           cp artifacts/web/netmax-web.zip netmax-web.zip
 
       - name: Create GitHub Release
@@ -316,13 +320,13 @@ jobs:
             netmax-linux-x64.tar.gz
             netmax-windows-x64.zip
             netmax-macos.app.zip
-            netmax-ios.app.zip
+            netmax-ios.ipa
             netmax-web.zip
 
       - name: Update update_manifest.json
         run: |
           ANDROID_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/netmax-android.apk"
-          IOS_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/netmax-ios.app.zip"
+          IOS_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/netmax-ios.ipa"
           MACOS_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/netmax-macos.app.zip"
           WINDOWS_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/netmax-windows-x64.zip"
           LINUX_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/netmax-linux-x64.tar.gz"
