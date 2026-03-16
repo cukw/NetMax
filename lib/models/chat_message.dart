@@ -54,6 +54,7 @@ class MessageAttachment {
 class ChatMessage {
   const ChatMessage({
     required this.id,
+    required this.chatId,
     required this.senderId,
     required this.senderName,
     required this.createdAt,
@@ -68,6 +69,7 @@ class ChatMessage {
 
     return ChatMessage(
       id: json['id']?.toString() ?? '',
+      chatId: (json['chatId']?.toString() ?? 'group-general').trim(),
       senderId: json['senderId']?.toString() ?? '',
       senderName: json['senderName']?.toString() ?? 'Unknown',
       createdAt:
@@ -86,6 +88,7 @@ class ChatMessage {
 
   factory ChatMessage.text({
     required String id,
+    required String chatId,
     required String senderId,
     required String senderName,
     required DateTime createdAt,
@@ -93,6 +96,7 @@ class ChatMessage {
   }) {
     return ChatMessage(
       id: id,
+      chatId: chatId,
       senderId: senderId,
       senderName: senderName,
       createdAt: createdAt,
@@ -104,6 +108,7 @@ class ChatMessage {
 
   factory ChatMessage.file({
     required String id,
+    required String chatId,
     required String senderId,
     required String senderName,
     required DateTime createdAt,
@@ -112,6 +117,7 @@ class ChatMessage {
   }) {
     return ChatMessage(
       id: id,
+      chatId: chatId,
       senderId: senderId,
       senderName: senderName,
       createdAt: createdAt,
@@ -126,9 +132,11 @@ class ChatMessage {
     required String id,
     required DateTime createdAt,
     required String text,
+    String chatId = 'group-general',
   }) {
     return ChatMessage(
       id: id,
+      chatId: chatId,
       senderId: 'system',
       senderName: 'System',
       createdAt: createdAt,
@@ -139,6 +147,7 @@ class ChatMessage {
   }
 
   final String id;
+  final String chatId;
   final String senderId;
   final String senderName;
   final DateTime createdAt;
@@ -150,6 +159,7 @@ class ChatMessage {
   Map<String, dynamic> toJson() {
     return {
       'id': id,
+      'chatId': chatId,
       'senderId': senderId,
       'senderName': senderName,
       'createdAt': createdAt.toUtc().toIso8601String(),

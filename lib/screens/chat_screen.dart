@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 
 import '../models/app_notification.dart';
 import '../models/chat_message.dart';
+import '../models/chat_thread.dart';
 import '../providers/chat_provider.dart';
 import '../widgets/message_bubble.dart';
 
@@ -285,6 +286,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final chatProvider = context.watch<ChatProvider>();
     _syncScheduleDraft(chatProvider);
 
+    final chats = chatProvider.chats;
     final messages = chatProvider.messages;
     final latestNotification = chatProvider.latestNotification;
     final canSend = _messageController.text.trim().isNotEmpty;
@@ -409,7 +411,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       ),
       body: SafeArea(
         child: _selectedTab == 0
-            ? _buildChatTab(chatProvider, messages, latestNotification, canSend)
+            ? _buildChatTab(
+                chatProvider,
+                chats,
+                messages,
+                latestNotification,
+                canSend,
+              )
             : _buildSettingsTab(chatProvider),
       ),
       bottomNavigationBar: NavigationBar(
@@ -437,6 +445,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   Widget _buildChatTab(
     ChatProvider chatProvider,
+    List<ChatThread> chats,
     List<ChatMessage> messages,
     AppNotification? latestNotification,
     bool canSend,
@@ -455,6 +464,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 padding: EdgeInsets.fromLTRB(12, 8, 12, 0),
                 child: LinearProgressIndicator(minHeight: 2),
               ),
+            _buildChatSelector(chatProvider, chats),
             Expanded(
               child: ListView.builder(
                 controller: _scrollController,
@@ -482,6 +492,77 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             _buildComposer(chatProvider, canSend),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _buildChatSelector(ChatProvider chatProvider, List<ChatThread> chats) {
+    if (chats.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    return SizedBox(
+      height: 58,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+        itemCount: chats.length,
+        separatorBuilder: (_, _) => const SizedBox(width: 8),
+        itemBuilder: (context, index) {
+          final thread = chats[index];
+          final isSelected = thread.id == chatProvider.selectedChatId;
+          return ChoiceChip(
+            selected: isSelected,
+            showCheckmark: false,
+            onSelected: (_) {
+              chatProvider.updateTypingStatus('');
+              chatProvider.selectChat(thread.id);
+              _messageController.clear();
+              setState(() {});
+              _scrollToBottom();
+            },
+            label: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  thread.type == ChatThreadType.group
+                      ? Icons.groups_rounded
+                      : Icons.person_rounded,
+                  size: 16,
+                ),
+                const SizedBox(width: 6),
+                Text(thread.title),
+                if (thread.unreadCount > 0) ...[
+                  const SizedBox(width: 8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 6,
+                      vertical: 2,
+                    ),
+                    decoration: BoxDecoration(
+                      color: isSelected
+                          ? Theme.of(context).colorScheme.primary
+                          : Theme.of(context).colorScheme.primaryContainer,
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Text(
+                      thread.unreadCount > 99
+                          ? '99+'
+                          : thread.unreadCount.toString(),
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w700,
+                        color: isSelected
+                            ? Theme.of(context).colorScheme.onPrimary
+                            : Theme.of(context).colorScheme.onPrimaryContainer,
+                      ),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          );
+        },
       ),
     );
   }
@@ -801,7 +882,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               onSubmitted: (_) => _sendMessage(chatProvider),
               decoration: InputDecoration(
                 hintText: chatProvider.isConnected
-                    ? 'Введите сообщение'
+                    ? 'Сообщение в ${chatProvider.selectedChatTitle}'
                     : 'Сначала подключитесь к серверу',
               ),
             ),

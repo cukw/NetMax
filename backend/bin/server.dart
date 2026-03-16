@@ -13,12 +13,15 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 const String _authConfigRelativePath = 'config/authorized_users.json';
 const String _updateManifestRelativePath = 'config/update_manifest.json';
 const String _scheduledConfigRelativePath = 'config/scheduled_messages.json';
+const String _groupChatsConfigRelativePath = 'config/group_chats.json';
 const String _messagesConfigRelativePath = 'config/messages_history.json';
 const Duration _scheduleTickInterval = Duration(seconds: 20);
 const Duration _storageCleanupInterval = Duration(minutes: 30);
 const Duration _storageFileMaxAge = Duration(days: 14);
 const int _storageMaxBytes = 1024 * 1024 * 1024;
 const int _maxHistoryMessages = 200;
+const String _defaultGroupChatId = 'group-general';
+const String _defaultGroupChatTitle = 'Общий чат';
 const Set<String> _scheduledRestrictedUsersLower = <String>{
   'юлия сергеевна',
   'татьяна владимировна',
@@ -32,9 +35,11 @@ late final List<String> _allowedUsers;
 late final Map<String, String> _allowedUsersByLower;
 late final Map<String, String> _passwordsByUserLower;
 late final File _scheduledConfigFile;
+late final File _groupChatsConfigFile;
 late final File _messagesConfigFile;
 final Map<String, ScheduledMessageRule> _scheduledRulesByUserLower =
     <String, ScheduledMessageRule>{};
+final Map<String, String> _groupChatTitlesById = <String, String>{};
 
 // 0 = без ограничений
 int _maxSessionsPerUser = 0;
@@ -51,11 +56,15 @@ Future<void> main() async {
   _scheduledConfigFile = File(
     p.join(Directory.current.path, _scheduledConfigRelativePath),
   );
+  _groupChatsConfigFile = File(
+    p.join(Directory.current.path, _groupChatsConfigRelativePath),
+  );
   _messagesConfigFile = File(
     p.join(Directory.current.path, _messagesConfigRelativePath),
   );
 
   _loadAuthorizedUsers();
+  _loadGroupChats();
   _loadMessageHistory();
   _loadScheduledRules();
   _startScheduledDispatcher();
@@ -65,6 +74,7 @@ Future<void> main() async {
   final router = Router()
     ..get('/health', _healthHandler)
     ..get('/authorized-users', _authorizedUsersHandler)
+    ..get('/chats', _chatsHandler)
     ..get('/scheduled-messages', _scheduledMessagesHandler)
     ..get('/update-manifest', _updateManifestHandler)
     ..get(
@@ -98,6 +108,7 @@ Future<void> main() async {
   stdout.writeln(
     'Scheduled rules loaded: ${_scheduledRulesByUserLower.length}',
   );
+  stdout.writeln('Group chats loaded: ${_groupChatTitlesById.length}');
   stdout.writeln('Messages loaded: ${_group.messages.length}');
   stdout.writeln(
     'Storage cleanup: every ${_storageCleanupInterval.inMinutes}m, '
@@ -226,6 +237,54 @@ void _loadScheduledRules() {
   }
 }
 
+void _loadGroupChats() {
+  if (!_groupChatsConfigFile.existsSync()) {
+    _groupChatsConfigFile.createSync(recursive: true);
+    _groupChatsConfigFile.writeAsStringSync(
+      const JsonEncoder.withIndent('  ').convert({
+        'chats': [
+          {'id': _defaultGroupChatId, 'title': _defaultGroupChatTitle},
+        ],
+      }),
+    );
+  }
+
+  final loaded = <String, String>{};
+
+  try {
+    final decoded = jsonDecode(_groupChatsConfigFile.readAsStringSync());
+    final root = _asMap(decoded);
+    final rawChats = root['chats'];
+
+    if (rawChats is List) {
+      for (final item in rawChats) {
+        final map = _asMap(item);
+        final rawId = (map['id']?.toString() ?? '').trim();
+        final rawTitle = (map['title']?.toString() ?? '').trim();
+        final chatId = _normalizeGroupChatId(rawId, requireExisting: false);
+        if (chatId == null || loaded.containsKey(chatId)) {
+          continue;
+        }
+        loaded[chatId] = rawTitle.isEmpty ? 'Чат' : rawTitle;
+      }
+    }
+  } catch (_) {
+    loaded.clear();
+  }
+
+  if (loaded.isEmpty) {
+    loaded[_defaultGroupChatId] = _defaultGroupChatTitle;
+  }
+
+  if (!loaded.containsKey(_defaultGroupChatId)) {
+    loaded[_defaultGroupChatId] = _defaultGroupChatTitle;
+  }
+
+  _groupChatTitlesById
+    ..clear()
+    ..addAll(loaded);
+}
+
 void _loadMessageHistory() {
   if (!_messagesConfigFile.existsSync()) {
     _messagesConfigFile.createSync(recursive: true);
@@ -238,16 +297,17 @@ void _loadMessageHistory() {
     final decoded = jsonDecode(_messagesConfigFile.readAsStringSync());
     final root = _asMap(decoded);
     final rawMessages = root['messages'];
+    var droppedInvalidMessages = false;
 
     _group.messages.clear();
     if (rawMessages is List) {
       for (final item in rawMessages) {
-        final message = _asMap(item);
-        final messageId = (message['id']?.toString() ?? '').trim();
-        if (messageId.isEmpty) {
+        final normalized = _normalizeLoadedMessage(_asMap(item));
+        if (normalized == null) {
+          droppedInvalidMessages = true;
           continue;
         }
-        _group.messages.add(message);
+        _group.messages.add(normalized);
       }
     }
 
@@ -256,6 +316,9 @@ void _loadMessageHistory() {
         0,
         _group.messages.length - _maxHistoryMessages,
       );
+      droppedInvalidMessages = true;
+    }
+    if (droppedInvalidMessages) {
       _saveMessageHistory();
     }
   } catch (_) {
@@ -420,6 +483,7 @@ void _dispatchScheduledMessages() {
     final senderId =
         _findOnlineUserIdByName(rule.userName) ??
         'scheduled-${_safeIdentity(rule.userName)}';
+    final groupChatId = _primaryGroupChatId;
 
     final message = <String, dynamic>{
       'id': _normalizeMessageId(null),
@@ -429,6 +493,8 @@ void _dispatchScheduledMessages() {
       'type': 'text',
       'text': text,
       'scheduled': true,
+      'chatId': groupChatId,
+      'chatType': 'group',
     };
 
     _appendMessage(message);
@@ -466,6 +532,179 @@ List<Map<String, dynamic>> _deduplicatedOnlineUsers() {
   return result;
 }
 
+String get _primaryGroupChatId {
+  if (_groupChatTitlesById.containsKey(_defaultGroupChatId)) {
+    return _defaultGroupChatId;
+  }
+  if (_groupChatTitlesById.isNotEmpty) {
+    return _groupChatTitlesById.keys.first;
+  }
+  return _defaultGroupChatId;
+}
+
+List<Map<String, dynamic>> _groupChatsPayload() {
+  return _groupChatTitlesById.entries
+      .map(
+        (entry) => <String, dynamic>{
+          'id': entry.key,
+          'title': entry.value,
+          'type': 'group',
+        },
+      )
+      .toList(growable: false);
+}
+
+List<Map<String, dynamic>> _messagesForUser(String userName) {
+  final userLower = userName.trim().toLowerCase();
+  final result = <Map<String, dynamic>>[];
+  for (final message in _group.messages) {
+    if (_isMessageVisibleForUser(message: message, userNameLower: userLower)) {
+      result.add(message);
+    }
+  }
+  return result;
+}
+
+bool _isMessageVisibleForUser({
+  required Map<String, dynamic> message,
+  required String userNameLower,
+}) {
+  final chatType = (message['chatType']?.toString() ?? 'group').trim();
+  if (chatType != 'direct') {
+    return true;
+  }
+  final rawParticipants = message['participants'];
+  if (rawParticipants is! List) {
+    return false;
+  }
+  for (final participant in rawParticipants) {
+    final lower = participant.toString().trim().toLowerCase();
+    if (lower == userNameLower) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool _isDirectChatId(String chatId) {
+  return chatId.startsWith('direct:');
+}
+
+String _buildDirectChatId(String firstLower, String secondLower) {
+  final parts = <String>[firstLower, secondLower]..sort();
+  return 'direct:${parts[0]}|${parts[1]}';
+}
+
+String? _normalizeGroupChatId(String raw, {bool requireExisting = true}) {
+  final id = raw.trim().toLowerCase();
+  if (id.isEmpty) {
+    return null;
+  }
+  if (!RegExp(r'^[a-z0-9][a-z0-9_-]{1,63}$').hasMatch(id)) {
+    return null;
+  }
+  if (requireExisting && !_groupChatTitlesById.containsKey(id)) {
+    return null;
+  }
+  return id;
+}
+
+_DirectChatContext? _resolveDirectChatContext({
+  required String chatId,
+  required String senderUserName,
+}) {
+  if (!_isDirectChatId(chatId)) {
+    return null;
+  }
+
+  final raw = chatId.substring('direct:'.length);
+  final parts = raw.split('|');
+  if (parts.length != 2) {
+    return null;
+  }
+  final first = parts[0].trim().toLowerCase();
+  final second = parts[1].trim().toLowerCase();
+  if (first.isEmpty || second.isEmpty || first == second) {
+    return null;
+  }
+
+  final canonicalFirst = _allowedUsersByLower[first];
+  final canonicalSecond = _allowedUsersByLower[second];
+  if (canonicalFirst == null || canonicalSecond == null) {
+    return null;
+  }
+
+  final senderLower = senderUserName.trim().toLowerCase();
+  if (senderLower != first && senderLower != second) {
+    return null;
+  }
+
+  final canonicalChatId = _buildDirectChatId(first, second);
+  return _DirectChatContext(
+    chatId: canonicalChatId,
+    participantsLower: <String>{first, second},
+  );
+}
+
+Map<String, dynamic>? _normalizeLoadedMessage(Map<String, dynamic> raw) {
+  final id = _normalizeMessageId(raw['id']);
+  final senderId = (raw['senderId']?.toString() ?? '').trim();
+  final senderName = (raw['senderName']?.toString() ?? '').trim();
+  final createdAt = _normalizeIsoTimestamp(raw['createdAt']);
+  final type = (raw['type']?.toString() ?? 'text').trim();
+  final text = (raw['text']?.toString() ?? '').trim();
+  final isScheduled = raw['scheduled'] == true;
+  final chatIdRaw = (raw['chatId']?.toString() ?? '').trim();
+  final chatType = (raw['chatType']?.toString() ?? 'group').trim();
+
+  if (type != 'text' && type != 'file' && type != 'system') {
+    return null;
+  }
+
+  if (chatType == 'direct') {
+    final direct = _resolveDirectChatContext(
+      chatId: chatIdRaw,
+      senderUserName: senderName,
+    );
+    if (direct == null) {
+      return null;
+    }
+    final normalized = <String, dynamic>{
+      'id': id,
+      'senderId': senderId,
+      'senderName': senderName.isEmpty ? 'Unknown' : senderName,
+      'createdAt': createdAt,
+      'type': type,
+      'text': text,
+      'scheduled': isScheduled,
+      'chatId': direct.chatId,
+      'chatType': 'direct',
+      'participants': direct.participantsLower.toList(),
+    };
+    if (type == 'file') {
+      normalized['attachment'] = _asMap(raw['attachment']);
+    }
+    return normalized;
+  }
+
+  final groupChatId = _normalizeGroupChatId(chatIdRaw) ?? _primaryGroupChatId;
+  final normalized = <String, dynamic>{
+    'id': id,
+    'senderId': senderId,
+    'senderName': senderName.isEmpty ? 'Unknown' : senderName,
+    'createdAt': createdAt,
+    'type': type,
+    'text': text,
+    'scheduled': isScheduled,
+    'chatId': groupChatId,
+    'chatType': 'group',
+  };
+  if (type == 'file') {
+    normalized['attachment'] = _asMap(raw['attachment']);
+  }
+  return normalized;
+}
+
 String? _findOnlineUserIdByName(String userName) {
   final expected = userName.toLowerCase();
   for (final entry in _group.userNames.entries) {
@@ -490,6 +729,7 @@ Response _healthHandler(Request request) {
     'onlineUsers': _group.clients.length,
     'uniqueOnlineUsers': _deduplicatedOnlineUsers().length,
     'authorizedUsers': _allowedUsers.length,
+    'groupChats': _groupChatTitlesById.length,
     'maxSessionsPerUser': _maxSessionsPerUser,
     'updateManifestAvailable': updateManifestFile.existsSync(),
     'scheduledRules': _scheduledRulesByUserLower.length,
@@ -501,6 +741,14 @@ Response _healthHandler(Request request) {
 
 Response _authorizedUsersHandler(Request request) {
   return _json({'count': _allowedUsers.length, 'users': _allowedUsers});
+}
+
+Response _chatsHandler(Request request) {
+  return _json({
+    'groupChats': _groupChatsPayload(),
+    'allowedUsers': _allowedUsers,
+    'count': _groupChatTitlesById.length,
+  });
 }
 
 Response _scheduledMessagesHandler(Request request) {
@@ -687,7 +935,9 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
               type: 'snapshot',
               payload: {
                 'onlineUsers': _deduplicatedOnlineUsers(),
-                'messages': _group.messages,
+                'messages': _messagesForUser(userName!),
+                'groupChats': _groupChatsPayload(),
+                'allowedUsers': _allowedUsers,
               },
             );
 
@@ -717,6 +967,41 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
               return;
             }
 
+            final chatId = (payload['chatId']?.toString() ?? '').trim();
+            if (chatId.isEmpty) {
+              _sendEnvelope(
+                channel,
+                type: 'error',
+                payload: {'message': 'chatId is required.'},
+              );
+              return;
+            }
+
+            final directContext = _resolveDirectChatContext(
+              chatId: chatId,
+              senderUserName: userName!,
+            );
+            if (_isDirectChatId(chatId) && directContext == null) {
+              _sendEnvelope(
+                channel,
+                type: 'error',
+                payload: {'message': 'Неверный direct chatId.'},
+              );
+              return;
+            }
+
+            final groupChatId = directContext == null
+                ? _normalizeGroupChatId(chatId)
+                : null;
+            if (directContext == null && groupChatId == null) {
+              _sendEnvelope(
+                channel,
+                type: 'error',
+                payload: {'message': 'Групповой чат не найден.'},
+              );
+              return;
+            }
+
             final message = <String, dynamic>{
               'id': _normalizeMessageId(payload['id']),
               'senderId': userId,
@@ -725,10 +1010,22 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
               'type': 'text',
               'text': text,
               'scheduled': false,
+              'chatId': directContext?.chatId ?? groupChatId!,
+              'chatType': directContext == null ? 'group' : 'direct',
+              if (directContext != null)
+                'participants': directContext.participantsLower.toList(),
             };
 
             _appendMessage(message);
-            _broadcast(type: 'message', payload: message);
+            if (directContext == null) {
+              _broadcast(type: 'message', payload: message);
+            } else {
+              _broadcastToParticipants(
+                type: 'message',
+                payload: message,
+                participantsLower: directContext.participantsLower,
+              );
+            }
             break;
 
           case 'typing':
@@ -737,15 +1034,44 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
             }
 
             final isTyping = payload['isTyping'] == true;
-            _broadcast(
-              type: 'typing',
-              payload: {
-                'userId': userId,
-                'userName': userName,
-                'isTyping': isTyping,
-              },
-              exceptUserId: userId,
+            final chatId = (payload['chatId']?.toString() ?? '').trim();
+            if (chatId.isEmpty) {
+              return;
+            }
+            final directContext = _resolveDirectChatContext(
+              chatId: chatId,
+              senderUserName: userName!,
             );
+            if (_isDirectChatId(chatId) && directContext == null) {
+              return;
+            }
+            final groupChatId = directContext == null
+                ? _normalizeGroupChatId(chatId)
+                : null;
+            if (directContext == null && groupChatId == null) {
+              return;
+            }
+
+            final typingPayload = {
+              'userId': userId,
+              'userName': userName,
+              'isTyping': isTyping,
+              'chatId': directContext?.chatId ?? groupChatId!,
+            };
+            if (directContext == null) {
+              _broadcast(
+                type: 'typing',
+                payload: typingPayload,
+                exceptUserId: userId,
+              );
+            } else {
+              _broadcastToParticipants(
+                type: 'typing',
+                payload: typingPayload,
+                participantsLower: directContext.participantsLower,
+                exceptUserId: userId,
+              );
+            }
             break;
 
           case 'file':
@@ -809,6 +1135,39 @@ void _handleFileMessage({
   required String userName,
   required Map<String, dynamic> payload,
 }) {
+  final chatId = (payload['chatId']?.toString() ?? '').trim();
+  if (chatId.isEmpty) {
+    _sendEnvelope(
+      channel,
+      type: 'error',
+      payload: {'message': 'chatId is required for file message.'},
+    );
+    return;
+  }
+  final directContext = _resolveDirectChatContext(
+    chatId: chatId,
+    senderUserName: userName,
+  );
+  if (_isDirectChatId(chatId) && directContext == null) {
+    _sendEnvelope(
+      channel,
+      type: 'error',
+      payload: {'message': 'Неверный direct chatId.'},
+    );
+    return;
+  }
+  final groupChatId = directContext == null
+      ? _normalizeGroupChatId(chatId)
+      : null;
+  if (directContext == null && groupChatId == null) {
+    _sendEnvelope(
+      channel,
+      type: 'error',
+      payload: {'message': 'Групповой чат не найден.'},
+    );
+    return;
+  }
+
   final fileName = (payload['name']?.toString() ?? '').trim();
   final base64Content = payload['contentBase64']?.toString() ?? '';
 
@@ -860,6 +1219,10 @@ void _handleFileMessage({
     'type': 'file',
     'text': (payload['text']?.toString() ?? 'Отправлен файл').trim(),
     'scheduled': false,
+    'chatId': directContext?.chatId ?? groupChatId!,
+    'chatType': directContext == null ? 'group' : 'direct',
+    if (directContext != null)
+      'participants': directContext.participantsLower.toList(),
     'attachment': {
       'name': fileName,
       'path': '/files/$storedName',
@@ -869,7 +1232,15 @@ void _handleFileMessage({
   };
 
   _appendMessage(message);
-  _broadcast(type: 'message', payload: message);
+  if (directContext == null) {
+    _broadcast(type: 'message', payload: message);
+  } else {
+    _broadcastToParticipants(
+      type: 'message',
+      payload: message,
+      participantsLower: directContext.participantsLower,
+    );
+  }
 }
 
 void _handleScheduledConfigSet({
@@ -997,7 +1368,12 @@ void _cleanupConnection({
 
   _broadcast(
     type: 'typing',
-    payload: {'userId': userId, 'userName': userName, 'isTyping': false},
+    payload: {
+      'userId': userId,
+      'userName': userName,
+      'isTyping': false,
+      'chatId': _primaryGroupChatId,
+    },
   );
 }
 
@@ -1024,6 +1400,38 @@ void _broadcast({
     if (exceptUserId != null && userKey == exceptUserId) {
       return;
     }
+    try {
+      socket.sink.add(envelope);
+    } catch (_) {
+      staleUsers.add(userKey);
+    }
+  });
+
+  for (final staleUser in staleUsers) {
+    _group.clients.remove(staleUser);
+    _group.userNames.remove(staleUser);
+  }
+}
+
+void _broadcastToParticipants({
+  required String type,
+  required Map<String, dynamic> payload,
+  required Set<String> participantsLower,
+  String? exceptUserId,
+}) {
+  final envelope = jsonEncode({'type': type, 'payload': payload});
+  final staleUsers = <String>[];
+
+  _group.clients.forEach((userKey, socket) {
+    if (exceptUserId != null && userKey == exceptUserId) {
+      return;
+    }
+    final onlineNameLower = _group.userNames[userKey]?.toLowerCase();
+    if (onlineNameLower == null ||
+        !participantsLower.contains(onlineNameLower)) {
+      return;
+    }
+
     try {
       socket.sink.add(envelope);
     } catch (_) {
@@ -1221,6 +1629,16 @@ class _StorageFileRecord {
   final File file;
   final int sizeBytes;
   final DateTime modifiedAt;
+}
+
+class _DirectChatContext {
+  const _DirectChatContext({
+    required this.chatId,
+    required this.participantsLower,
+  });
+
+  final String chatId;
+  final Set<String> participantsLower;
 }
 
 class ScheduledMessageRule {

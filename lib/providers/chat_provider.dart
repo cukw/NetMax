@@ -14,6 +14,7 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../models/app_notification.dart';
 import '../models/chat_message.dart';
+import '../models/chat_thread.dart';
 import '../models/chat_user.dart';
 import '../services/system_notification_service.dart';
 
@@ -50,6 +51,8 @@ class ChatProvider extends ChangeNotifier {
   static const Duration _updateCheckInterval = Duration(minutes: 15);
   static const Duration _reconnectBaseDelay = Duration(seconds: 3);
   static const Duration _reconnectMaxDelay = Duration(seconds: 30);
+  static const String _defaultGroupChatId = 'group-general';
+  static const String _defaultGroupChatTitle = 'Общий чат';
   static const Set<String> _scheduledRestrictedUsersLower = <String>{
     'юлия сергеевна',
     'татьяна владимировна',
@@ -60,6 +63,13 @@ class ChatProvider extends ChangeNotifier {
   final Set<String> _messageIds = <String>{};
   final Map<String, String> _onlineUsers = <String, String>{};
   final Map<String, String> _typingUsers = <String, String>{};
+  final Map<String, String> _groupChatTitlesById = <String, String>{
+    _defaultGroupChatId: _defaultGroupChatTitle,
+  };
+  final Map<String, String> _allowedUsersByLower = <String, String>{};
+  final Map<String, String> _directChatPeerById = <String, String>{};
+  final Map<String, int> _unreadByChatId = <String, int>{};
+  String _selectedChatId = _defaultGroupChatId;
   final Random _random = Random();
 
   WebSocketChannel? _channel;
@@ -144,6 +154,9 @@ class ChatProvider extends ChangeNotifier {
       isConnected &&
       _isScheduledAllowedByServer &&
       _isScheduledAllowedForUser(_userName);
+  String get selectedChatId => _selectedChatId;
+  String get selectedChatTitle => _chatTitleById(_selectedChatId);
+  List<ChatThread> get chats => _buildChatThreads();
   bool get hasSavedPasswordForCurrentUser => hasSavedPasswordForUser(_userName);
 
   ChatUser get me => ChatUser(id: _userId, name: _userName, isMe: true);
@@ -164,7 +177,13 @@ class ChatProvider extends ChangeNotifier {
   AppNotification? get latestNotification =>
       _notifications.isEmpty ? null : _notifications.last;
 
-  List<ChatMessage> get messages => List<ChatMessage>.unmodifiable(_messages);
+  List<ChatMessage> get messages {
+    final selected = _selectedChatId;
+    final visible = _messages
+        .where((message) => message.chatId == selected)
+        .toList(growable: false);
+    return List<ChatMessage>.unmodifiable(visible);
+  }
 
   List<AppNotification> get notifications =>
       List<AppNotification>.unmodifiable(_notifications.reversed);
@@ -200,6 +219,376 @@ class ChatProvider extends ChangeNotifier {
     return 'Авторизован: $_userName • В сети: $onlineUsersCount';
   }
 
+  void selectChat(String chatId) {
+    final normalized = chatId.trim();
+    if (normalized.isEmpty || !_chatExists(normalized)) {
+      return;
+    }
+    if (_selectedChatId == normalized) {
+      return;
+    }
+    _selectedChatId = normalized;
+    _typingUsers.clear();
+    _unreadByChatId[_selectedChatId] = 0;
+    _safeNotify();
+  }
+
+  String get _primaryGroupChatId {
+    if (_groupChatTitlesById.containsKey(_defaultGroupChatId)) {
+      return _defaultGroupChatId;
+    }
+    if (_groupChatTitlesById.isNotEmpty) {
+      return _groupChatTitlesById.keys.first;
+    }
+    return _defaultGroupChatId;
+  }
+
+  bool _chatExists(String chatId) {
+    return _groupChatTitlesById.containsKey(chatId) ||
+        _directChatPeerById.containsKey(chatId);
+  }
+
+  String _chatTitleById(String chatId) {
+    final groupTitle = _groupChatTitlesById[chatId];
+    if (groupTitle != null && groupTitle.trim().isNotEmpty) {
+      return groupTitle;
+    }
+
+    final directName = _directChatPeerById[chatId];
+    if (directName != null && directName.trim().isNotEmpty) {
+      return 'ЛС: $directName';
+    }
+
+    if (_isDirectChatId(chatId)) {
+      final peerName = _resolvePeerNameForDirectChat(chatId);
+      if (peerName != null && peerName.isNotEmpty) {
+        return 'ЛС: $peerName';
+      }
+    }
+
+    return 'Чат';
+  }
+
+  List<ChatThread> _buildChatThreads() {
+    final lastMessageByChatId = <String, ChatMessage>{};
+    for (final message in _messages) {
+      final chatId = message.chatId.trim();
+      if (chatId.isEmpty) {
+        continue;
+      }
+      final previous = lastMessageByChatId[chatId];
+      if (previous == null || previous.createdAt.isBefore(message.createdAt)) {
+        lastMessageByChatId[chatId] = message;
+      }
+    }
+
+    final threads = <ChatThread>[];
+    final added = <String>{};
+
+    void addThread({
+      required String id,
+      required String title,
+      required ChatThreadType type,
+    }) {
+      if (!added.add(id)) {
+        return;
+      }
+      final lastMessage = lastMessageByChatId[id];
+      threads.add(
+        ChatThread(
+          id: id,
+          title: title,
+          type: type,
+          lastMessageAt: lastMessage?.createdAt,
+          lastMessagePreview: lastMessage == null
+              ? null
+              : _threadPreview(lastMessage),
+          unreadCount: _unreadByChatId[id] ?? 0,
+        ),
+      );
+    }
+
+    final groupEntries = _groupChatTitlesById.entries.toList()
+      ..sort((a, b) => a.value.compareTo(b.value));
+    for (final entry in groupEntries) {
+      addThread(id: entry.key, title: entry.value, type: ChatThreadType.group);
+    }
+
+    final directEntries = _directChatPeerById.entries.toList()
+      ..sort((a, b) => a.value.compareTo(b.value));
+    for (final entry in directEntries) {
+      addThread(
+        id: entry.key,
+        title: 'ЛС: ${entry.value}',
+        type: ChatThreadType.direct,
+      );
+    }
+
+    threads.sort((left, right) {
+      if (left.id == _selectedChatId) {
+        return -1;
+      }
+      if (right.id == _selectedChatId) {
+        return 1;
+      }
+
+      if (left.type != right.type) {
+        return left.type == ChatThreadType.group ? -1 : 1;
+      }
+
+      final leftLast = left.lastMessageAt;
+      final rightLast = right.lastMessageAt;
+      if (leftLast != null && rightLast != null) {
+        final byDate = rightLast.compareTo(leftLast);
+        if (byDate != 0) {
+          return byDate;
+        }
+      } else if (leftLast != null) {
+        return -1;
+      } else if (rightLast != null) {
+        return 1;
+      }
+
+      return left.title.compareTo(right.title);
+    });
+
+    return List<ChatThread>.unmodifiable(threads);
+  }
+
+  String _threadPreview(ChatMessage message) {
+    final senderPrefix = isMyMessage(message)
+        ? 'Вы: '
+        : '${message.senderName}: ';
+    if (message.type == MessageType.file) {
+      final attachmentName = message.attachment?.name ?? 'Файл';
+      final caption = (message.text ?? '').trim();
+      if (caption.isEmpty) {
+        return '$senderPrefix$attachmentName';
+      }
+      return '$senderPrefix$caption';
+    }
+
+    final text = (message.text ?? '').trim();
+    if (text.isEmpty) {
+      return senderPrefix.trim();
+    }
+    return '$senderPrefix$text';
+  }
+
+  String? _normalizeGroupChatId(String raw, {bool requireExisting = true}) {
+    final id = raw.trim().toLowerCase();
+    if (id.isEmpty) {
+      return null;
+    }
+    if (!RegExp(r'^[a-z0-9][a-z0-9_-]{1,63}$').hasMatch(id)) {
+      return null;
+    }
+    if (requireExisting && !_groupChatTitlesById.containsKey(id)) {
+      return null;
+    }
+    return id;
+  }
+
+  void _syncGroupChats(Object? raw) {
+    final merged = <String, String>{
+      _defaultGroupChatId: _defaultGroupChatTitle,
+    };
+
+    if (raw is List) {
+      for (final item in raw) {
+        final map = _asMap(item);
+        final normalizedId = _normalizeGroupChatId(
+          map['id']?.toString() ?? '',
+          requireExisting: false,
+        );
+        if (normalizedId == null || merged.containsKey(normalizedId)) {
+          continue;
+        }
+
+        final title = (map['title']?.toString() ?? '').trim();
+        merged[normalizedId] = title.isEmpty ? 'Групповой чат' : title;
+      }
+    }
+
+    _groupChatTitlesById
+      ..clear()
+      ..addAll(merged);
+  }
+
+  void _syncAllowedUsers(Object? raw) {
+    _allowedUsersByLower.clear();
+    if (raw is! List) {
+      return;
+    }
+
+    for (final item in raw) {
+      final map = _asMap(item);
+      final fromMap = (map['name']?.toString() ?? '').trim();
+      final name = fromMap.isNotEmpty ? fromMap : item.toString().trim();
+      if (name.isEmpty) {
+        continue;
+      }
+      _allowedUsersByLower[name.toLowerCase()] = name;
+    }
+  }
+
+  void _syncDirectChats() {
+    final meLower = _userName.trim().toLowerCase();
+    _directChatPeerById.clear();
+    if (meLower.isEmpty) {
+      return;
+    }
+
+    for (final entry in _allowedUsersByLower.entries) {
+      if (entry.key == meLower) {
+        continue;
+      }
+      final chatId = _buildDirectChatIdForUsers(meLower, entry.key);
+      _directChatPeerById[chatId] = entry.value;
+    }
+
+    for (final message in _messages) {
+      _rememberDirectChat(message.chatId, peerNameHint: message.senderName);
+    }
+  }
+
+  void _ensureSelectedChatExists() {
+    if (_chatExists(_selectedChatId)) {
+      return;
+    }
+    _selectedChatId = _primaryGroupChatId;
+    _typingUsers.clear();
+    _unreadByChatId[_selectedChatId] = 0;
+  }
+
+  void _registerMessageChat(ChatMessage message) {
+    final chatId = message.chatId.trim();
+    if (chatId.isEmpty) {
+      return;
+    }
+
+    if (_isDirectChatId(chatId)) {
+      _rememberDirectChat(chatId, peerNameHint: message.senderName);
+      return;
+    }
+
+    final normalizedGroup = _normalizeGroupChatId(
+      chatId,
+      requireExisting: false,
+    );
+    if (normalizedGroup == null) {
+      return;
+    }
+    _groupChatTitlesById.putIfAbsent(normalizedGroup, () => 'Групповой чат');
+  }
+
+  bool _isDirectChatId(String chatId) {
+    return chatId.startsWith('direct:');
+  }
+
+  String _buildDirectChatIdForUsers(String firstLower, String secondLower) {
+    final parts = <String>[firstLower, secondLower]..sort();
+    return 'direct:${parts[0]}|${parts[1]}';
+  }
+
+  String? _normalizeDirectChatId(String raw) {
+    if (!_isDirectChatId(raw)) {
+      return null;
+    }
+    final tail = raw.substring('direct:'.length);
+    final parts = tail.split('|');
+    if (parts.length != 2) {
+      return null;
+    }
+
+    final first = parts[0].trim().toLowerCase();
+    final second = parts[1].trim().toLowerCase();
+    if (first.isEmpty || second.isEmpty || first == second) {
+      return null;
+    }
+
+    return _buildDirectChatIdForUsers(first, second);
+  }
+
+  bool _directChatIncludesUser(String chatId, String userLower) {
+    final normalized = _normalizeDirectChatId(chatId);
+    if (normalized == null) {
+      return false;
+    }
+    final tail = normalized.substring('direct:'.length);
+    final parts = tail.split('|');
+    if (parts.length != 2) {
+      return false;
+    }
+    return parts[0] == userLower || parts[1] == userLower;
+  }
+
+  String? _resolvePeerNameForDirectChat(String chatId, {String? fallbackName}) {
+    final normalized = _normalizeDirectChatId(chatId);
+    if (normalized == null) {
+      return null;
+    }
+
+    final tail = normalized.substring('direct:'.length);
+    final parts = tail.split('|');
+    if (parts.length != 2) {
+      return null;
+    }
+
+    final meLower = _userName.trim().toLowerCase();
+    String peerLower;
+    if (parts[0] == meLower) {
+      peerLower = parts[1];
+    } else if (parts[1] == meLower) {
+      peerLower = parts[0];
+    } else {
+      peerLower = parts[0];
+    }
+
+    final fromAllowed = _allowedUsersByLower[peerLower];
+    if (fromAllowed != null && fromAllowed.isNotEmpty) {
+      return fromAllowed;
+    }
+
+    final fallback = fallbackName?.trim();
+    if (fallback != null &&
+        fallback.isNotEmpty &&
+        fallback.toLowerCase() != meLower) {
+      return fallback;
+    }
+
+    final partsForDisplay = peerLower
+        .split(RegExp(r'[_\-. ]+'))
+        .where((part) => part.isNotEmpty)
+        .map((part) => '${part[0].toUpperCase()}${part.substring(1)}')
+        .toList(growable: false);
+    if (partsForDisplay.isEmpty) {
+      return peerLower;
+    }
+    return partsForDisplay.join(' ');
+  }
+
+  void _rememberDirectChat(String chatId, {String? peerNameHint}) {
+    final normalized = _normalizeDirectChatId(chatId);
+    if (normalized == null) {
+      return;
+    }
+
+    final meLower = _userName.trim().toLowerCase();
+    if (meLower.isNotEmpty && !_directChatIncludesUser(normalized, meLower)) {
+      return;
+    }
+
+    final peerName = _resolvePeerNameForDirectChat(
+      normalized,
+      fallbackName: peerNameHint,
+    );
+    if (peerName == null || peerName.trim().isEmpty) {
+      return;
+    }
+    _directChatPeerById[normalized] = peerName.trim();
+  }
+
   Future<void> _bootstrap() async {
     await _loadPreferences();
     await _loadAppInfo();
@@ -211,6 +600,7 @@ class ChatProvider extends ChangeNotifier {
       ChatMessage.system(
         id: _nextId(),
         createdAt: DateTime.now(),
+        chatId: _selectedChatId,
         text: _userName.isEmpty
             ? 'Выберите имя из списка авторизованных пользователей и подключитесь к серверу.'
             : 'NetMax Messenger готов. Выполняется подключение к серверу...',
@@ -512,6 +902,8 @@ class ChatProvider extends ChangeNotifier {
       _userName = authorizedUserName;
     }
     _isScheduledAllowedByServer = _isScheduledAllowedForUser(_userName);
+    _syncDirectChats();
+    _ensureSelectedChatExists();
 
     _setConnectionStatus(ChatConnectionStatus.connected);
     _manualDisconnectRequested = false;
@@ -617,6 +1009,13 @@ class ChatProvider extends ChangeNotifier {
   void _handleSnapshot(Map<String, dynamic> payload) {
     final onlineUsersRaw = payload['onlineUsers'];
     final messagesRaw = payload['messages'];
+    final groupChatsRaw = payload['groupChats'];
+    final allowedUsersRaw = payload['allowedUsers'];
+
+    _syncGroupChats(groupChatsRaw);
+    _syncAllowedUsers(allowedUsersRaw);
+    _syncDirectChats();
+    _ensureSelectedChatExists();
 
     _onlineUsers.clear();
     if (onlineUsersRaw is List) {
@@ -633,6 +1032,7 @@ class ChatProvider extends ChangeNotifier {
 
     _messages.clear();
     _messageIds.clear();
+    _unreadByChatId.clear();
 
     if (messagesRaw is List) {
       for (final item in messagesRaw) {
@@ -641,18 +1041,22 @@ class ChatProvider extends ChangeNotifier {
         if (message.id.isEmpty || _messageIds.contains(message.id)) {
           continue;
         }
+        _registerMessageChat(message);
         _messageIds.add(message.id);
         _messages.add(message);
       }
     }
 
     _messages.sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    _syncDirectChats();
+    _ensureSelectedChatExists();
 
     if (_messages.isEmpty) {
       _messages.add(
         ChatMessage.system(
           id: _nextId(),
           createdAt: DateTime.now(),
+          chatId: _selectedChatId,
           text: 'Подключено к общей группе.',
         ),
       );
@@ -681,6 +1085,7 @@ class ChatProvider extends ChangeNotifier {
       ChatMessage.system(
         id: _nextId(),
         createdAt: DateTime.now(),
+        chatId: _primaryGroupChatId,
         text: isOnline ? '$userName в сети' : '$userName вышел из сети',
       ),
     );
@@ -699,8 +1104,18 @@ class ChatProvider extends ChangeNotifier {
     final userId = payload['userId']?.toString() ?? '';
     final userName = payload['userName']?.toString() ?? 'Unknown';
     final isTyping = payload['isTyping'] == true;
+    final chatId = (payload['chatId']?.toString() ?? _primaryGroupChatId)
+        .trim();
 
     if (userId.isEmpty || userId == _userId) {
+      return;
+    }
+
+    if (_isDirectChatId(chatId)) {
+      _rememberDirectChat(chatId, peerNameHint: userName);
+    }
+
+    if (chatId != _selectedChatId) {
       return;
     }
 
@@ -725,10 +1140,17 @@ class ChatProvider extends ChangeNotifier {
       return;
     }
 
+    _registerMessageChat(message);
     _messageIds.add(message.id);
     _messages.add(message);
 
-    if (!isMyMessage(message)) {
+    final isMine = isMyMessage(message);
+    if (!isMine && message.chatId != _selectedChatId) {
+      _unreadByChatId[message.chatId] =
+          (_unreadByChatId[message.chatId] ?? 0) + 1;
+    }
+
+    if (!isMine) {
       _pushNotification(
         kind: message.type == MessageType.file
             ? NotificationKind.file
@@ -868,6 +1290,7 @@ class ChatProvider extends ChangeNotifier {
       payload: {
         'id': _nextId(),
         'text': text,
+        'chatId': _selectedChatId,
         'createdAt': DateTime.now().toUtc().toIso8601String(),
       },
     );
@@ -948,6 +1371,7 @@ class ChatProvider extends ChangeNotifier {
       type: 'file',
       payload: {
         'id': _nextId(),
+        'chatId': _selectedChatId,
         'name': file.name,
         'extension': file.extension,
         'sizeBytes': file.sizeBytes,
@@ -1021,7 +1445,10 @@ class ChatProvider extends ChangeNotifier {
     }
 
     _isMeTyping = isTyping;
-    _sendEnvelope(type: 'typing', payload: {'isTyping': isTyping});
+    _sendEnvelope(
+      type: 'typing',
+      payload: {'isTyping': isTyping, 'chatId': _selectedChatId},
+    );
   }
 
   void _sendEnvelope({
