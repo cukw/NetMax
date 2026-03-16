@@ -157,6 +157,38 @@ class ChatProvider extends ChangeNotifier {
   String get selectedChatId => _selectedChatId;
   String get selectedChatTitle => _chatTitleById(_selectedChatId);
   List<ChatThread> get chats => _buildChatThreads();
+  List<ChatThread> searchDirectUsers(String query) {
+    final normalized = query.trim().toLowerCase();
+    if (normalized.isEmpty) {
+      return const <ChatThread>[];
+    }
+
+    final lastMessageByChatId = _lastMessagesByChatId();
+    final results = <ChatThread>[];
+    final entries = _directChatPeerById.entries.where((entry) {
+      final name = entry.value.toLowerCase();
+      return name.contains(normalized);
+    }).toList()..sort((a, b) => a.value.compareTo(b.value));
+
+    for (final entry in entries) {
+      final lastMessage = lastMessageByChatId[entry.key];
+      results.add(
+        ChatThread(
+          id: entry.key,
+          title: 'ЛС: ${entry.value}',
+          type: ChatThreadType.direct,
+          lastMessageAt: lastMessage?.createdAt,
+          lastMessagePreview: lastMessage == null
+              ? null
+              : _threadPreview(lastMessage),
+          unreadCount: _unreadByChatId[entry.key] ?? 0,
+        ),
+      );
+    }
+
+    return List<ChatThread>.unmodifiable(results);
+  }
+
   bool get hasSavedPasswordForCurrentUser => hasSavedPasswordForUser(_userName);
 
   ChatUser get me => ChatUser(id: _userId, name: _userName, isMe: true);
@@ -269,18 +301,23 @@ class ChatProvider extends ChangeNotifier {
     return 'Чат';
   }
 
-  List<ChatThread> _buildChatThreads() {
-    final lastMessageByChatId = <String, ChatMessage>{};
+  Map<String, ChatMessage> _lastMessagesByChatId() {
+    final result = <String, ChatMessage>{};
     for (final message in _messages) {
       final chatId = message.chatId.trim();
       if (chatId.isEmpty) {
         continue;
       }
-      final previous = lastMessageByChatId[chatId];
+      final previous = result[chatId];
       if (previous == null || previous.createdAt.isBefore(message.createdAt)) {
-        lastMessageByChatId[chatId] = message;
+        result[chatId] = message;
       }
     }
+    return result;
+  }
+
+  List<ChatThread> _buildChatThreads() {
+    final lastMessageByChatId = _lastMessagesByChatId();
 
     final threads = <ChatThread>[];
     final added = <String>{};
@@ -317,6 +354,10 @@ class ChatProvider extends ChangeNotifier {
     final directEntries = _directChatPeerById.entries.toList()
       ..sort((a, b) => a.value.compareTo(b.value));
     for (final entry in directEntries) {
+      final hasMessages = lastMessageByChatId.containsKey(entry.key);
+      if (!hasMessages && entry.key != _selectedChatId) {
+        continue;
+      }
       addThread(
         id: entry.key,
         title: 'ЛС: ${entry.value}',
@@ -325,13 +366,6 @@ class ChatProvider extends ChangeNotifier {
     }
 
     threads.sort((left, right) {
-      if (left.id == _selectedChatId) {
-        return -1;
-      }
-      if (right.id == _selectedChatId) {
-        return 1;
-      }
-
       if (left.type != right.type) {
         return left.type == ChatThreadType.group ? -1 : 1;
       }

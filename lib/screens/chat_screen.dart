@@ -17,6 +17,7 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final TextEditingController _messageController = TextEditingController();
+  final TextEditingController _chatSearchController = TextEditingController();
   final TextEditingController _scheduledTextController =
       TextEditingController();
   final ScrollController _scrollController = ScrollController();
@@ -38,6 +39,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _messageController.dispose();
+    _chatSearchController.dispose();
     _scheduledTextController.dispose();
     _scrollController.dispose();
     super.dispose();
@@ -452,119 +454,403 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   ) {
     return Center(
       child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 980),
-        child: Column(
-          children: [
-            if (latestNotification != null)
-              _buildActivityBanner(latestNotification),
-            if (chatProvider.shouldShowUpdateBanner)
-              _buildUpdateBanner(chatProvider),
-            if (chatProvider.isCheckingUpdates)
-              const Padding(
-                padding: EdgeInsets.fromLTRB(12, 8, 12, 0),
-                child: LinearProgressIndicator(minHeight: 2),
-              ),
-            _buildChatSelector(chatProvider, chats),
-            Expanded(
-              child: ListView.builder(
-                controller: _scrollController,
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: 10,
+        constraints: const BoxConstraints(maxWidth: 1240),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final showLeftSidebar = constraints.maxWidth >= 860;
+            final sidebarThreads = _resolveSidebarThreads(
+              chatProvider: chatProvider,
+              source: chats,
+              query: _chatSearchController.text,
+            );
+
+            return Column(
+              children: [
+                if (latestNotification != null)
+                  _buildActivityBanner(latestNotification),
+                if (chatProvider.shouldShowUpdateBanner)
+                  _buildUpdateBanner(chatProvider),
+                if (chatProvider.isCheckingUpdates)
+                  const Padding(
+                    padding: EdgeInsets.fromLTRB(12, 8, 12, 0),
+                    child: LinearProgressIndicator(minHeight: 2),
+                  ),
+                Expanded(
+                  child: showLeftSidebar
+                      ? Row(
+                          children: [
+                            SizedBox(
+                              width: 320,
+                              child: _buildLeftSidebar(
+                                chatProvider: chatProvider,
+                                threads: sidebarThreads,
+                              ),
+                            ),
+                            const VerticalDivider(width: 1),
+                            Expanded(
+                              child: _buildConversationPane(
+                                chatProvider: chatProvider,
+                                messages: messages,
+                                canSend: canSend,
+                              ),
+                            ),
+                          ],
+                        )
+                      : _buildConversationPane(
+                          chatProvider: chatProvider,
+                          messages: messages,
+                          canSend: canSend,
+                          onOpenChats: () =>
+                              _openChatsSheet(chatProvider, chats),
+                        ),
                 ),
-                itemCount: messages.length,
-                itemBuilder: (context, index) {
-                  final message = messages[index];
-                  final isMine = chatProvider.isMyMessage(message);
-                  return MessageBubble(
-                    message: message,
-                    isMine: isMine,
-                    onAttachmentTap: message.attachment == null
-                        ? null
-                        : () => _openAttachment(
-                            chatProvider,
-                            message.attachment!,
-                          ),
-                  );
-                },
-              ),
-            ),
-            _buildComposer(chatProvider, canSend),
-          ],
+              ],
+            );
+          },
         ),
       ),
     );
   }
 
-  Widget _buildChatSelector(ChatProvider chatProvider, List<ChatThread> chats) {
-    if (chats.isEmpty) {
-      return const SizedBox.shrink();
-    }
-
-    return SizedBox(
-      height: 58,
-      child: ListView.separated(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-        itemCount: chats.length,
-        separatorBuilder: (_, _) => const SizedBox(width: 8),
-        itemBuilder: (context, index) {
-          final thread = chats[index];
-          final isSelected = thread.id == chatProvider.selectedChatId;
-          return ChoiceChip(
-            selected: isSelected,
-            showCheckmark: false,
-            onSelected: (_) {
-              chatProvider.updateTypingStatus('');
-              chatProvider.selectChat(thread.id);
-              _messageController.clear();
-              setState(() {});
-              _scrollToBottom();
-            },
-            label: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  thread.type == ChatThreadType.group
-                      ? Icons.groups_rounded
-                      : Icons.person_rounded,
-                  size: 16,
-                ),
-                const SizedBox(width: 6),
-                Text(thread.title),
-                if (thread.unreadCount > 0) ...[
-                  const SizedBox(width: 8),
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 6,
-                      vertical: 2,
+  Widget _buildLeftSidebar({
+    required ChatProvider chatProvider,
+    required List<ChatThread> threads,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(10, 10, 8, 10),
+      child: Column(
+        children: [
+          TextField(
+            controller: _chatSearchController,
+            onChanged: (_) => setState(() {}),
+            decoration: InputDecoration(
+              hintText: 'Поиск пользователя',
+              prefixIcon: const Icon(Icons.search_rounded),
+              suffixIcon: _chatSearchController.text.trim().isEmpty
+                  ? null
+                  : IconButton(
+                      tooltip: 'Очистить',
+                      onPressed: () {
+                        _chatSearchController.clear();
+                        setState(() {});
+                      },
+                      icon: const Icon(Icons.close_rounded),
                     ),
-                    decoration: BoxDecoration(
-                      color: isSelected
-                          ? Theme.of(context).colorScheme.primary
-                          : Theme.of(context).colorScheme.primaryContainer,
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: Text(
-                      thread.unreadCount > 99
-                          ? '99+'
-                          : thread.unreadCount.toString(),
-                      style: TextStyle(
-                        fontSize: 11,
-                        fontWeight: FontWeight.w700,
-                        color: isSelected
-                            ? Theme.of(context).colorScheme.onPrimary
-                            : Theme.of(context).colorScheme.onPrimaryContainer,
-                      ),
-                    ),
-                  ),
-                ],
-              ],
             ),
-          );
-        },
+          ),
+          const SizedBox(height: 10),
+          Expanded(
+            child: threads.isEmpty
+                ? Center(
+                    child: Text(
+                      _chatSearchController.text.trim().isEmpty
+                          ? 'Нет активных диалогов'
+                          : 'Пользователь не найден',
+                    ),
+                  )
+                : ListView.separated(
+                    itemCount: threads.length,
+                    separatorBuilder: (_, _) => const SizedBox(height: 6),
+                    itemBuilder: (context, index) {
+                      final thread = threads[index];
+                      final selected = thread.id == chatProvider.selectedChatId;
+                      final preview = thread.lastMessagePreview?.trim() ?? '';
+                      final showPreview = preview.isNotEmpty;
+                      final threadTitle = _displayThreadTitle(thread);
+                      final timeLabel = thread.lastMessageAt == null
+                          ? null
+                          : DateFormat('HH:mm').format(thread.lastMessageAt!);
+
+                      return Material(
+                        color: selected
+                            ? Theme.of(context).colorScheme.primaryContainer
+                            : Theme.of(context).colorScheme.surface,
+                        borderRadius: BorderRadius.circular(12),
+                        child: InkWell(
+                          borderRadius: BorderRadius.circular(12),
+                          onTap: () => _selectThread(chatProvider, thread),
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 10,
+                              vertical: 8,
+                            ),
+                            child: Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                CircleAvatar(
+                                  radius: 16,
+                                  child: Icon(
+                                    thread.type == ChatThreadType.group
+                                        ? Icons.groups_rounded
+                                        : Icons.person_rounded,
+                                    size: 18,
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        threadTitle,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: const TextStyle(
+                                          fontWeight: FontWeight.w700,
+                                        ),
+                                      ),
+                                      if (showPreview) ...[
+                                        const SizedBox(height: 2),
+                                        Text(
+                                          preview,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: Theme.of(
+                                            context,
+                                          ).textTheme.bodySmall,
+                                        ),
+                                      ],
+                                    ],
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                Column(
+                                  crossAxisAlignment: CrossAxisAlignment.end,
+                                  children: [
+                                    if (timeLabel != null)
+                                      Text(
+                                        timeLabel,
+                                        style: Theme.of(
+                                          context,
+                                        ).textTheme.bodySmall,
+                                      ),
+                                    if (thread.unreadCount > 0) ...[
+                                      if (timeLabel != null)
+                                        const SizedBox(height: 4),
+                                      Container(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 6,
+                                          vertical: 2,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: Theme.of(
+                                            context,
+                                          ).colorScheme.primary,
+                                          borderRadius: BorderRadius.circular(
+                                            10,
+                                          ),
+                                        ),
+                                        child: Text(
+                                          thread.unreadCount > 99
+                                              ? '99+'
+                                              : thread.unreadCount.toString(),
+                                          style: TextStyle(
+                                            color: Theme.of(
+                                              context,
+                                            ).colorScheme.onPrimary,
+                                            fontSize: 11,
+                                            fontWeight: FontWeight.w700,
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ],
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+        ],
       ),
     );
+  }
+
+  Widget _buildConversationPane({
+    required ChatProvider chatProvider,
+    required List<ChatMessage> messages,
+    required bool canSend,
+    VoidCallback? onOpenChats,
+  }) {
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 10, 12, 0),
+          child: Row(
+            children: [
+              if (onOpenChats != null)
+                IconButton.filledTonal(
+                  onPressed: onOpenChats,
+                  tooltip: 'Диалоги',
+                  icon: const Icon(Icons.menu_rounded),
+                ),
+              if (onOpenChats != null) const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  chatProvider.selectedChatTitle,
+                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: ListView.builder(
+            controller: _scrollController,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            itemCount: messages.length,
+            itemBuilder: (context, index) {
+              final message = messages[index];
+              final isMine = chatProvider.isMyMessage(message);
+              return MessageBubble(
+                message: message,
+                isMine: isMine,
+                onAttachmentTap: message.attachment == null
+                    ? null
+                    : () => _openAttachment(chatProvider, message.attachment!),
+              );
+            },
+          ),
+        ),
+        _buildComposer(chatProvider, canSend),
+      ],
+    );
+  }
+
+  Future<void> _openChatsSheet(
+    ChatProvider chatProvider,
+    List<ChatThread> source,
+  ) async {
+    var query = '';
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (sheetContext) {
+        return StatefulBuilder(
+          builder: (sheetContext, setSheetState) {
+            final threads = _resolveSidebarThreads(
+              chatProvider: chatProvider,
+              source: source,
+              query: query,
+            );
+
+            return SafeArea(
+              child: Padding(
+                padding: EdgeInsets.only(
+                  left: 12,
+                  right: 12,
+                  top: 8,
+                  bottom: MediaQuery.of(sheetContext).viewInsets.bottom + 12,
+                ),
+                child: SizedBox(
+                  height: MediaQuery.of(sheetContext).size.height * 0.75,
+                  child: Column(
+                    children: [
+                      TextField(
+                        onChanged: (value) {
+                          setSheetState(() {
+                            query = value;
+                          });
+                        },
+                        decoration: const InputDecoration(
+                          hintText: 'Поиск пользователя',
+                          prefixIcon: Icon(Icons.search_rounded),
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      Expanded(
+                        child: threads.isEmpty
+                            ? const Center(
+                                child: Text('Пользователь не найден'),
+                              )
+                            : ListView.builder(
+                                itemCount: threads.length,
+                                itemBuilder: (context, index) {
+                                  final thread = threads[index];
+                                  final preview =
+                                      thread.lastMessagePreview?.trim() ?? '';
+                                  final title = _displayThreadTitle(thread);
+                                  return ListTile(
+                                    leading: Icon(
+                                      thread.type == ChatThreadType.group
+                                          ? Icons.groups_rounded
+                                          : Icons.person_rounded,
+                                    ),
+                                    title: Text(title),
+                                    subtitle: preview.isEmpty
+                                        ? null
+                                        : Text(
+                                            preview,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                          ),
+                                    onTap: () {
+                                      Navigator.of(sheetContext).pop();
+                                      _selectThread(chatProvider, thread);
+                                    },
+                                  );
+                                },
+                              ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  List<ChatThread> _resolveSidebarThreads({
+    required ChatProvider chatProvider,
+    required List<ChatThread> source,
+    required String query,
+  }) {
+    final normalized = query.trim().toLowerCase();
+    if (normalized.isEmpty) {
+      return source;
+    }
+
+    final byId = <String, ChatThread>{};
+    for (final thread in source) {
+      final title = _displayThreadTitle(thread).toLowerCase();
+      if (title.contains(normalized)) {
+        byId[thread.id] = thread;
+      }
+    }
+
+    for (final thread in chatProvider.searchDirectUsers(normalized)) {
+      byId.putIfAbsent(thread.id, () => thread);
+    }
+
+    return byId.values.toList(growable: false);
+  }
+
+  String _displayThreadTitle(ChatThread thread) {
+    if (thread.type == ChatThreadType.group) {
+      return thread.title;
+    }
+    return thread.title.replaceFirst(RegExp(r'^ЛС:\s*'), '');
+  }
+
+  void _selectThread(ChatProvider chatProvider, ChatThread thread) {
+    chatProvider.updateTypingStatus('');
+    chatProvider.selectChat(thread.id);
+    _messageController.clear();
+    _chatSearchController.clear();
+    setState(() {});
+    _scrollToBottom();
   }
 
   Widget _buildSettingsTab(ChatProvider chatProvider) {
