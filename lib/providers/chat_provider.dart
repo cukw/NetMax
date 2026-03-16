@@ -114,8 +114,6 @@ class ChatProvider extends ChangeNotifier {
   String? _scheduledConfigError;
   bool _isScheduledAllowedByServer = true;
 
-  DateTime _lastTypingSystemNotificationAt =
-      DateTime.fromMillisecondsSinceEpoch(0);
   int _reconnectAttempt = 0;
   bool _manualDisconnectRequested = false;
 
@@ -1185,16 +1183,16 @@ class ChatProvider extends ChangeNotifier {
     }
 
     if (!isMine) {
+      final isFile = message.type == MessageType.file;
+      final fileName = message.attachment?.name ?? 'Файл';
+      final messageText = (message.text ?? '').trim();
+      final bodyText = isFile
+          ? (messageText.isEmpty ? fileName : '$fileName — $messageText')
+          : messageText;
       _pushNotification(
-        kind: message.type == MessageType.file
-            ? NotificationKind.file
-            : NotificationKind.message,
-        title: message.type == MessageType.file
-            ? 'Новый файл'
-            : 'Новое сообщение',
-        description: message.type == MessageType.file
-            ? '${message.senderName}: ${message.attachment?.name ?? 'Файл'}'
-            : '${message.senderName}: ${message.text ?? ''}',
+        kind: NotificationKind.message,
+        title: isFile ? 'Новый файл' : 'Новое сообщение',
+        description: '${message.senderName}: $bodyText',
         showInSystem: true,
       );
     }
@@ -1302,20 +1300,13 @@ class ChatProvider extends ChangeNotifier {
     return null;
   }
 
-  void sendText(String rawText) {
+  void sendText(String rawText, {ChatMessage? replyTo}) {
     final text = rawText.trim();
     if (text.isEmpty) {
       return;
     }
 
     if (!isConnected) {
-      _pushNotification(
-        kind: NotificationKind.system,
-        title: 'Нет соединения',
-        description: 'Подключитесь к серверу, чтобы отправить сообщение.',
-        showInSystem: false,
-      );
-      _safeNotify();
       return;
     }
 
@@ -1325,6 +1316,7 @@ class ChatProvider extends ChangeNotifier {
         'id': _nextId(),
         'text': text,
         'chatId': _selectedChatId,
+        if (replyTo != null) 'replyTo': _replyPayloadFromMessage(replyTo),
         'createdAt': DateTime.now().toUtc().toIso8601String(),
       },
     );
@@ -1394,6 +1386,7 @@ class ChatProvider extends ChangeNotifier {
   Future<String?> sendPickedFile(
     PreparedFileUpload file, {
     String caption = '',
+    ChatMessage? replyTo,
   }) async {
     if (!isConnected) {
       return 'Нет подключения к серверу. Невозможно отправить файл.';
@@ -1411,19 +1404,26 @@ class ChatProvider extends ChangeNotifier {
         'sizeBytes': file.sizeBytes,
         'contentBase64': base64Encode(file.bytes),
         'text': normalizedCaption,
+        if (replyTo != null) 'replyTo': _replyPayloadFromMessage(replyTo),
         'createdAt': DateTime.now().toUtc().toIso8601String(),
       },
     );
 
-    _pushNotification(
-      kind: NotificationKind.file,
-      title: 'Отправка файла',
-      description: file.name,
-      showInSystem: false,
-    );
-    _safeNotify();
-
     return null;
+  }
+
+  Map<String, dynamic> _replyPayloadFromMessage(ChatMessage message) {
+    final previewText = (message.text ?? '').trim();
+    final fallbackFileName = message.attachment?.name ?? 'Файл';
+    final textForPayload = previewText.isEmpty ? fallbackFileName : previewText;
+    return <String, dynamic>{
+      'messageId': message.id,
+      'senderName': message.senderName.trim().isEmpty
+          ? 'Unknown'
+          : message.senderName.trim(),
+      'text': textForPayload,
+      'type': message.type.value,
+    };
   }
 
   Future<String?> openAttachment(
@@ -1656,6 +1656,10 @@ class ChatProvider extends ChangeNotifier {
     required String description,
     required bool showInSystem,
   }) {
+    if (kind != NotificationKind.message) {
+      return;
+    }
+
     _notifications.add(
       AppNotification(
         id: _nextId(),
@@ -1671,28 +1675,14 @@ class ChatProvider extends ChangeNotifier {
     }
 
     if (showInSystem) {
-      _showSystemNotification(
-        kind: kind,
-        title: title,
-        description: description,
-      );
+      _showSystemNotification(title: title, description: description);
     }
   }
 
   void _showSystemNotification({
-    required NotificationKind kind,
     required String title,
     required String description,
   }) {
-    if (kind == NotificationKind.typing) {
-      final now = DateTime.now();
-      if (now.difference(_lastTypingSystemNotificationAt) <
-          const Duration(seconds: 25)) {
-        return;
-      }
-      _lastTypingSystemNotificationAt = now;
-    }
-
     unawaited(
       SystemNotificationService.instance.show(title: title, body: description),
     );

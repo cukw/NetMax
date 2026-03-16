@@ -646,6 +646,35 @@ _DirectChatContext? _resolveDirectChatContext({
   );
 }
 
+Map<String, dynamic>? _normalizeReplyPayload(Object? raw) {
+  if (raw is! Map) {
+    return null;
+  }
+
+  final map = _asMap(raw);
+  final messageId = (map['messageId']?.toString() ?? '').trim();
+  if (messageId.isEmpty) {
+    return null;
+  }
+
+  final senderName = (map['senderName']?.toString() ?? 'Unknown').trim();
+  final text = (map['text']?.toString() ?? '').trim();
+  final typeRaw = (map['type']?.toString() ?? 'text').trim().toLowerCase();
+  final type = switch (typeRaw) {
+    'file' => 'file',
+    'system' => 'system',
+    _ => 'text',
+  };
+
+  final fallbackText = type == 'file' ? 'Файл' : 'Сообщение';
+  return <String, dynamic>{
+    'messageId': messageId,
+    'senderName': senderName.isEmpty ? 'Unknown' : senderName,
+    'text': text.isEmpty ? fallbackText : text,
+    'type': type,
+  };
+}
+
 Map<String, dynamic>? _normalizeLoadedMessage(Map<String, dynamic> raw) {
   final id = _normalizeMessageId(raw['id']);
   final senderId = (raw['senderId']?.toString() ?? '').trim();
@@ -656,6 +685,7 @@ Map<String, dynamic>? _normalizeLoadedMessage(Map<String, dynamic> raw) {
   final isScheduled = raw['scheduled'] == true;
   final chatIdRaw = (raw['chatId']?.toString() ?? '').trim();
   final chatType = (raw['chatType']?.toString() ?? 'group').trim();
+  final replyTo = _normalizeReplyPayload(raw['replyTo']);
 
   if (type != 'text' && type != 'file' && type != 'system') {
     return null;
@@ -680,6 +710,7 @@ Map<String, dynamic>? _normalizeLoadedMessage(Map<String, dynamic> raw) {
       'chatId': direct.chatId,
       'chatType': 'direct',
       'participants': direct.participantsLower.toList(),
+      if (replyTo != null) 'replyTo': replyTo,
     };
     if (type == 'file') {
       normalized['attachment'] = _asMap(raw['attachment']);
@@ -698,6 +729,7 @@ Map<String, dynamic>? _normalizeLoadedMessage(Map<String, dynamic> raw) {
     'scheduled': isScheduled,
     'chatId': groupChatId,
     'chatType': 'group',
+    if (replyTo != null) 'replyTo': replyTo,
   };
   if (type == 'file') {
     normalized['attachment'] = _asMap(raw['attachment']);
@@ -1001,6 +1033,7 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
               );
               return;
             }
+            final replyTo = _normalizeReplyPayload(payload['replyTo']);
 
             final message = <String, dynamic>{
               'id': _normalizeMessageId(payload['id']),
@@ -1012,6 +1045,7 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
               'scheduled': false,
               'chatId': directContext?.chatId ?? groupChatId!,
               'chatType': directContext == null ? 'group' : 'direct',
+              if (replyTo != null) 'replyTo': replyTo,
               if (directContext != null)
                 'participants': directContext.participantsLower.toList(),
             };
@@ -1167,6 +1201,7 @@ void _handleFileMessage({
     );
     return;
   }
+  final replyTo = _normalizeReplyPayload(payload['replyTo']);
 
   final fileName = (payload['name']?.toString() ?? '').trim();
   final base64Content = payload['contentBase64']?.toString() ?? '';
@@ -1221,6 +1256,7 @@ void _handleFileMessage({
     'scheduled': false,
     'chatId': directContext?.chatId ?? groupChatId!,
     'chatType': directContext == null ? 'group' : 'direct',
+    if (replyTo != null) 'replyTo': replyTo,
     if (directContext != null)
       'participants': directContext.participantsLower.toList(),
     'attachment': {

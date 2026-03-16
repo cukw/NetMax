@@ -9,11 +9,13 @@ class MessageBubble extends StatelessWidget {
     required this.message,
     required this.isMine,
     this.onAttachmentTap,
+    this.onReply,
   });
 
   final ChatMessage message;
   final bool isMine;
   final VoidCallback? onAttachmentTap;
+  final ValueChanged<ChatMessage>? onReply;
 
   @override
   Widget build(BuildContext context) {
@@ -73,6 +75,14 @@ class MessageBubble extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 5),
+            if (message.replyTo != null) ...[
+              _ReplyPreview(
+                reply: message.replyTo!,
+                textColor: textColor,
+                isMine: isMine,
+              ),
+              const SizedBox(height: 7),
+            ],
             if (hasFile) ...[
               _FileAttachmentView(
                 attachment: message.attachment!,
@@ -96,6 +106,20 @@ class MessageBubble extends StatelessWidget {
             Row(
               mainAxisSize: MainAxisSize.min,
               children: [
+                if (onReply != null)
+                  InkWell(
+                    borderRadius: BorderRadius.circular(8),
+                    onTap: () => onReply!(message),
+                    child: Padding(
+                      padding: const EdgeInsets.all(3),
+                      child: Icon(
+                        Icons.reply_rounded,
+                        size: 15,
+                        color: textColor.withAlpha(170),
+                      ),
+                    ),
+                  ),
+                if (onReply != null) const SizedBox(width: 4),
                 Text(
                   DateFormat('HH:mm').format(message.createdAt),
                   style: TextStyle(
@@ -107,6 +131,65 @@ class MessageBubble extends StatelessWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class _ReplyPreview extends StatelessWidget {
+  const _ReplyPreview({
+    required this.reply,
+    required this.textColor,
+    required this.isMine,
+  });
+
+  final MessageReplyInfo reply;
+  final Color textColor;
+  final bool isMine;
+
+  @override
+  Widget build(BuildContext context) {
+    final background = isMine
+        ? Colors.white.withAlpha(38)
+        : Theme.of(context).colorScheme.primary.withAlpha(18);
+
+    final kindText = switch (reply.type) {
+      MessageType.file => '[Файл] ',
+      MessageType.system => '[Система] ',
+      _ => '',
+    };
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: background,
+        borderRadius: BorderRadius.circular(10),
+        border: Border(
+          left: BorderSide(color: textColor.withAlpha(160), width: 3),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            reply.senderName,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: textColor.withAlpha(190),
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            '$kindText${reply.text}',
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(color: textColor.withAlpha(200), fontSize: 12),
+          ),
+        ],
       ),
     );
   }

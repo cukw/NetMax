@@ -1,3 +1,6 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
@@ -21,9 +24,19 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final TextEditingController _scheduledTextController =
       TextEditingController();
   final ScrollController _scrollController = ScrollController();
+  final FocusNode _messageFocusNode = FocusNode(
+    debugLabel: 'message_input_focus',
+  );
+  final FocusNode _chatSearchFocusNode = FocusNode(
+    debugLabel: 'chat_search_focus',
+  );
 
   int _lastMessageCount = 0;
   int _selectedTab = 0;
+  ChatMessage? _replyToMessage;
+  String? _lastWebPopupNotificationId;
+  AppNotification? _webPopupNotification;
+  Timer? _webPopupTimer;
 
   bool _scheduledEnabledDraft = false;
   String _scheduledTimeDraft = '09:00';
@@ -33,6 +46,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _ensureMessageInputFocus(force: true);
+    });
   }
 
   @override
@@ -42,6 +58,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _chatSearchController.dispose();
     _scheduledTextController.dispose();
     _scrollController.dispose();
+    _messageFocusNode.dispose();
+    _chatSearchFocusNode.dispose();
+    _webPopupTimer?.cancel();
     super.dispose();
   }
 
@@ -50,6 +69,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     if (state != AppLifecycleState.resumed || !mounted) {
       return;
     }
+
+    _ensureMessageInputFocus(force: true);
 
     final chatProvider = context.read<ChatProvider>();
     if (chatProvider.userName.trim().isEmpty || chatProvider.isConnected) {
@@ -60,11 +81,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   void _sendMessage(ChatProvider chatProvider) {
     final text = _messageController.text;
-    chatProvider.sendText(text);
+    chatProvider.sendText(text, replyTo: _replyToMessage);
     _messageController.clear();
+    _replyToMessage = null;
     chatProvider.updateTypingStatus('');
     setState(() {});
     _scrollToBottom();
+    _ensureMessageInputFocus(force: true);
   }
 
   Future<void> _sendFile(ChatProvider chatProvider) async {
@@ -94,7 +117,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       return;
     }
 
-    final error = await chatProvider.sendPickedFile(prepared, caption: caption);
+    final error = await chatProvider.sendPickedFile(
+      prepared,
+      caption: caption,
+      replyTo: _replyToMessage,
+    );
     if (!mounted) {
       return;
     }
@@ -106,7 +133,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       return;
     }
 
+    _replyToMessage = null;
+    setState(() {});
     _scrollToBottom();
+    _ensureMessageInputFocus(force: true);
   }
 
   Future<String?> _showFileCaptionDialog(String fileName) async {
@@ -261,6 +291,76 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
+  void _syncWebMessagePopup(AppNotification? latestNotification) {
+    if (!kIsWeb) {
+      return;
+    }
+    if (latestNotification == null ||
+        latestNotification.kind != NotificationKind.message) {
+      return;
+    }
+    if (latestNotification.id == _lastWebPopupNotificationId) {
+      return;
+    }
+
+    _lastWebPopupNotificationId = latestNotification.id;
+    _webPopupTimer?.cancel();
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _webPopupNotification = latestNotification;
+      });
+    });
+
+    _webPopupTimer = Timer(const Duration(seconds: 5), () {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _webPopupNotification = null;
+      });
+    });
+  }
+
+  void _startReply(ChatMessage message) {
+    if (message.type == MessageType.system) {
+      return;
+    }
+    setState(() {
+      _replyToMessage = message;
+    });
+    _ensureMessageInputFocus(force: true);
+  }
+
+  void _cancelReply() {
+    if (_replyToMessage == null) {
+      return;
+    }
+    setState(() {
+      _replyToMessage = null;
+    });
+    _ensureMessageInputFocus(force: true);
+  }
+
+  void _ensureMessageInputFocus({bool force = false}) {
+    if (!mounted || _selectedTab != 0) {
+      return;
+    }
+    if (_chatSearchFocusNode.hasFocus) {
+      return;
+    }
+    if (!force && _messageFocusNode.hasFocus) {
+      return;
+    }
+    final scope = FocusScope.of(context);
+    if (!scope.hasFocus || force || !_messageFocusNode.hasFocus) {
+      scope.requestFocus(_messageFocusNode);
+    }
+  }
+
   void _scrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_scrollController.hasClients) {
@@ -294,6 +394,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final canSend = _messageController.text.trim().isNotEmpty;
 
     _maybeScrollOnNewMessage(messages.length);
+    _syncWebMessagePopup(latestNotification);
 
     return Scaffold(
       appBar: AppBar(
@@ -412,15 +513,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         ],
       ),
       body: SafeArea(
-        child: _selectedTab == 0
-            ? _buildChatTab(
-                chatProvider,
-                chats,
-                messages,
-                latestNotification,
-                canSend,
-              )
-            : _buildSettingsTab(chatProvider),
+        child: Stack(
+          children: [
+            _selectedTab == 0
+                ? _buildChatTab(chatProvider, chats, messages, canSend)
+                : _buildSettingsTab(chatProvider),
+            if (kIsWeb && _webPopupNotification != null)
+              _buildWebMessagePopup(_webPopupNotification!),
+          ],
+        ),
       ),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _selectedTab,
@@ -428,6 +529,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           setState(() {
             _selectedTab = index;
           });
+          if (index == 0) {
+            _ensureMessageInputFocus(force: true);
+          }
         },
         destinations: const [
           NavigationDestination(
@@ -449,7 +553,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     ChatProvider chatProvider,
     List<ChatThread> chats,
     List<ChatMessage> messages,
-    AppNotification? latestNotification,
     bool canSend,
   ) {
     return Center(
@@ -466,9 +569,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
             return Column(
               children: [
-                if (latestNotification != null)
-                  _buildActivityBanner(latestNotification),
-                if (chatProvider.shouldShowUpdateBanner)
+                if (!kIsWeb && chatProvider.shouldShowUpdateBanner)
                   _buildUpdateBanner(chatProvider),
                 if (chatProvider.isCheckingUpdates)
                   const Padding(
@@ -522,6 +623,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         children: [
           TextField(
             controller: _chatSearchController,
+            focusNode: _chatSearchFocusNode,
             onChanged: (_) => setState(() {}),
             decoration: InputDecoration(
               hintText: 'Поиск пользователя',
@@ -716,6 +818,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 onAttachmentTap: message.attachment == null
                     ? null
                     : () => _openAttachment(chatProvider, message.attachment!),
+                onReply: message.type == MessageType.system
+                    ? null
+                    : _startReply,
               );
             },
           ),
@@ -849,8 +954,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     chatProvider.selectChat(thread.id);
     _messageController.clear();
     _chatSearchController.clear();
+    _replyToMessage = null;
     setState(() {});
     _scrollToBottom();
+    _ensureMessageInputFocus(force: true);
   }
 
   Widget _buildSettingsTab(ChatProvider chatProvider) {
@@ -1005,46 +1112,48 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  Widget _buildActivityBanner(AppNotification notification) {
+  Widget _buildWebMessagePopup(AppNotification notification) {
     final theme = Theme.of(context);
-
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-      child: Container(
-        width: double.infinity,
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-        decoration: BoxDecoration(
-          color: theme.colorScheme.primaryContainer.withAlpha(170),
-          borderRadius: BorderRadius.circular(14),
-        ),
-        child: Row(
-          children: [
-            Icon(
-              _iconForNotification(notification.kind),
-              size: 18,
-              color: theme.colorScheme.onPrimaryContainer,
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                '${notification.title}: ${notification.description}',
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-                style: theme.textTheme.bodySmall?.copyWith(
-                  color: theme.colorScheme.onPrimaryContainer,
-                  fontWeight: FontWeight.w600,
+    return Positioned.fill(
+      child: IgnorePointer(
+        child: Container(
+          color: Colors.black.withAlpha(70),
+          alignment: Alignment.center,
+          child: Container(
+            constraints: const BoxConstraints(maxWidth: 420),
+            margin: const EdgeInsets.symmetric(horizontal: 16),
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surface,
+              borderRadius: BorderRadius.circular(14),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withAlpha(70),
+                  blurRadius: 20,
+                  offset: const Offset(0, 8),
                 ),
-              ),
+              ],
             ),
-            const SizedBox(width: 8),
-            Text(
-              DateFormat('HH:mm').format(notification.createdAt),
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: theme.colorScheme.onPrimaryContainer.withAlpha(190),
-                fontSize: 11,
-              ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  notification.title,
+                  style: theme.textTheme.titleSmall?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  notification.description,
+                  maxLines: 3,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.bodyMedium,
+                ),
+              ],
             ),
-          ],
+          ),
         ),
       ),
     );
@@ -1137,47 +1246,89 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   Widget _buildComposer(ChatProvider chatProvider, bool canSend) {
+    final reply = _replyToMessage;
+    final replyPreviewText = reply == null
+        ? null
+        : ((reply.text ?? '').trim().isEmpty
+              ? (reply.attachment?.name ?? 'Файл')
+              : (reply.text ?? '').trim());
+
     return Padding(
       padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
-      child: Row(
+      child: Column(
         children: [
-          IconButton.filledTonal(
-            onPressed: chatProvider.isPickingFile
-                ? null
-                : () => _sendFile(chatProvider),
-            tooltip: 'Отправить файл',
-            icon: chatProvider.isPickingFile
-                ? const SizedBox(
-                    height: 18,
-                    width: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : const Icon(Icons.attach_file_rounded),
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: TextField(
-              controller: _messageController,
-              minLines: 1,
-              maxLines: 5,
-              textInputAction: TextInputAction.send,
-              onChanged: (value) {
-                chatProvider.updateTypingStatus(value);
-                setState(() {});
-              },
-              onSubmitted: (_) => _sendMessage(chatProvider),
-              decoration: InputDecoration(
-                hintText: chatProvider.isConnected
-                    ? 'Сообщение в ${chatProvider.selectedChatTitle}'
-                    : 'Сначала подключитесь к серверу',
+          if (reply != null)
+            Container(
+              width: double.infinity,
+              margin: const EdgeInsets.only(bottom: 8),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.primaryContainer,
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.reply_rounded, size: 16),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'Ответ ${reply.senderName}: $replyPreviewText',
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Отменить ответ',
+                    onPressed: _cancelReply,
+                    icon: const Icon(Icons.close_rounded, size: 18),
+                  ),
+                ],
               ),
             ),
-          ),
-          const SizedBox(width: 8),
-          IconButton.filled(
-            onPressed: canSend ? () => _sendMessage(chatProvider) : null,
-            tooltip: 'Отправить',
-            icon: const Icon(Icons.send_rounded),
+          Row(
+            children: [
+              IconButton.filledTonal(
+                onPressed: chatProvider.isPickingFile
+                    ? null
+                    : () => _sendFile(chatProvider),
+                tooltip: 'Отправить файл',
+                icon: chatProvider.isPickingFile
+                    ? const SizedBox(
+                        height: 18,
+                        width: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.attach_file_rounded),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: TextField(
+                  controller: _messageController,
+                  focusNode: _messageFocusNode,
+                  autofocus: true,
+                  minLines: 1,
+                  maxLines: 5,
+                  textInputAction: TextInputAction.send,
+                  onChanged: (value) {
+                    chatProvider.updateTypingStatus(value);
+                    setState(() {});
+                  },
+                  onSubmitted: (_) => _sendMessage(chatProvider),
+                  decoration: InputDecoration(
+                    hintText: chatProvider.isConnected
+                        ? 'Сообщение в ${chatProvider.selectedChatTitle}'
+                        : 'Сначала подключитесь к серверу',
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              IconButton.filled(
+                onPressed: canSend ? () => _sendMessage(chatProvider) : null,
+                tooltip: 'Отправить',
+                icon: const Icon(Icons.send_rounded),
+              ),
+            ],
           ),
         ],
       ),

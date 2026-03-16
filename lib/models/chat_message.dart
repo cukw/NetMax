@@ -51,6 +51,38 @@ class MessageAttachment {
   }
 }
 
+class MessageReplyInfo {
+  const MessageReplyInfo({
+    required this.messageId,
+    required this.senderName,
+    required this.text,
+    required this.type,
+  });
+
+  factory MessageReplyInfo.fromJson(Map<String, dynamic> json) {
+    return MessageReplyInfo(
+      messageId: (json['messageId']?.toString() ?? '').trim(),
+      senderName: (json['senderName']?.toString() ?? 'Unknown').trim(),
+      text: (json['text']?.toString() ?? '').trim(),
+      type: MessageTypeX.fromValue(json['type']?.toString() ?? 'text'),
+    );
+  }
+
+  final String messageId;
+  final String senderName;
+  final String text;
+  final MessageType type;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'messageId': messageId,
+      'senderName': senderName,
+      'text': text,
+      'type': type.value,
+    };
+  }
+}
+
 class ChatMessage {
   const ChatMessage({
     required this.id,
@@ -62,10 +94,12 @@ class ChatMessage {
     required this.isScheduled,
     this.text,
     this.attachment,
+    this.replyTo,
   });
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) {
     final attachmentJson = json['attachment'];
+    final replyJson = json['replyTo'];
 
     return ChatMessage(
       id: json['id']?.toString() ?? '',
@@ -83,6 +117,11 @@ class ChatMessage {
           : attachmentJson is Map
           ? MessageAttachment.fromJson(attachmentJson.cast<String, dynamic>())
           : null,
+      replyTo: replyJson is Map<String, dynamic>
+          ? MessageReplyInfo.fromJson(replyJson)
+          : replyJson is Map
+          ? MessageReplyInfo.fromJson(replyJson.cast<String, dynamic>())
+          : null,
     );
   }
 
@@ -93,6 +132,7 @@ class ChatMessage {
     required String senderName,
     required DateTime createdAt,
     required String text,
+    MessageReplyInfo? replyTo,
   }) {
     return ChatMessage(
       id: id,
@@ -103,6 +143,7 @@ class ChatMessage {
       type: MessageType.text,
       isScheduled: false,
       text: text,
+      replyTo: replyTo,
     );
   }
 
@@ -114,6 +155,7 @@ class ChatMessage {
     required DateTime createdAt,
     required MessageAttachment attachment,
     String? text,
+    MessageReplyInfo? replyTo,
   }) {
     return ChatMessage(
       id: id,
@@ -125,6 +167,7 @@ class ChatMessage {
       isScheduled: false,
       text: text,
       attachment: attachment,
+      replyTo: replyTo,
     );
   }
 
@@ -155,6 +198,7 @@ class ChatMessage {
   final bool isScheduled;
   final String? text;
   final MessageAttachment? attachment;
+  final MessageReplyInfo? replyTo;
 
   Map<String, dynamic> toJson() {
     return {
@@ -167,6 +211,7 @@ class ChatMessage {
       'scheduled': isScheduled,
       'text': text,
       'attachment': attachment?.toJson(),
+      'replyTo': replyTo?.toJson(),
     };
   }
 }
