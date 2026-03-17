@@ -16,6 +16,10 @@ import '../models/app_notification.dart';
 import '../models/chat_message.dart';
 import '../models/chat_thread.dart';
 import '../models/chat_user.dart';
+import '../services/mesh_transport_service.dart';
+import '../services/mesh_transport_service_base.dart';
+import '../services/proxy_transport_service.dart';
+import '../services/proxy_transport_service_base.dart';
 import '../services/system_notification_service.dart';
 
 enum ChatConnectionStatus { disconnected, connecting, connected }
@@ -44,13 +48,31 @@ class ChatProvider extends ChangeNotifier {
   static const String _userNameKey = 'user_name';
   static const String _userIdKey = 'user_id';
   static const String _passwordsByUserKey = 'passwords_by_user';
+  static const String _subscriptionSourcesKey = 'ws_subscription_sources';
+  static const String _proxySubscriptionSourcesKey =
+      'proxy_subscription_sources';
   static const String _dismissedUpdateSignatureKey =
       'dismissed_update_signature';
 
   static const String _defaultServerUrl = 'ws://localhost:8080/ws';
+  static const String _defaultSubscriptionSourcesRaw = String.fromEnvironment(
+    'NETMAX_WS_SUBSCRIPTION_SOURCES',
+    defaultValue: '',
+  );
+  static const String _defaultProxySubscriptionSourcesRaw =
+      String.fromEnvironment(
+        'NETMAX_PROXY_SUBSCRIPTION_SOURCES',
+        defaultValue: '',
+      );
   static const Duration _updateCheckInterval = Duration(minutes: 15);
   static const Duration _reconnectBaseDelay = Duration(seconds: 3);
   static const Duration _reconnectMaxDelay = Duration(seconds: 30);
+  static const Duration _meshFallbackActivationDelay = Duration(minutes: 1);
+  static const Duration _subscriptionRefreshInterval = Duration(hours: 1);
+  static const Duration _subscriptionProbeTimeout = Duration(seconds: 5);
+  static const Duration _subscriptionConnectTimeout = Duration(seconds: 12);
+  static const Duration _meshRetryInterval = Duration(seconds: 4);
+  static const int _meshMaxRetryAttempts = 5;
   static const String _defaultGroupChatId = 'group-general';
   static const String _defaultGroupChatTitle = 'Общий чат';
   static const Set<String> _scheduledRestrictedUsersLower = <String>{
@@ -73,10 +95,14 @@ class ChatProvider extends ChangeNotifier {
   final Random _random = Random();
 
   WebSocketChannel? _channel;
+  Future<void> Function()? _channelResourceDisposer;
   StreamSubscription<dynamic>? _channelSubscription;
   Timer? _typingStopTimer;
   Timer? _updateCheckTimer;
+  Timer? _subscriptionRefreshTimer;
   Timer? _reconnectTimer;
+  Timer? _meshFallbackTimer;
+  Timer? _meshRetryTimer;
 
   ThemeMode _themeMode = ThemeMode.light;
   ChatConnectionStatus _connectionStatus = ChatConnectionStatus.disconnected;
@@ -94,6 +120,8 @@ class ChatProvider extends ChangeNotifier {
   bool _isCheckingUpdates = false;
   bool _isUpdateAvailable = false;
   bool _isSavingScheduledConfig = false;
+  bool _isSubscriptionFailoverRunning = false;
+  bool _suppressReconnectScheduling = false;
 
   String _appVersion = '0.0.0';
   int _appBuild = 0;
@@ -113,6 +141,20 @@ class ChatProvider extends ChangeNotifier {
   DateTime? _scheduledUpdatedAt;
   String? _scheduledConfigError;
   bool _isScheduledAllowedByServer = true;
+  bool _isMeshFallbackActive = false;
+  DateTime? _serverUnavailableSince;
+  DateTime? _lastSubscriptionRefreshAt;
+  final List<String> _subscriptionSources = <String>[];
+  final List<String> _subscriptionCandidates = <String>[];
+  final List<String> _proxySubscriptionSources = <String>[];
+  final List<ProxyEndpoint> _proxyCandidates = <ProxyEndpoint>[];
+  ProxyEndpoint? _activeProxyEndpoint;
+  final Map<String, _MeshPendingMessage> _meshPendingByMessageId =
+      <String, _MeshPendingMessage>{};
+
+  final MeshTransportServiceBase _meshTransport = MeshTransportService.instance;
+  final ProxyTransportServiceBase _proxyTransport =
+      ProxyTransportService.instance;
 
   int _reconnectAttempt = 0;
   bool _manualDisconnectRequested = false;
@@ -120,6 +162,12 @@ class ChatProvider extends ChangeNotifier {
   ThemeMode get themeMode => _themeMode;
   ChatConnectionStatus get connectionStatus => _connectionStatus;
   bool get isConnected => _connectionStatus == ChatConnectionStatus.connected;
+  bool get isMeshFallbackActive => _isMeshFallbackActive;
+  bool get isSubscriptionFailoverRunning => _isSubscriptionFailoverRunning;
+  DateTime? get lastSubscriptionRefreshAt => _lastSubscriptionRefreshAt;
+  String get subscriptionSourcesText => _subscriptionSources.join('\n');
+  String get proxySubscriptionSourcesText =>
+      _proxySubscriptionSources.join('\n');
 
   String get serverUrl => _serverUrl;
   String get userName => _userName;
@@ -238,6 +286,19 @@ class ChatProvider extends ChangeNotifier {
       return 'Авторизация на сервере...';
     }
 
+    if (_isMeshFallbackActive &&
+        _connectionStatus != ChatConnectionStatus.connected) {
+      final mode = _meshTransport.isSupported
+          ? 'Mesh режим LAN: узел недоступен'
+          : 'Mesh режим: не поддерживается на этой платформе';
+      return '$mode • Сообщения: общий чат';
+    }
+
+    if (_isSubscriptionFailoverRunning &&
+        _connectionStatus != ChatConnectionStatus.connected) {
+      return 'Подбор подписки: поиск самого быстрого сервера...';
+    }
+
     if (_connectionStatus == ChatConnectionStatus.disconnected) {
       return 'Не подключено';
     }
@@ -246,7 +307,11 @@ class ChatProvider extends ChangeNotifier {
       return '${typingUsers.join(', ')} печатает...';
     }
 
-    return 'Авторизован: $_userName • В сети: $onlineUsersCount';
+    final proxy = _activeProxyEndpoint;
+    final proxyLabel = proxy == null
+        ? ''
+        : ' • Proxy: ${proxy.scheme.toUpperCase()} ${proxy.host}:${proxy.port}';
+    return 'Авторизован: $_userName • В сети: $onlineUsersCount$proxyLabel';
   }
 
   void selectChat(String chatId) {
@@ -641,7 +706,9 @@ class ChatProvider extends ChangeNotifier {
     _safeNotify();
 
     _startUpdateChecks();
+    _startSubscriptionRefresh();
     await checkForUpdates();
+    await _refreshAllCandidates(force: true);
 
     if (_userName.isNotEmpty) {
       await connect();
@@ -664,6 +731,15 @@ class ChatProvider extends ChangeNotifier {
     _updateCheckTimer?.cancel();
     _updateCheckTimer = Timer.periodic(_updateCheckInterval, (_) {
       unawaited(checkForUpdates());
+    });
+  }
+
+  void _startSubscriptionRefresh() {
+    _subscriptionRefreshTimer?.cancel();
+    _subscriptionRefreshTimer = Timer.periodic(_subscriptionRefreshInterval, (
+      _,
+    ) {
+      unawaited(_refreshAllCandidates());
     });
   }
 
@@ -691,6 +767,21 @@ class ChatProvider extends ChangeNotifier {
     } catch (_) {
       _serverUrl = _defaultServerUrl;
     }
+
+    final storedSourcesRaw =
+        prefs.getString(_subscriptionSourcesKey) ??
+        _defaultSubscriptionSourcesRaw;
+    _subscriptionSources
+      ..clear()
+      ..addAll(_parseSourceUrls(storedSourcesRaw));
+
+    final storedProxySourcesRaw =
+        prefs.getString(_proxySubscriptionSourcesKey) ??
+        _defaultProxySubscriptionSourcesRaw;
+    _proxySubscriptionSources
+      ..clear()
+      ..addAll(_parseSourceUrls(storedProxySourcesRaw));
+
     _userName = (prefs.getString(_userNameKey) ?? '').trim();
 
     final storedUserId = (prefs.getString(_userIdKey) ?? '').trim();
@@ -716,6 +807,8 @@ class ChatProvider extends ChangeNotifier {
     required String serverUrl,
     required String userName,
     required String password,
+    String? subscriptionSources,
+    String? proxySubscriptionSources,
   }) async {
     final normalizedServerUrl = _normalizeServerUrl(serverUrl);
     final normalizedUserName = userName.trim();
@@ -749,6 +842,25 @@ class ChatProvider extends ChangeNotifier {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_serverUrlKey, _serverUrl);
     await prefs.setString(_userNameKey, _userName);
+    if (subscriptionSources != null) {
+      _subscriptionSources
+        ..clear()
+        ..addAll(_parseSourceUrls(subscriptionSources));
+      await prefs.setString(
+        _subscriptionSourcesKey,
+        _subscriptionSources.join('\n'),
+      );
+    }
+    if (proxySubscriptionSources != null) {
+      _proxySubscriptionSources
+        ..clear()
+        ..addAll(_parseSourceUrls(proxySubscriptionSources));
+      await prefs.setString(
+        _proxySubscriptionSourcesKey,
+        _proxySubscriptionSources.join('\n'),
+      );
+    }
+    await _refreshAllCandidates(force: true);
     if (_canPersistPasswordLocally && cacheKey.isNotEmpty) {
       await prefs.setString(
         _passwordsByUserKey,
@@ -759,7 +871,7 @@ class ChatProvider extends ChangeNotifier {
     await checkForUpdates();
   }
 
-  Future<void> connect({bool force = false}) async {
+  Future<void> connect({bool force = false, ProxyEndpoint? proxy}) async {
     if (_disposed) {
       return;
     }
@@ -776,6 +888,8 @@ class ChatProvider extends ChangeNotifier {
     _cancelReconnect(resetAttempt: false);
 
     if (_userName.trim().isEmpty) {
+      _clearServerUnavailableMarker();
+      _deactivateMeshFallback();
       _pushNotification(
         kind: NotificationKind.system,
         title: 'Авторизация',
@@ -788,6 +902,8 @@ class ChatProvider extends ChangeNotifier {
 
     final passwordForAuth = _resolvedPasswordForCurrentUser;
     if (passwordForAuth.isEmpty) {
+      _clearServerUnavailableMarker();
+      _deactivateMeshFallback();
       _pushNotification(
         kind: NotificationKind.system,
         title: 'Требуется пароль',
@@ -801,6 +917,7 @@ class ChatProvider extends ChangeNotifier {
     }
 
     await _closeSocket(sendTypingOff: false, notify: false);
+    _activeProxyEndpoint = proxy;
 
     _setConnectionStatus(ChatConnectionStatus.connecting);
     _lastError = null;
@@ -808,7 +925,12 @@ class ChatProvider extends ChangeNotifier {
 
     try {
       final uri = Uri.parse(_serverUrl);
-      _channel = WebSocketChannel.connect(uri);
+      final session = await _proxyTransport.openWebSocket(
+        uri: uri,
+        proxy: proxy,
+      );
+      _channelResourceDisposer = session.dispose;
+      _channel = session.channel;
 
       _channelSubscription = _channel!.stream.listen(
         _onSocketData,
@@ -826,8 +948,10 @@ class ChatProvider extends ChangeNotifier {
         },
       );
     } catch (error) {
+      _activeProxyEndpoint = null;
       _setConnectionStatus(ChatConnectionStatus.disconnected);
       _lastError = error.toString();
+      _markServerUnavailable();
       _pushNotification(
         kind: NotificationKind.system,
         title: 'Ошибка подключения',
@@ -841,6 +965,10 @@ class ChatProvider extends ChangeNotifier {
 
   Future<void> disconnect() async {
     _manualDisconnectRequested = true;
+    _isSubscriptionFailoverRunning = false;
+    _suppressReconnectScheduling = false;
+    _clearServerUnavailableMarker();
+    _deactivateMeshFallback();
     _cancelReconnect();
     await _closeSocket(sendTypingOff: true, notify: true);
   }
@@ -860,16 +988,53 @@ class ChatProvider extends ChangeNotifier {
     _onlineUsers.clear();
     _isSavingScheduledConfig = false;
 
+    await _disposeChannelResources();
+
+    _setConnectionStatus(ChatConnectionStatus.disconnected);
+    if (!_isSubscriptionFailoverRunning) {
+      _activeProxyEndpoint = null;
+    }
+
+    if (notify) {
+      _safeNotify();
+    }
+  }
+
+  Future<void> _disposeChannelResources() async {
     await _channelSubscription?.cancel();
     _channelSubscription = null;
 
     await _channel?.sink.close();
     _channel = null;
 
-    _setConnectionStatus(ChatConnectionStatus.disconnected);
+    final resourceDisposer = _channelResourceDisposer;
+    _channelResourceDisposer = null;
+    if (resourceDisposer != null) {
+      await resourceDisposer();
+    }
+  }
 
-    if (notify) {
-      _safeNotify();
+  void _disposeChannelResourcesWithoutAwait() {
+    final subscription = _channelSubscription;
+    _channelSubscription = null;
+    if (subscription != null) {
+      unawaited(subscription.cancel());
+    }
+
+    final channel = _channel;
+    _channel = null;
+    if (channel != null) {
+      unawaited(channel.sink.close());
+    }
+
+    final resourceDisposer = _channelResourceDisposer;
+    _channelResourceDisposer = null;
+    if (resourceDisposer != null) {
+      unawaited(resourceDisposer());
+    }
+
+    if (!_isSubscriptionFailoverRunning) {
+      _activeProxyEndpoint = null;
     }
   }
 
@@ -936,6 +1101,8 @@ class ChatProvider extends ChangeNotifier {
     _isScheduledAllowedByServer = _isScheduledAllowedForUser(_userName);
     _syncDirectChats();
     _ensureSelectedChatExists();
+    _clearServerUnavailableMarker();
+    _deactivateMeshFallback();
 
     _setConnectionStatus(ChatConnectionStatus.connected);
     _manualDisconnectRequested = false;
@@ -1007,9 +1174,11 @@ class ChatProvider extends ChangeNotifier {
   }
 
   void _onSocketError(Object error) {
+    _disposeChannelResourcesWithoutAwait();
     _lastError = error.toString();
     _setConnectionStatus(ChatConnectionStatus.disconnected);
     _isSavingScheduledConfig = false;
+    _markServerUnavailable();
     _pushNotification(
       kind: NotificationKind.system,
       title: 'Соединение потеряно',
@@ -1021,12 +1190,14 @@ class ChatProvider extends ChangeNotifier {
   }
 
   void _onSocketDone() {
+    _disposeChannelResourcesWithoutAwait();
     _typingUsers.clear();
     _onlineUsers.clear();
     _isSavingScheduledConfig = false;
 
     if (_connectionStatus != ChatConnectionStatus.disconnected) {
       _setConnectionStatus(ChatConnectionStatus.disconnected);
+      _markServerUnavailable();
       _pushNotification(
         kind: NotificationKind.system,
         title: 'Отключено',
@@ -1168,13 +1339,14 @@ class ChatProvider extends ChangeNotifier {
 
   void _handleMessage(Map<String, dynamic> payload) {
     final message = ChatMessage.fromJson(payload);
-    if (message.id.isEmpty || _messageIds.contains(message.id)) {
+    if (message.id.isEmpty) {
       return;
     }
 
-    _registerMessageChat(message);
-    _messageIds.add(message.id);
-    _messages.add(message);
+    final added = _appendLocalMessage(message);
+    if (!added) {
+      return;
+    }
 
     final isMine = isMyMessage(message);
     if (!isMine && message.chatId != _selectedChatId) {
@@ -1200,6 +1372,17 @@ class ChatProvider extends ChangeNotifier {
     _safeNotify();
   }
 
+  bool _appendLocalMessage(ChatMessage message) {
+    if (message.id.isEmpty || _messageIds.contains(message.id)) {
+      return false;
+    }
+    _registerMessageChat(message);
+    _messageIds.add(message.id);
+    _messages.add(message);
+    _messages.sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    return true;
+  }
+
   void _handleServerError(Map<String, dynamic> payload) {
     final message = payload['message']?.toString() ?? 'Неизвестная ошибка.';
     _lastError = message;
@@ -1221,6 +1404,8 @@ class ChatProvider extends ChangeNotifier {
       _setConnectionStatus(ChatConnectionStatus.disconnected);
       if (isHardAuthError) {
         _manualDisconnectRequested = true;
+        _clearServerUnavailableMarker();
+        _deactivateMeshFallback();
         _cancelReconnect();
         _pendingPasswordForAuth = null;
         final cacheKey = _passwordCacheKey(_userName);
@@ -1230,6 +1415,7 @@ class ChatProvider extends ChangeNotifier {
           unawaited(_savePasswordCache());
         }
       } else {
+        _markServerUnavailable();
         _scheduleReconnectIfNeeded();
       }
 
@@ -1240,9 +1426,7 @@ class ChatProvider extends ChangeNotifier {
         showInSystem: true,
       );
 
-      _channel?.sink.close();
-      _channel = null;
-      _safeNotify();
+      unawaited(_closeSocket(sendTypingOff: false, notify: true));
       return;
     }
 
@@ -1306,7 +1490,48 @@ class ChatProvider extends ChangeNotifier {
       return;
     }
 
-    if (!isConnected) {
+    if (!isConnected && !_isMeshFallbackActive) {
+      return;
+    }
+
+    if (!isConnected && _isMeshFallbackActive) {
+      if (_selectedChatId != _primaryGroupChatId) {
+        return;
+      }
+
+      final messageId = _nextId();
+      final createdAt = DateTime.now();
+      final replyPayload = replyTo == null
+          ? null
+          : _replyPayloadFromMessage(replyTo);
+      final createdAtIso = createdAt.toUtc().toIso8601String();
+      final added = _appendLocalMessage(
+        ChatMessage.text(
+          id: messageId,
+          chatId: _primaryGroupChatId,
+          senderId: _userId,
+          senderName: _userName,
+          createdAt: createdAt,
+          text: text,
+          replyTo: replyPayload == null
+              ? null
+              : MessageReplyInfo.fromJson(replyPayload),
+        ),
+      );
+      if (added) {
+        _safeNotify();
+      }
+
+      _meshPendingByMessageId[messageId] = _MeshPendingMessage(
+        messageId: messageId,
+        text: text,
+        createdAtIso: createdAtIso,
+        replyTo: replyPayload,
+      );
+      _startMeshRetryLoopIfNeeded();
+      unawaited(_sendMeshPendingMessage(messageId));
+
+      updateTypingStatus('');
       return;
     }
 
@@ -1388,6 +1613,10 @@ class ChatProvider extends ChangeNotifier {
     String caption = '',
     ChatMessage? replyTo,
   }) async {
+    if (_isMeshFallbackActive && !isConnected) {
+      return 'В Mesh режиме сейчас доступна только отправка текстовых сообщений.';
+    }
+
     if (!isConnected) {
       return 'Нет подключения к серверу. Невозможно отправить файл.';
     }
@@ -1567,8 +1796,700 @@ class ChatProvider extends ChangeNotifier {
     );
   }
 
+  List<String> _parseSourceUrls(String raw) {
+    final chunks = raw
+        .split(RegExp(r'[\n\r,;]+'))
+        .map((item) => item.trim())
+        .where((item) => item.isNotEmpty && !item.startsWith('#'));
+
+    final unique = <String>{};
+    for (final chunk in chunks) {
+      final parsed = Uri.tryParse(chunk);
+      if (parsed == null) {
+        continue;
+      }
+      if (!parsed.hasScheme) {
+        continue;
+      }
+      final scheme = parsed.scheme.toLowerCase();
+      if (scheme != 'http' && scheme != 'https') {
+        continue;
+      }
+      unique.add(parsed.toString());
+    }
+    return unique.toList(growable: false);
+  }
+
+  Future<void> _refreshAllCandidates({bool force = false}) async {
+    await _refreshSubscriptionCandidates(force: force);
+    await _refreshProxyCandidates(force: force);
+  }
+
+  Future<void> _refreshSubscriptionCandidates({bool force = false}) async {
+    if (_subscriptionSources.isEmpty) {
+      _subscriptionCandidates.clear();
+      return;
+    }
+
+    final now = DateTime.now();
+    if (!force &&
+        _lastSubscriptionRefreshAt != null &&
+        now.difference(_lastSubscriptionRefreshAt!) <
+            _subscriptionRefreshInterval) {
+      return;
+    }
+
+    final collected = <String>{};
+    for (final source in _subscriptionSources) {
+      final endpoints = await _fetchSubscriptionEndpoints(source);
+      collected.addAll(endpoints);
+    }
+
+    _subscriptionCandidates
+      ..clear()
+      ..addAll(collected);
+    _lastSubscriptionRefreshAt = now;
+  }
+
+  Future<void> _refreshProxyCandidates({bool force = false}) async {
+    if (_proxySubscriptionSources.isEmpty) {
+      _proxyCandidates.clear();
+      return;
+    }
+
+    final now = DateTime.now();
+    if (!force &&
+        _lastSubscriptionRefreshAt != null &&
+        now.difference(_lastSubscriptionRefreshAt!) <
+            _subscriptionRefreshInterval) {
+      return;
+    }
+
+    final unique = <String, ProxyEndpoint>{};
+    for (final source in _proxySubscriptionSources) {
+      final proxies = await _fetchProxyEndpoints(source);
+      for (final proxy in proxies) {
+        unique[proxy.id] = proxy;
+      }
+    }
+
+    _proxyCandidates
+      ..clear()
+      ..addAll(unique.values);
+  }
+
+  Future<List<String>> _fetchSubscriptionEndpoints(String sourceUrl) async {
+    final text = await _downloadSubscriptionText(sourceUrl);
+    if (text == null) {
+      return const <String>[];
+    }
+    return _extractServerUrls(text);
+  }
+
+  Future<List<ProxyEndpoint>> _fetchProxyEndpoints(String sourceUrl) async {
+    final text = await _downloadSubscriptionText(sourceUrl);
+    if (text == null) {
+      return const <ProxyEndpoint>[];
+    }
+    return _extractProxyEndpoints(text);
+  }
+
+  Future<String?> _downloadSubscriptionText(String sourceUrl) async {
+    try {
+      final source = Uri.parse(sourceUrl);
+      final response = await http
+          .get(source, headers: const {'accept': 'application/json,text/plain'})
+          .timeout(_subscriptionProbeTimeout);
+      if (response.statusCode != 200) {
+        return null;
+      }
+      return response.body;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  List<String> _extractServerUrls(String raw) {
+    final text = raw.trim();
+    if (text.isEmpty) {
+      return const <String>[];
+    }
+
+    final unique = <String>{};
+
+    void addCandidate(Object? value) {
+      final candidate = value?.toString().trim() ?? '';
+      if (candidate.isEmpty) {
+        return;
+      }
+      try {
+        final normalized = _normalizeServerUrl(candidate);
+        unique.add(normalized);
+      } catch (_) {}
+    }
+
+    try {
+      final decoded = jsonDecode(text);
+      if (decoded is List) {
+        for (final item in decoded) {
+          addCandidate(item);
+        }
+      } else if (decoded is Map) {
+        for (final key in const ['servers', 'endpoints', 'ws', 'urls']) {
+          final rawList = decoded[key];
+          if (rawList is List) {
+            for (final item in rawList) {
+              addCandidate(item);
+            }
+          }
+        }
+      }
+    } catch (_) {
+      final lines = text.split(RegExp(r'[\n\r]+'));
+      for (final line in lines) {
+        final trimmed = line.trim();
+        if (trimmed.isEmpty || trimmed.startsWith('#')) {
+          continue;
+        }
+        addCandidate(trimmed);
+      }
+    }
+
+    return unique.toList(growable: false);
+  }
+
+  List<ProxyEndpoint> _extractProxyEndpoints(String raw) {
+    final text = raw.trim();
+    if (text.isEmpty) {
+      return const <ProxyEndpoint>[];
+    }
+
+    final unique = <String, ProxyEndpoint>{};
+
+    void addProxy(Object? value) {
+      final proxy = _parseProxyEndpoint(value);
+      if (proxy == null) {
+        return;
+      }
+      unique[proxy.id] = proxy;
+    }
+
+    try {
+      final decoded = jsonDecode(text);
+      if (decoded is List) {
+        for (final item in decoded) {
+          addProxy(item);
+        }
+      } else if (decoded is Map) {
+        for (final key in const ['proxies', 'proxy', 'endpoints', 'urls']) {
+          final rawList = decoded[key];
+          if (rawList is List) {
+            for (final item in rawList) {
+              addProxy(item);
+            }
+          }
+        }
+      }
+    } catch (_) {
+      final lines = text.split(RegExp(r'[\n\r]+'));
+      for (final line in lines) {
+        final trimmed = line.trim();
+        if (trimmed.isEmpty || trimmed.startsWith('#')) {
+          continue;
+        }
+        addProxy(trimmed);
+      }
+    }
+
+    return unique.values.toList(growable: false);
+  }
+
+  ProxyEndpoint? _parseProxyEndpoint(Object? raw) {
+    final text = raw?.toString().trim() ?? '';
+    if (text.isEmpty) {
+      return null;
+    }
+
+    final uri = Uri.tryParse(text);
+    if (uri == null || !uri.hasScheme || uri.host.trim().isEmpty) {
+      return null;
+    }
+
+    final scheme = uri.scheme.toLowerCase();
+    if (scheme != 'http' &&
+        scheme != 'https' &&
+        scheme != 'socks5' &&
+        scheme != 'socks') {
+      return null;
+    }
+
+    final port = uri.hasPort
+        ? uri.port
+        : (scheme == 'http' || scheme == 'https' ? 8080 : 1080);
+    if (port <= 0) {
+      return null;
+    }
+
+    final userInfo = uri.userInfo.trim();
+    String? username;
+    String? password;
+    if (userInfo.isNotEmpty) {
+      final parts = userInfo.split(':');
+      final parsedUser = Uri.decodeComponent(parts.first).trim();
+      if (parsedUser.isNotEmpty) {
+        username = parsedUser;
+      }
+      if (parts.length > 1) {
+        final parsedPass = Uri.decodeComponent(
+          parts.sublist(1).join(':'),
+        ).trim();
+        if (parsedPass.isNotEmpty) {
+          password = parsedPass;
+        }
+      }
+    }
+
+    return ProxyEndpoint(
+      scheme: scheme,
+      host: uri.host.trim(),
+      port: port,
+      username: username,
+      password: password,
+    );
+  }
+
+  List<String> _resolveFailoverServerCandidates() {
+    final unique = <String>{_serverUrl};
+    unique.addAll(_subscriptionCandidates);
+    return unique.toList(growable: false);
+  }
+
+  List<ProxyEndpoint> _resolveFailoverProxyCandidates() {
+    final unique = <String, ProxyEndpoint>{};
+    for (final proxy in _proxyCandidates) {
+      unique[proxy.id] = proxy;
+    }
+    return unique.values.toList(growable: false);
+  }
+
+  Future<List<String>> _rankCandidatesByLatency(List<String> candidates) async {
+    if (candidates.isEmpty) {
+      return const <String>[];
+    }
+
+    final probes = await Future.wait(
+      candidates.map(_probeCandidate),
+      eagerError: false,
+    );
+
+    probes.sort((a, b) {
+      final aLatency = a.latency ?? const Duration(days: 1);
+      final bLatency = b.latency ?? const Duration(days: 1);
+      final cmp = aLatency.compareTo(bLatency);
+      if (cmp != 0) {
+        return cmp;
+      }
+      return a.serverUrl.compareTo(b.serverUrl);
+    });
+
+    return probes.map((item) => item.serverUrl).toList(growable: false);
+  }
+
+  Future<List<ProxyEndpoint>> _rankProxyCandidatesByLatency({
+    required String serverUrl,
+    required List<ProxyEndpoint> proxies,
+  }) async {
+    if (proxies.isEmpty || !_proxyTransport.supportsCustomProxy) {
+      return const <ProxyEndpoint>[];
+    }
+
+    final probes = await Future.wait(
+      proxies.map((proxy) => _probeCandidate(serverUrl, proxy: proxy)),
+      eagerError: false,
+    );
+
+    probes.sort((a, b) {
+      final aLatency = a.latency ?? const Duration(days: 1);
+      final bLatency = b.latency ?? const Duration(days: 1);
+      final cmp = aLatency.compareTo(bLatency);
+      if (cmp != 0) {
+        return cmp;
+      }
+      final aId = a.proxy?.id ?? '';
+      final bId = b.proxy?.id ?? '';
+      return aId.compareTo(bId);
+    });
+
+    final ranked = <ProxyEndpoint>[];
+    for (final probe in probes) {
+      if (probe.latency == null || probe.proxy == null) {
+        continue;
+      }
+      ranked.add(probe.proxy!);
+    }
+    return ranked;
+  }
+
+  Future<_ServerProbeResult> _probeCandidate(
+    String serverUrl, {
+    ProxyEndpoint? proxy,
+  }) async {
+    try {
+      final healthUri = _healthUriFromServerUrl(serverUrl);
+      final latency = await _proxyTransport.probeHealth(
+        healthUri: healthUri,
+        timeout: _subscriptionProbeTimeout,
+        proxy: proxy,
+      );
+      return _ServerProbeResult(
+        serverUrl: serverUrl,
+        latency: latency,
+        proxy: proxy,
+      );
+    } catch (_) {
+      return _ServerProbeResult(
+        serverUrl: serverUrl,
+        latency: null,
+        proxy: proxy,
+      );
+    }
+  }
+
+  Uri _healthUriFromServerUrl(String serverUrl) {
+    final wsUri = Uri.parse(serverUrl);
+    return Uri(
+      scheme: wsUri.scheme == 'wss' ? 'https' : 'http',
+      host: wsUri.host,
+      port: wsUri.hasPort ? wsUri.port : null,
+      path: '/health',
+    );
+  }
+
+  Future<bool> _attemptConnectPlan(_FailoverPlan plan) async {
+    if (_disposed || _manualDisconnectRequested) {
+      return false;
+    }
+
+    try {
+      _serverUrl = _normalizeServerUrl(plan.serverUrl);
+    } catch (_) {
+      return false;
+    }
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_serverUrlKey, _serverUrl);
+
+    if (_connectionStatus == ChatConnectionStatus.connecting) {
+      await _closeSocket(sendTypingOff: false, notify: false);
+    }
+
+    await connect(force: true, proxy: plan.proxy);
+    return _waitForConnected(timeout: _subscriptionConnectTimeout);
+  }
+
+  Future<bool> _waitForConnected({required Duration timeout}) async {
+    final endAt = DateTime.now().add(timeout);
+    while (DateTime.now().isBefore(endAt)) {
+      if (isConnected) {
+        return true;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+    }
+    return isConnected;
+  }
+
+  void _markServerUnavailable() {
+    if (_manualDisconnectRequested || _userName.trim().isEmpty) {
+      return;
+    }
+    _serverUnavailableSince ??= DateTime.now();
+    _scheduleMeshFallbackActivation();
+  }
+
+  void _clearServerUnavailableMarker() {
+    _serverUnavailableSince = null;
+    _meshFallbackTimer?.cancel();
+    _meshFallbackTimer = null;
+  }
+
+  void _scheduleMeshFallbackActivation() {
+    if (_isMeshFallbackActive) {
+      return;
+    }
+
+    final since = _serverUnavailableSince;
+    if (since == null) {
+      return;
+    }
+
+    final elapsed = DateTime.now().difference(since);
+    final remaining = _meshFallbackActivationDelay - elapsed;
+    if (remaining <= Duration.zero) {
+      unawaited(_runSubscriptionFailover());
+      return;
+    }
+
+    _meshFallbackTimer?.cancel();
+    _meshFallbackTimer = Timer(remaining, () {
+      _meshFallbackTimer = null;
+      unawaited(_runSubscriptionFailover());
+    });
+  }
+
+  Future<void> _runSubscriptionFailover() async {
+    if (_disposed || _manualDisconnectRequested || isConnected) {
+      return;
+    }
+    if (_isSubscriptionFailoverRunning) {
+      return;
+    }
+
+    _isSubscriptionFailoverRunning = true;
+    _suppressReconnectScheduling = true;
+    _cancelReconnect(resetAttempt: false);
+    _safeNotify();
+
+    try {
+      await _refreshAllCandidates(force: true);
+      final rankedServers = await _rankCandidatesByLatency(
+        _resolveFailoverServerCandidates(),
+      );
+      final plans = <_FailoverPlan>[
+        for (final server in rankedServers) _FailoverPlan(serverUrl: server),
+      ];
+
+      if (_proxyTransport.supportsCustomProxy) {
+        final proxyBaseServer = rankedServers.isNotEmpty
+            ? rankedServers.first
+            : _serverUrl;
+        final rankedProxies = await _rankProxyCandidatesByLatency(
+          serverUrl: proxyBaseServer,
+          proxies: _resolveFailoverProxyCandidates(),
+        );
+        plans.addAll(
+          rankedProxies.map(
+            (proxy) => _FailoverPlan(serverUrl: proxyBaseServer, proxy: proxy),
+          ),
+        );
+      }
+
+      for (final plan in plans) {
+        if (_disposed || _manualDisconnectRequested || isConnected) {
+          return;
+        }
+        final connected = await _attemptConnectPlan(plan);
+        if (connected) {
+          return;
+        }
+      }
+    } finally {
+      _suppressReconnectScheduling = false;
+      _isSubscriptionFailoverRunning = false;
+      _safeNotify();
+    }
+
+    if (!isConnected) {
+      if (_meshTransport.isSupported) {
+        await _activateMeshFallback();
+      }
+      _scheduleReconnectIfNeeded();
+    }
+  }
+
+  Future<void> _activateMeshFallback() async {
+    if (_disposed || _isMeshFallbackActive) {
+      return;
+    }
+    if (_connectionStatus == ChatConnectionStatus.connected) {
+      return;
+    }
+    if (!_meshTransport.isSupported) {
+      return;
+    }
+
+    try {
+      await _meshTransport.start(
+        userId: _userId,
+        userName: _userName,
+        onMessage: _onMeshPacket,
+      );
+      _isMeshFallbackActive = true;
+      _safeNotify();
+    } catch (_) {
+      _isMeshFallbackActive = false;
+    }
+  }
+
+  void _deactivateMeshFallback() {
+    _meshFallbackTimer?.cancel();
+    _meshFallbackTimer = null;
+    _meshRetryTimer?.cancel();
+    _meshRetryTimer = null;
+    _meshPendingByMessageId.clear();
+    final wasActive = _isMeshFallbackActive || _meshTransport.isRunning;
+    _isMeshFallbackActive = false;
+    unawaited(_meshTransport.stop());
+    if (wasActive) {
+      _safeNotify();
+    }
+  }
+
+  void _onMeshPacket(Map<String, dynamic> payload) {
+    final type = (payload['type']?.toString() ?? '').trim();
+    if (type == 'mesh_ack') {
+      _onMeshAck(payload);
+      return;
+    }
+    if (type == 'mesh_message') {
+      _onMeshMessage(payload);
+    }
+  }
+
+  void _onMeshMessage(Map<String, dynamic> payload) {
+    final chatType = (payload['chatType']?.toString() ?? 'group').trim();
+    final messageType = (payload['messageType']?.toString() ?? 'text').trim();
+    if (chatType != 'group' || messageType != 'text') {
+      return;
+    }
+
+    final messageId = (payload['id']?.toString() ?? '').trim();
+    final senderId = (payload['senderId']?.toString() ?? '').trim();
+    if (messageId.isEmpty || senderId.isEmpty) {
+      return;
+    }
+
+    unawaited(
+      _meshTransport.sendAck(
+        messageId: messageId,
+        userId: _userId,
+        targetUserId: senderId,
+        createdAtIso: DateTime.now().toUtc().toIso8601String(),
+      ),
+    );
+
+    if (_messageIds.contains(messageId)) {
+      return;
+    }
+
+    final normalizedPayload = <String, dynamic>{
+      'id': messageId,
+      'senderId': senderId,
+      'senderName': (payload['senderName']?.toString() ?? 'Unknown').trim(),
+      'createdAt': (payload['createdAt']?.toString() ?? '').trim(),
+      'type': 'text',
+      'text': (payload['text']?.toString() ?? '').trim(),
+      'scheduled': false,
+      'chatId': _primaryGroupChatId,
+      'chatType': 'group',
+      if (payload['replyTo'] is Map) 'replyTo': _asMap(payload['replyTo']),
+    };
+    _handleMessage(normalizedPayload);
+  }
+
+  void _onMeshAck(Map<String, dynamic> payload) {
+    final targetUserId = (payload['targetUserId']?.toString() ?? '').trim();
+    final messageId = (payload['id']?.toString() ?? '').trim();
+    if (targetUserId != _userId || messageId.isEmpty) {
+      return;
+    }
+    _meshPendingByMessageId.remove(messageId);
+    if (_meshPendingByMessageId.isEmpty) {
+      _meshRetryTimer?.cancel();
+      _meshRetryTimer = null;
+    }
+  }
+
+  void _startMeshRetryLoopIfNeeded() {
+    if (_meshRetryTimer != null) {
+      return;
+    }
+    _meshRetryTimer = Timer.periodic(_meshRetryInterval, (_) {
+      _processMeshRetries();
+    });
+  }
+
+  Future<void> _sendMeshPendingMessage(String messageId) async {
+    if (!_isMeshFallbackActive || isConnected) {
+      _meshPendingByMessageId.clear();
+      _meshRetryTimer?.cancel();
+      _meshRetryTimer = null;
+      return;
+    }
+
+    final pending = _meshPendingByMessageId[messageId];
+    if (pending == null) {
+      return;
+    }
+
+    if (pending.attempts >= _meshMaxRetryAttempts) {
+      _meshPendingByMessageId.remove(messageId);
+      _pushNotification(
+        kind: NotificationKind.system,
+        title: 'Mesh доставка',
+        description:
+            'Не удалось подтвердить доставку сообщения в локальной сети.',
+        showInSystem: false,
+      );
+      if (_meshPendingByMessageId.isEmpty) {
+        _meshRetryTimer?.cancel();
+        _meshRetryTimer = null;
+      }
+      _safeNotify();
+      return;
+    }
+
+    final sent = await _meshTransport.sendText(
+      messageId: pending.messageId,
+      userId: _userId,
+      userName: _userName,
+      text: pending.text,
+      createdAtIso: pending.createdAtIso,
+      chatId: _primaryGroupChatId,
+      replyTo: pending.replyTo,
+    );
+    if (!sent) {
+      return;
+    }
+
+    pending.attempts = pending.attempts + 1;
+    pending.lastAttemptAt = DateTime.now();
+  }
+
+  void _processMeshRetries() {
+    if (isConnected) {
+      _meshPendingByMessageId.clear();
+    }
+    if (_meshPendingByMessageId.isEmpty ||
+        !_isMeshFallbackActive ||
+        isConnected) {
+      _meshRetryTimer?.cancel();
+      _meshRetryTimer = null;
+      return;
+    }
+
+    final now = DateTime.now();
+    final pendingIds = _meshPendingByMessageId.keys.toList(growable: false);
+    for (final messageId in pendingIds) {
+      final pending = _meshPendingByMessageId[messageId];
+      if (pending == null) {
+        continue;
+      }
+      final lastAttemptAt = pending.lastAttemptAt;
+      final shouldRetry =
+          lastAttemptAt == null ||
+          now.difference(lastAttemptAt) >= _meshRetryInterval;
+      if (!shouldRetry) {
+        continue;
+      }
+      unawaited(_sendMeshPendingMessage(messageId));
+    }
+  }
+
   void _scheduleReconnectIfNeeded() {
     if (_disposed || _manualDisconnectRequested || _userName.trim().isEmpty) {
+      return;
+    }
+    if (_suppressReconnectScheduling) {
       return;
     }
     if (_reconnectTimer?.isActive ?? false) {
@@ -1992,12 +2913,56 @@ class ChatProvider extends ChangeNotifier {
   void dispose() {
     _disposed = true;
     _manualDisconnectRequested = true;
+    _isSubscriptionFailoverRunning = false;
+    _suppressReconnectScheduling = false;
+    _meshFallbackTimer?.cancel();
+    _meshFallbackTimer = null;
+    _meshRetryTimer?.cancel();
+    _meshRetryTimer = null;
+    _subscriptionRefreshTimer?.cancel();
+    _subscriptionRefreshTimer = null;
+    _meshPendingByMessageId.clear();
     _cancelReconnect();
     _typingStopTimer?.cancel();
     _updateCheckTimer?.cancel();
     _sendTyping(isTyping: false);
-    _channelSubscription?.cancel();
-    _channel?.sink.close();
+    _disposeChannelResourcesWithoutAwait();
+    unawaited(_meshTransport.stop());
     super.dispose();
   }
+}
+
+class _MeshPendingMessage {
+  _MeshPendingMessage({
+    required this.messageId,
+    required this.text,
+    required this.createdAtIso,
+    this.replyTo,
+  });
+
+  final String messageId;
+  final String text;
+  final String createdAtIso;
+  final Map<String, dynamic>? replyTo;
+  int attempts = 0;
+  DateTime? lastAttemptAt;
+}
+
+class _ServerProbeResult {
+  const _ServerProbeResult({
+    required this.serverUrl,
+    required this.latency,
+    this.proxy,
+  });
+
+  final String serverUrl;
+  final Duration? latency;
+  final ProxyEndpoint? proxy;
+}
+
+class _FailoverPlan {
+  const _FailoverPlan({required this.serverUrl, this.proxy});
+
+  final String serverUrl;
+  final ProxyEndpoint? proxy;
 }

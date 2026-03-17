@@ -1339,6 +1339,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final serverController = TextEditingController(
       text: chatProvider.serverUrl,
     );
+    final subscriptionController = TextEditingController(
+      text: chatProvider.subscriptionSourcesText,
+    );
+    final proxySubscriptionController = TextEditingController(
+      text: chatProvider.proxySubscriptionSourcesText,
+    );
     final userController = TextEditingController(text: chatProvider.userName);
     final passwordController = TextEditingController();
     var hasSavedPassword = chatProvider.hasSavedPasswordForUser(
@@ -1379,6 +1385,30 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     decoration: const InputDecoration(
                       labelText: 'Server URL',
                       hintText: 'ws://localhost:8080/ws',
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: subscriptionController,
+                    minLines: 2,
+                    maxLines: 4,
+                    keyboardType: TextInputType.multiline,
+                    decoration: const InputDecoration(
+                      labelText: 'Источники подписок (опционально)',
+                      hintText:
+                          'https://example.com/netmax-subscription.txt\nОдна ссылка на строку',
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: proxySubscriptionController,
+                    minLines: 2,
+                    maxLines: 4,
+                    keyboardType: TextInputType.multiline,
+                    decoration: const InputDecoration(
+                      labelText: 'Proxy-подписки (native)',
+                      hintText:
+                          'http://proxy-list.local/proxies.txt\nПоддержка: http/https/socks5',
                     ),
                   ),
                   const SizedBox(height: 10),
@@ -1447,6 +1477,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                                 serverUrl: serverController.text,
                                 userName: userController.text,
                                 password: passwordController.text,
+                                subscriptionSources:
+                                    subscriptionController.text,
+                                proxySubscriptionSources:
+                                    proxySubscriptionController.text,
                               );
                               if (!context.mounted) {
                                 return;
@@ -1483,6 +1517,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
     return future.whenComplete(() {
       serverController.dispose();
+      subscriptionController.dispose();
+      proxySubscriptionController.dispose();
       userController.dispose();
       passwordController.dispose();
     });
