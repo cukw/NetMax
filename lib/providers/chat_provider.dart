@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 cukw
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
@@ -77,13 +80,14 @@ class ChatProvider extends ChangeNotifier {
   static const Duration _subscriptionConnectTimeout = Duration(seconds: 12);
   static const Duration _meshRetryInterval = Duration(seconds: 4);
   static const int _meshMaxRetryAttempts = 5;
-  static const int _clientMaxMessages = 1500;
+  static const int _clientMaxMessages = 10000;
   static const String _defaultGroupChatId = 'group-general';
   static const String _defaultGroupChatTitle = 'Общий чат';
   static const Set<String> _scheduledRestrictedUsersLower = <String>{
     'юлия сергеевна',
     'татьяна владимировна',
   };
+  static final RegExp _unsafeControlChars = RegExp(r'[\u0000-\u001F\u007F]');
 
   final List<ChatMessage> _messages = <ChatMessage>[];
   final List<AppNotification> _notifications = <AppNotification>[];
@@ -299,11 +303,12 @@ class ChatProvider extends ChangeNotifier {
 
   List<String> get mentionCandidates {
     final meLower = _userName.trim().toLowerCase();
-    final result = _allowedUsersByLower.entries
-        .where((entry) => entry.key != meLower)
-        .map((entry) => entry.value)
-        .toList(growable: false)
-      ..sort((a, b) => a.compareTo(b));
+    final result =
+        _allowedUsersByLower.entries
+            .where((entry) => entry.key != meLower)
+            .map((entry) => entry.value)
+            .toList(growable: false)
+          ..sort((a, b) => a.compareTo(b));
     return result;
   }
 
@@ -831,14 +836,10 @@ class ChatProvider extends ChangeNotifier {
     _e2eeSecret = '';
     _favoriteMessageIds
       ..clear()
-      ..addAll(
-        _decodeStringSet(prefs.getStringList(_favoriteMessageIdsKey)),
-      );
+      ..addAll(_decodeStringSet(prefs.getStringList(_favoriteMessageIdsKey)));
     _pinnedByChatId
       ..clear()
-      ..addAll(
-        _decodeStringMap(prefs.getString(_pinnedByChatKey)),
-      );
+      ..addAll(_decodeStringMap(prefs.getString(_pinnedByChatKey)));
 
     final storedUserId = (prefs.getString(_userIdKey) ?? '').trim();
     _userId = storedUserId.isEmpty ? _nextId() : storedUserId;
@@ -1468,8 +1469,7 @@ class ChatProvider extends ChangeNotifier {
     }
     _registerMessageChat(message);
     _messageIds.add(message.id);
-    _messages.add(message);
-    _messages.sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    _insertMessageInOrder(message);
     _trimMessageCache();
     return true;
   }
@@ -1485,10 +1485,31 @@ class ChatProvider extends ChangeNotifier {
       return false;
     }
 
-    _messages[index] = message;
-    _messages.sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    _messages.removeAt(index);
+    _insertMessageInOrder(message);
     _trimMessageCache();
     return true;
+  }
+
+  void _insertMessageInOrder(ChatMessage message) {
+    if (_messages.isEmpty ||
+        !_messages.last.createdAt.isAfter(message.createdAt)) {
+      _messages.add(message);
+      return;
+    }
+
+    var low = 0;
+    var high = _messages.length;
+    while (low < high) {
+      final mid = low + ((high - low) >> 1);
+      final midTime = _messages[mid].createdAt;
+      if (midTime.isAfter(message.createdAt)) {
+        high = mid;
+      } else {
+        low = mid + 1;
+      }
+    }
+    _messages.insert(low, message);
   }
 
   void _trimMessageCache() {
@@ -1557,14 +1578,99 @@ class ChatProvider extends ChangeNotifier {
           normalizedHistory.add(<String, dynamic>{
             'text': decrypted ?? '[Не удалось расшифровать]',
             'editedAt': map['editedAt'],
-            if (map['encryption'] is Map) 'encryption': _asMap(map['encryption']),
+            if (map['encryption'] is Map)
+              'encryption': _asMap(map['encryption']),
           });
         }
         normalized['editHistory'] = normalizedHistory;
       }
     }
 
-    return ChatMessage.fromJson(normalized);
+    return ChatMessage.fromJson(_sanitizeServerMessagePayload(normalized));
+  }
+
+  Map<String, dynamic> _sanitizeServerMessagePayload(
+    Map<String, dynamic> payload,
+  ) {
+    final normalized = Map<String, dynamic>.from(payload);
+    normalized['senderName'] = _sanitizeTextForUi(
+      normalized['senderName']?.toString() ?? 'Unknown',
+      maxLength: 80,
+    );
+    normalized['text'] = _sanitizeTextForUi(
+      normalized['text']?.toString() ?? '',
+      maxLength: 4000,
+    );
+
+    final attachmentRaw = normalized['attachment'];
+    if (attachmentRaw is Map) {
+      final attachment = _asMap(attachmentRaw);
+      attachment['name'] = _sanitizeTextForUi(
+        attachment['name']?.toString() ?? 'file',
+        maxLength: 255,
+      );
+      normalized['attachment'] = attachment;
+    }
+
+    final replyRaw = normalized['replyTo'];
+    if (replyRaw is Map) {
+      final reply = _asMap(replyRaw);
+      reply['senderName'] = _sanitizeTextForUi(
+        reply['senderName']?.toString() ?? 'Unknown',
+        maxLength: 80,
+      );
+      reply['text'] = _sanitizeTextForUi(
+        reply['text']?.toString() ?? '',
+        maxLength: 600,
+      );
+      normalized['replyTo'] = reply;
+    }
+
+    final forwardedRaw = normalized['forwardedFrom'];
+    if (forwardedRaw is Map) {
+      final forwarded = _asMap(forwardedRaw);
+      forwarded['senderName'] = _sanitizeTextForUi(
+        forwarded['senderName']?.toString() ?? 'Unknown',
+        maxLength: 80,
+      );
+      forwarded['text'] = _sanitizeTextForUi(
+        forwarded['text']?.toString() ?? '',
+        maxLength: 600,
+      );
+      normalized['forwardedFrom'] = forwarded;
+    }
+
+    final editHistoryRaw = normalized['editHistory'];
+    if (editHistoryRaw is List) {
+      final safeHistory = <Map<String, dynamic>>[];
+      for (final item in editHistoryRaw) {
+        final historyItem = _asMap(item);
+        safeHistory.add(<String, dynamic>{
+          'text': _sanitizeTextForUi(
+            historyItem['text']?.toString() ?? '',
+            maxLength: 4000,
+          ),
+          'editedAt': historyItem['editedAt'],
+          if (historyItem['encryption'] is Map)
+            'encryption': _asMap(historyItem['encryption']),
+        });
+      }
+      normalized['editHistory'] = safeHistory;
+    }
+
+    return normalized;
+  }
+
+  String _sanitizeTextForUi(String raw, {required int maxLength}) {
+    final withoutControls = raw.replaceAll(_unsafeControlChars, ' ').trim();
+    if (withoutControls.isEmpty) {
+      return '';
+    }
+    final collapsed = withoutControls.replaceAll(RegExp(r'\s+'), ' ');
+    if (collapsed.length <= maxLength) {
+      return collapsed;
+    }
+    return '${collapsed.substring(0, maxLength - 1)}…';
   }
 
   bool _isMentionedInMessage(ChatMessage message) {
@@ -1809,6 +1915,139 @@ class ChatProvider extends ChangeNotifier {
     updateTypingStatus('');
   }
 
+  Future<String?> forwardMessage({
+    required ChatMessage message,
+    required String targetChatId,
+  }) async {
+    if (message.type == MessageType.system) {
+      return 'Системные сообщения нельзя пересылать.';
+    }
+    if (message.isDeleted) {
+      return 'Удаленное сообщение нельзя переслать.';
+    }
+    if (!isConnected) {
+      return 'Нет подключения к серверу.';
+    }
+
+    final normalizedChatId = targetChatId.trim();
+    if (!_chatExists(normalizedChatId)) {
+      return 'Чат для пересылки не найден.';
+    }
+
+    final forwardedFrom = _forwardPayloadFromMessage(message);
+    if (message.type == MessageType.file) {
+      final attachment = message.attachment;
+      if (attachment == null) {
+        return 'В сообщении нет вложения для пересылки.';
+      }
+      return _forwardFileMessageToChat(
+        targetChatId: normalizedChatId,
+        attachment: attachment,
+        caption: (message.text ?? '').trim(),
+        forwardedFrom: forwardedFrom,
+      );
+    }
+
+    final text = (message.text ?? '').trim();
+    final textToForward = text.isEmpty ? 'Пересланное сообщение' : text;
+    _forwardTextMessageToChat(
+      targetChatId: normalizedChatId,
+      text: textToForward,
+      forwardedFrom: forwardedFrom,
+    );
+    return null;
+  }
+
+  void _forwardTextMessageToChat({
+    required String targetChatId,
+    required String text,
+    required Map<String, dynamic> forwardedFrom,
+  }) {
+    final encryptedPayload = _encryptTextPayload(text);
+    final outgoingText = encryptedPayload?.cipherText ?? text;
+    final mentions = _extractMentionsFromText(text);
+
+    _sendEnvelope(
+      type: 'message',
+      payload: <String, dynamic>{
+        'id': _nextId(),
+        'text': outgoingText,
+        'chatId': targetChatId,
+        'mentions': mentions,
+        'forwardedFrom': forwardedFrom,
+        if (encryptedPayload != null) 'encrypted': true,
+        if (encryptedPayload != null)
+          'encryption': <String, dynamic>{
+            'method': encryptedPayload.method,
+            'nonce': encryptedPayload.nonceBase64,
+          },
+        'createdAt': DateTime.now().toUtc().toIso8601String(),
+      },
+    );
+  }
+
+  Future<String?> _forwardFileMessageToChat({
+    required String targetChatId,
+    required MessageAttachment attachment,
+    required String caption,
+    required Map<String, dynamic> forwardedFrom,
+  }) async {
+    late final http.Response response;
+    try {
+      response = await http.get(
+        _attachmentUri(attachment, forceDownload: false),
+      );
+    } catch (_) {
+      return 'Не удалось загрузить файл для пересылки.';
+    }
+
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      return 'Сервер вернул ошибку ${response.statusCode} при пересылке файла.';
+    }
+
+    final bytes = response.bodyBytes;
+    if (bytes.isEmpty) {
+      return 'Не удалось прочитать файл для пересылки.';
+    }
+
+    const maxFileSize = 20 * 1024 * 1024;
+    if (bytes.length > maxFileSize) {
+      return 'Файл слишком большой. Максимум 20 MB.';
+    }
+
+    final encryptedCaption = caption.isEmpty
+        ? null
+        : _encryptTextPayload(caption);
+    final outgoingCaption = encryptedCaption?.cipherText ?? caption;
+
+    _sendEnvelope(
+      type: 'file',
+      payload: <String, dynamic>{
+        'id': _nextId(),
+        'chatId': targetChatId,
+        'name': attachment.name,
+        'extension': attachment.extension.trim().isEmpty
+            ? 'FILE'
+            : attachment.extension,
+        'sizeBytes': bytes.length,
+        'contentBase64': base64Encode(bytes),
+        'text': outgoingCaption,
+        'mentions': caption.isEmpty
+            ? const <String>[]
+            : _extractMentionsFromText(caption),
+        'forwardedFrom': forwardedFrom,
+        if (encryptedCaption != null) 'encrypted': true,
+        if (encryptedCaption != null)
+          'encryption': <String, dynamic>{
+            'method': encryptedCaption.method,
+            'nonce': encryptedCaption.nonceBase64,
+          },
+        'createdAt': DateTime.now().toUtc().toIso8601String(),
+      },
+    );
+    return null;
+  }
+
   Future<String?> editMessage({
     required ChatMessage message,
     required String text,
@@ -1911,33 +2150,39 @@ class ChatProvider extends ChangeNotifier {
     _safeNotify();
   }
 
-  List<ChatMessage> searchMessages({
-    required String query,
-    String? chatId,
-  }) {
+  List<ChatMessage> searchMessages({required String query, String? chatId}) {
     final normalized = query.trim().toLowerCase();
     if (normalized.isEmpty) {
       return const <ChatMessage>[];
     }
 
     final targetChat = (chatId ?? _selectedChatId).trim();
-    final result = _messages.where((message) {
-      if (targetChat.isNotEmpty && message.chatId != targetChat) {
-        return false;
-      }
-      if (message.isDeleted) {
-        return false;
-      }
-      final sender = message.senderName.toLowerCase();
-      final text = (message.text ?? '').toLowerCase();
-      final fileName = (message.attachment?.name ?? '').toLowerCase();
-      final reply = (message.replyTo?.text ?? '').toLowerCase();
-      return sender.contains(normalized) ||
-          text.contains(normalized) ||
-          fileName.contains(normalized) ||
-          reply.contains(normalized);
-    }).toList(growable: false)
-      ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    final result =
+        _messages
+            .where((message) {
+              if (targetChat.isNotEmpty && message.chatId != targetChat) {
+                return false;
+              }
+              if (message.isDeleted) {
+                return false;
+              }
+              final sender = message.senderName.toLowerCase();
+              final text = (message.text ?? '').toLowerCase();
+              final fileName = (message.attachment?.name ?? '').toLowerCase();
+              final reply = (message.replyTo?.text ?? '').toLowerCase();
+              final forwardedText = (message.forwardedFrom?.text ?? '')
+                  .toLowerCase();
+              final forwardedSender = (message.forwardedFrom?.senderName ?? '')
+                  .toLowerCase();
+              return sender.contains(normalized) ||
+                  text.contains(normalized) ||
+                  fileName.contains(normalized) ||
+                  reply.contains(normalized) ||
+                  forwardedText.contains(normalized) ||
+                  forwardedSender.contains(normalized);
+            })
+            .toList(growable: false)
+          ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
 
     return result;
   }
@@ -2049,6 +2294,20 @@ class ChatProvider extends ChangeNotifier {
   }
 
   Map<String, dynamic> _replyPayloadFromMessage(ChatMessage message) {
+    final previewText = (message.text ?? '').trim();
+    final fallbackFileName = message.attachment?.name ?? 'Файл';
+    final textForPayload = previewText.isEmpty ? fallbackFileName : previewText;
+    return <String, dynamic>{
+      'messageId': message.id,
+      'senderName': message.senderName.trim().isEmpty
+          ? 'Unknown'
+          : message.senderName.trim(),
+      'text': textForPayload,
+      'type': message.type.value,
+    };
+  }
+
+  Map<String, dynamic> _forwardPayloadFromMessage(ChatMessage message) {
     final previewText = (message.text ?? '').trim();
     final fallbackFileName = message.attachment?.name ?? 'Файл';
     final textForPayload = previewText.isEmpty ? fallbackFileName : previewText;
@@ -2949,6 +3208,8 @@ class ChatProvider extends ChangeNotifier {
       'chatId': _primaryGroupChatId,
       'chatType': 'group',
       if (payload['replyTo'] is Map) 'replyTo': _asMap(payload['replyTo']),
+      if (payload['forwardedFrom'] is Map)
+        'forwardedFrom': _asMap(payload['forwardedFrom']),
     };
     _handleMessage(normalizedPayload);
   }
@@ -3148,12 +3409,18 @@ class ChatProvider extends ChangeNotifier {
       return;
     }
 
+    final safeTitle = _sanitizeTextForUi(title, maxLength: 120);
+    final safeDescription = _sanitizeTextForUi(description, maxLength: 280);
+    if (safeTitle.isEmpty || safeDescription.isEmpty) {
+      return;
+    }
+
     _notifications.add(
       AppNotification(
         id: _nextId(),
         kind: kind,
-        title: title,
-        description: description,
+        title: safeTitle,
+        description: safeDescription,
         createdAt: DateTime.now(),
       ),
     );
@@ -3163,7 +3430,7 @@ class ChatProvider extends ChangeNotifier {
     }
 
     if (showInSystem) {
-      _showSystemNotification(title: title, description: description);
+      _showSystemNotification(title: safeTitle, description: safeDescription);
     }
   }
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 cukw
+
 import 'mesh_transport_service_base.dart';
 
 MeshTransportServiceBase createMeshTransportService() {

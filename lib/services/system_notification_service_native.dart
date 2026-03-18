@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 cukw
+
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
 import 'system_notification_service_base.dart';

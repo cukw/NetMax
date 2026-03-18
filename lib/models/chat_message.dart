@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 cukw
+
 enum MessageType { text, file, system }
 
 extension MessageTypeX on MessageType {
@@ -83,11 +86,40 @@ class MessageReplyInfo {
   }
 }
 
-class MessageEditHistoryItem {
-  const MessageEditHistoryItem({
+class MessageForwardInfo {
+  const MessageForwardInfo({
+    required this.messageId,
+    required this.senderName,
     required this.text,
-    required this.editedAt,
+    required this.type,
   });
+
+  factory MessageForwardInfo.fromJson(Map<String, dynamic> json) {
+    return MessageForwardInfo(
+      messageId: (json['messageId']?.toString() ?? '').trim(),
+      senderName: (json['senderName']?.toString() ?? 'Unknown').trim(),
+      text: (json['text']?.toString() ?? '').trim(),
+      type: MessageTypeX.fromValue(json['type']?.toString() ?? 'text'),
+    );
+  }
+
+  final String messageId;
+  final String senderName;
+  final String text;
+  final MessageType type;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'messageId': messageId,
+      'senderName': senderName,
+      'text': text,
+      'type': type.value,
+    };
+  }
+}
+
+class MessageEditHistoryItem {
+  const MessageEditHistoryItem({required this.text, required this.editedAt});
 
   factory MessageEditHistoryItem.fromJson(Map<String, dynamic> json) {
     return MessageEditHistoryItem(
@@ -102,10 +134,7 @@ class MessageEditHistoryItem {
   final DateTime editedAt;
 
   Map<String, dynamic> toJson() {
-    return {
-      'text': text,
-      'editedAt': editedAt.toUtc().toIso8601String(),
-    };
+    return {'text': text, 'editedAt': editedAt.toUtc().toIso8601String()};
   }
 }
 
@@ -132,11 +161,13 @@ class ChatMessage {
     this.text,
     this.attachment,
     this.replyTo,
+    this.forwardedFrom,
   });
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) {
     final attachmentJson = json['attachment'];
     final replyJson = json['replyTo'];
+    final forwardedJson = json['forwardedFrom'];
     final reactionsJson = json['reactions'];
     final editHistoryRaw = json['editHistory'];
 
@@ -212,6 +243,11 @@ class ChatMessage {
           : replyJson is Map
           ? MessageReplyInfo.fromJson(replyJson.cast<String, dynamic>())
           : null,
+      forwardedFrom: forwardedJson is Map<String, dynamic>
+          ? MessageForwardInfo.fromJson(forwardedJson)
+          : forwardedJson is Map
+          ? MessageForwardInfo.fromJson(forwardedJson.cast<String, dynamic>())
+          : null,
     );
   }
 
@@ -223,6 +259,7 @@ class ChatMessage {
     required DateTime createdAt,
     required String text,
     MessageReplyInfo? replyTo,
+    MessageForwardInfo? forwardedFrom,
   }) {
     return ChatMessage(
       id: id,
@@ -234,6 +271,7 @@ class ChatMessage {
       isScheduled: false,
       text: text,
       replyTo: replyTo,
+      forwardedFrom: forwardedFrom,
       mentions: const <String>[],
       reactions: const <String, List<String>>{},
       deliveredTo: const <String>[],
@@ -250,6 +288,7 @@ class ChatMessage {
     required MessageAttachment attachment,
     String? text,
     MessageReplyInfo? replyTo,
+    MessageForwardInfo? forwardedFrom,
   }) {
     return ChatMessage(
       id: id,
@@ -262,6 +301,7 @@ class ChatMessage {
       text: text,
       attachment: attachment,
       replyTo: replyTo,
+      forwardedFrom: forwardedFrom,
       mentions: const <String>[],
       reactions: const <String, List<String>>{},
       deliveredTo: const <String>[],
@@ -312,6 +352,7 @@ class ChatMessage {
   final String? text;
   final MessageAttachment? attachment;
   final MessageReplyInfo? replyTo;
+  final MessageForwardInfo? forwardedFrom;
 
   bool get isVoiceMessage {
     if (type != MessageType.file || attachment == null) {
@@ -348,6 +389,7 @@ class ChatMessage {
     String? text,
     MessageAttachment? attachment,
     MessageReplyInfo? replyTo,
+    MessageForwardInfo? forwardedFrom,
   }) {
     return ChatMessage(
       id: id ?? this.id,
@@ -371,6 +413,7 @@ class ChatMessage {
       text: text ?? this.text,
       attachment: attachment ?? this.attachment,
       replyTo: replyTo ?? this.replyTo,
+      forwardedFrom: forwardedFrom ?? this.forwardedFrom,
     );
   }
 
@@ -397,6 +440,7 @@ class ChatMessage {
       'text': text,
       'attachment': attachment?.toJson(),
       'replyTo': replyTo?.toJson(),
+      'forwardedFrom': forwardedFrom?.toJson(),
     };
   }
 }

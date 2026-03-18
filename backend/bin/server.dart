@@ -1,26 +1,39 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 cukw
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:typed_data';
 
+import 'package:mongo_dart/mongo_dart.dart' as mongo;
 import 'package:path/path.dart' as p;
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as shelf_io;
 import 'package:shelf_router/shelf_router.dart';
 import 'package:shelf_web_socket/shelf_web_socket.dart';
+import 'package:sqlite3/sqlite3.dart' as sqlite;
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 const String _authConfigRelativePath = 'config/authorized_users.json';
+const String _usersDbRelativePath = 'config/users.sqlite3';
 const String _updateManifestRelativePath = 'config/update_manifest.json';
 const String _scheduledConfigRelativePath = 'config/scheduled_messages.json';
 const String _groupChatsConfigRelativePath = 'config/group_chats.json';
+const String _messagesDbRelativePath = 'config/messages_history.sqlite3';
 const String _messagesConfigRelativePath = 'config/messages_history.json';
 const String _e2eeKeyConfigRelativePath = 'config/e2ee_shared_key.txt';
+const String _mongoUriEnv = 'NETMAX_MONGO_URI';
+const String _defaultMongoUri = 'mongodb://127.0.0.1:27017/netmax';
 const Duration _scheduleTickInterval = Duration(seconds: 20);
 const Duration _storageCleanupInterval = Duration(minutes: 30);
 const Duration _storageFileMaxAge = Duration(days: 14);
 const int _storageMaxBytes = 1024 * 1024 * 1024;
-const int _maxHistoryMessages = 200;
+final int _maxHistoryMessages = _readPositiveIntFromEnv(
+  'NETMAX_HISTORY_LIMIT',
+  fallback: 10000,
+);
 const String _defaultGroupChatId = 'group-general';
 const String _defaultGroupChatTitle = 'Общий чат';
 const Set<String> _scheduledRestrictedUsersLower = <String>{
@@ -31,16 +44,24 @@ const Set<String> _scheduledRestrictedUsersLower = <String>{
 final RoomState _group = RoomState();
 final Random _random = Random();
 
-late final Directory _storageDir;
 late final List<String> _allowedUsers;
 late final Map<String, String> _allowedUsersByLower;
 late final Map<String, String> _passwordsByUserLower;
 late final String _serverManagedE2eeKey;
 late final String _serverManagedE2eeKeySource;
 late final File _e2eeKeyFile;
+late final File _usersDbFile;
+late final sqlite.Database _usersDb;
 late final File _scheduledConfigFile;
 late final File _groupChatsConfigFile;
-late final File _messagesConfigFile;
+late final File _messagesLegacyConfigFile;
+late final File _messagesDbFile;
+late final sqlite.Database _messagesDb;
+late final mongo.Db _mongoDb;
+late final mongo.DbCollection _mongoMessagesCollection;
+late final mongo.DbCollection _mongoFilesCollection;
+late final mongo.DbCollection _mongoChatsCollection;
+late final mongo.GridFS _mongoGridFs;
 final Map<String, ScheduledMessageRule> _scheduledRulesByUserLower =
     <String, ScheduledMessageRule>{};
 final Map<String, String> _groupChatTitlesById = <String, String>{};
@@ -52,28 +73,28 @@ Timer? _scheduledDispatchTimer;
 Timer? _storageCleanupTimer;
 
 Future<void> main() async {
-  _storageDir = Directory(p.join(Directory.current.path, 'storage'));
-  if (!_storageDir.existsSync()) {
-    _storageDir.createSync(recursive: true);
-  }
-
+  _usersDbFile = File(p.join(Directory.current.path, _usersDbRelativePath));
   _scheduledConfigFile = File(
     p.join(Directory.current.path, _scheduledConfigRelativePath),
   );
   _groupChatsConfigFile = File(
     p.join(Directory.current.path, _groupChatsConfigRelativePath),
   );
-  _messagesConfigFile = File(
+  _messagesLegacyConfigFile = File(
     p.join(Directory.current.path, _messagesConfigRelativePath),
+  );
+  _messagesDbFile = File(
+    p.join(Directory.current.path, _messagesDbRelativePath),
   );
   _e2eeKeyFile = File(
     p.join(Directory.current.path, _e2eeKeyConfigRelativePath),
   );
 
   _loadServerManagedE2eeKey();
+  await _initializeNoSqlStore();
   _loadAuthorizedUsers();
-  _loadGroupChats();
-  _loadMessageHistory();
+  await _loadGroupChats();
+  await _initializeMessageStore();
   _loadScheduledRules();
   _startScheduledDispatcher();
   _cleanupStorage();
@@ -118,6 +139,8 @@ Future<void> main() async {
   );
   stdout.writeln('Group chats loaded: ${_groupChatTitlesById.length}');
   stdout.writeln('Messages loaded: ${_group.messages.length}');
+  stdout.writeln('History limit: $_maxHistoryMessages');
+  stdout.writeln('NoSQL backend: MongoDB (${_mongoDb.databaseName})');
   stdout.writeln('E2EE key source: $_serverManagedE2eeKeySource');
   stdout.writeln(
     'Storage cleanup: every ${_storageCleanupInterval.inMinutes}m, '
@@ -127,43 +150,46 @@ Future<void> main() async {
 }
 
 void _loadAuthorizedUsers() {
+  _usersDbFile.parent.createSync(recursive: true);
+  _usersDb = sqlite.sqlite3.open(_usersDbFile.path);
+  _usersDb.execute('PRAGMA journal_mode = WAL;');
+  _usersDb.execute('PRAGMA synchronous = NORMAL;');
+  _usersDb.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+      name_lower TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      password TEXT NOT NULL
+    )
+  ''');
+
   final configFile = File(
     p.join(Directory.current.path, _authConfigRelativePath),
   );
-  if (!configFile.existsSync()) {
-    throw StateError(
-      'Authorization config not found: ${configFile.path}. '
-      'Create $_authConfigRelativePath with allowedUsers list containing '
-      '{"name","password"} entries.',
-    );
+  Map<String, dynamic> decoded = <String, dynamic>{};
+  if (configFile.existsSync()) {
+    final raw = configFile.readAsStringSync();
+    final parsed = jsonDecode(raw);
+    if (parsed is! Map<String, dynamic>) {
+      throw StateError(
+        'Invalid authorization config format. Expected JSON object.',
+      );
+    }
+    decoded = parsed;
   }
 
-  final raw = configFile.readAsStringSync();
-  final decoded = jsonDecode(raw);
-  if (decoded is! Map<String, dynamic>) {
-    throw StateError(
-      'Invalid authorization config format. Expected JSON object.',
-    );
-  }
-
-  // подгрузка лимита сессий
   final maxSessions = _toInt(decoded['maxSessionsPerUser']);
   _maxSessionsPerUser = (maxSessions != null && maxSessions >= 0)
       ? maxSessions
       : 0;
 
   final usersRaw = decoded['allowedUsers'];
-  if (usersRaw is! List) {
-    throw StateError(
-      'Invalid authorization config: "allowedUsers" must be a list.',
-    );
-  }
+  final seedUsers = usersRaw is List ? usersRaw : const <Object>[];
 
   final users = <String>[];
   final usersByLower = <String, String>{};
   final passwordsByLower = <String, String>{};
 
-  for (final rawUser in usersRaw) {
+  for (final rawUser in seedUsers) {
     final map = _asMap(rawUser);
     final name = (map['name']?.toString() ?? '').trim();
     final password = (map['password']?.toString() ?? '').trim();
@@ -187,15 +213,104 @@ void _loadAuthorizedUsers() {
     users.add(name);
   }
 
-  users.sort();
+  final rows = _usersDb.select('SELECT COUNT(*) AS c FROM users');
+  final existingUsersCount = rows.isEmpty
+      ? 0
+      : ((rows.first['c'] as num?)?.toInt() ?? 0);
+  if (existingUsersCount == 0 && users.isNotEmpty) {
+    final insert = _usersDb.prepare(
+      'INSERT INTO users (name_lower, name, password) VALUES (?, ?, ?)',
+    );
+    try {
+      for (final entry in usersByLower.entries) {
+        insert.execute(<Object?>[
+          entry.key,
+          entry.value,
+          passwordsByLower[entry.key] ?? '',
+        ]);
+      }
+    } finally {
+      insert.dispose();
+    }
+  }
+
+  final persisted = _usersDb.select(
+    'SELECT name_lower, name, password FROM users ORDER BY name COLLATE NOCASE ASC',
+  );
+
+  users
+    ..clear()
+    ..addAll(
+      persisted
+          .map((row) => (row['name']?.toString() ?? '').trim())
+          .where((name) => name.isNotEmpty),
+    );
+  usersByLower
+    ..clear()
+    ..addEntries(
+      persisted
+          .map((row) {
+            final lower = (row['name_lower']?.toString() ?? '')
+                .trim()
+                .toLowerCase();
+            final name = (row['name']?.toString() ?? '').trim();
+            return MapEntry(lower, name);
+          })
+          .where((entry) => entry.key.isNotEmpty && entry.value.isNotEmpty),
+    );
+  passwordsByLower
+    ..clear()
+    ..addEntries(
+      persisted
+          .map((row) {
+            final lower = (row['name_lower']?.toString() ?? '')
+                .trim()
+                .toLowerCase();
+            final password = (row['password']?.toString() ?? '').trim();
+            return MapEntry(lower, password);
+          })
+          .where((entry) => entry.key.isNotEmpty && entry.value.isNotEmpty),
+    );
 
   if (users.isEmpty) {
-    throw StateError('Authorization config must contain at least one user.');
+    throw StateError(
+      'Users store is empty. Add users to SQLite ($_usersDbRelativePath) '
+      'or define allowedUsers in $_authConfigRelativePath for bootstrap.',
+    );
   }
 
   _allowedUsers = List<String>.unmodifiable(users);
   _allowedUsersByLower = Map<String, String>.unmodifiable(usersByLower);
   _passwordsByUserLower = Map<String, String>.unmodifiable(passwordsByLower);
+}
+
+Future<void> _initializeNoSqlStore() async {
+  var uri = (Platform.environment[_mongoUriEnv] ?? _defaultMongoUri).trim();
+  if (uri.isEmpty) {
+    uri = _defaultMongoUri;
+  }
+
+  _mongoDb = await mongo.Db.create(uri);
+  await _mongoDb.open();
+
+  _mongoMessagesCollection = _mongoDb.collection('messages');
+  _mongoFilesCollection = _mongoDb.collection('files');
+  _mongoChatsCollection = _mongoDb.collection('chats');
+  _mongoGridFs = mongo.GridFS(_mongoDb, 'netmax_files');
+
+  await _mongoMessagesCollection.createIndex(
+    keys: <String, dynamic>{'created_at': 1},
+  );
+  await _mongoMessagesCollection.createIndex(
+    keys: <String, dynamic>{'chat_id': 1, 'created_at': 1},
+  );
+  await _mongoFilesCollection.createIndex(
+    keys: <String, dynamic>{'created_at': 1},
+  );
+  await _mongoChatsCollection.createIndex(
+    keys: <String, dynamic>{'id': 1},
+    unique: true,
+  );
 }
 
 void _loadServerManagedE2eeKey() {
@@ -283,25 +398,88 @@ void _loadScheduledRules() {
   }
 }
 
-void _loadGroupChats() {
-  if (!_groupChatsConfigFile.existsSync()) {
-    _groupChatsConfigFile.createSync(recursive: true);
-    _groupChatsConfigFile.writeAsStringSync(
-      const JsonEncoder.withIndent('  ').convert({
-        'chats': [
-          {'id': _defaultGroupChatId, 'title': _defaultGroupChatTitle},
-        ],
-      }),
+Future<void> _loadGroupChats() async {
+  final loaded = <String, String>{};
+
+  final chatsFromNoSql = await _mongoChatsCollection.find({
+    'type': 'group',
+  }).toList();
+  for (final item in chatsFromNoSql) {
+    final rawId = (item['id']?.toString() ?? '').trim();
+    final rawTitle = (item['title']?.toString() ?? '').trim();
+    final chatId = _normalizeGroupChatId(rawId, requireExisting: false);
+    if (chatId == null || loaded.containsKey(chatId)) {
+      continue;
+    }
+    loaded[chatId] = rawTitle.isEmpty ? 'Чат' : rawTitle;
+  }
+
+  if (loaded.isEmpty) {
+    final legacyLoaded = _loadLegacyGroupChats();
+    loaded.addAll(legacyLoaded);
+    if (loaded.isNotEmpty) {
+      final documents = loaded.entries
+          .map(
+            (entry) => <String, dynamic>{
+              '_id': entry.key,
+              'id': entry.key,
+              'title': entry.value,
+              'type': 'group',
+              'created_at': DateTime.now().toUtc().toIso8601String(),
+            },
+          )
+          .toList(growable: false);
+      if (documents.isNotEmpty) {
+        await _mongoChatsCollection.insertMany(documents);
+      }
+    }
+  }
+
+  if (loaded.isEmpty) {
+    loaded[_defaultGroupChatId] = _defaultGroupChatTitle;
+    await _mongoChatsCollection.replaceOne(
+      {'_id': _defaultGroupChatId},
+      <String, dynamic>{
+        '_id': _defaultGroupChatId,
+        'id': _defaultGroupChatId,
+        'title': _defaultGroupChatTitle,
+        'type': 'group',
+        'created_at': DateTime.now().toUtc().toIso8601String(),
+      },
+      upsert: true,
     );
   }
 
-  final loaded = <String, String>{};
+  if (!loaded.containsKey(_defaultGroupChatId)) {
+    loaded[_defaultGroupChatId] = _defaultGroupChatTitle;
+    await _mongoChatsCollection.replaceOne(
+      {'_id': _defaultGroupChatId},
+      <String, dynamic>{
+        '_id': _defaultGroupChatId,
+        'id': _defaultGroupChatId,
+        'title': _defaultGroupChatTitle,
+        'type': 'group',
+        'created_at': DateTime.now().toUtc().toIso8601String(),
+      },
+      upsert: true,
+    );
+  }
 
+  _groupChatTitlesById
+    ..clear()
+    ..addAll(loaded);
+}
+
+Map<String, String> _loadLegacyGroupChats() {
+  if (!_groupChatsConfigFile.existsSync()) {
+    return <String, String>{};
+  }
+
+  final loaded = <String, String>{};
   try {
     final decoded = jsonDecode(_groupChatsConfigFile.readAsStringSync());
     final root = _asMap(decoded);
     final rawChats = root['chats'];
-
     if (rawChats is List) {
       for (final item in rawChats) {
         final map = _asMap(item);
@@ -315,69 +493,281 @@ void _loadGroupChats() {
       }
     }
   } catch (_) {
-    loaded.clear();
+    return <String, String>{};
   }
-
-  if (loaded.isEmpty) {
-    loaded[_defaultGroupChatId] = _defaultGroupChatTitle;
-  }
-
-  if (!loaded.containsKey(_defaultGroupChatId)) {
-    loaded[_defaultGroupChatId] = _defaultGroupChatTitle;
-  }
-
-  _groupChatTitlesById
-    ..clear()
-    ..addAll(loaded);
+  return loaded;
 }
 
-void _loadMessageHistory() {
-  if (!_messagesConfigFile.existsSync()) {
-    _messagesConfigFile.createSync(recursive: true);
-    _messagesConfigFile.writeAsStringSync(
-      const JsonEncoder.withIndent('  ').convert({'messages': <Object>[]}),
-    );
+Future<void> _initializeMessageStore() async {
+  _messagesDbFile.parent.createSync(recursive: true);
+  _messagesDb = sqlite.sqlite3.open(_messagesDbFile.path);
+  _messagesDb.execute('PRAGMA journal_mode = WAL;');
+  _messagesDb.execute('PRAGMA synchronous = NORMAL;');
+  _messagesDb.execute('''
+    CREATE TABLE IF NOT EXISTS message_store_meta (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    )
+    ''');
+  _messagesDb.execute('''
+    INSERT OR REPLACE INTO message_store_meta (key, value)
+    VALUES ('engine', 'mongo')
+    ''');
+
+  await _trimMessagesInNoSql();
+
+  if (await _messagesCountInNoSql() == 0) {
+    final migrated = _loadLegacyMessagesForMigration();
+    if (migrated.isNotEmpty) {
+      await _replaceAllMessagesInNoSql(migrated);
+      stdout.writeln(
+        'Migrated ${migrated.length} message(s) from $_messagesConfigRelativePath to MongoDB.',
+      );
+    }
   }
 
+  await _loadMessagesFromNoSqlToMemory();
+}
+
+List<Map<String, dynamic>> _loadLegacyMessagesForMigration() {
+  if (!_messagesLegacyConfigFile.existsSync()) {
+    return <Map<String, dynamic>>[];
+  }
+
+  final result = <Map<String, dynamic>>[];
   try {
-    final decoded = jsonDecode(_messagesConfigFile.readAsStringSync());
+    final decoded = jsonDecode(_messagesLegacyConfigFile.readAsStringSync());
     final root = _asMap(decoded);
     final rawMessages = root['messages'];
-    var droppedInvalidMessages = false;
-
-    _group.messages.clear();
-    if (rawMessages is List) {
-      for (final item in rawMessages) {
-        final normalized = _normalizeLoadedMessage(_asMap(item));
-        if (normalized == null) {
-          droppedInvalidMessages = true;
-          continue;
-        }
-        _group.messages.add(normalized);
+    if (rawMessages is! List) {
+      return result;
+    }
+    for (final item in rawMessages) {
+      final normalized = _normalizeLoadedMessage(_asMap(item));
+      if (normalized != null) {
+        result.add(normalized);
       }
     }
-
-    if (_group.messages.length > _maxHistoryMessages) {
-      _group.messages.removeRange(
-        0,
-        _group.messages.length - _maxHistoryMessages,
-      );
-      droppedInvalidMessages = true;
-    }
-    if (droppedInvalidMessages) {
-      _saveMessageHistory();
-    }
   } catch (_) {
-    _group.messages.clear();
-    _saveMessageHistory();
+    return <Map<String, dynamic>>[];
+  }
+
+  if (result.length > _maxHistoryMessages) {
+    return result.sublist(result.length - _maxHistoryMessages);
+  }
+  return result;
+}
+
+Future<void> _loadMessagesFromNoSqlToMemory() async {
+  _group.messages.clear();
+
+  final staleIds = <String>[];
+  final rows = await _mongoMessagesCollection
+      .find(mongo.where.sortBy('created_at'))
+      .toList();
+  for (final row in rows) {
+    final id = (row['_id']?.toString() ?? '').trim();
+    final parsed = _asMap(row['payload']);
+
+    final normalized = _normalizeLoadedMessage(parsed);
+    if (normalized == null) {
+      if (id.isNotEmpty) {
+        staleIds.add(id);
+      }
+      continue;
+    }
+    _group.messages.add(normalized);
+  }
+
+  if (staleIds.isNotEmpty) {
+    await _deleteMessagesFromNoSqlByIds(staleIds);
+  }
+
+  if (_group.messages.length > _maxHistoryMessages) {
+    _group.messages.removeRange(
+      0,
+      _group.messages.length - _maxHistoryMessages,
+    );
+    await _replaceAllMessagesInNoSql(_group.messages);
   }
 }
 
-void _saveMessageHistory() {
-  final payload = {'messages': _group.messages};
-  _messagesConfigFile.writeAsStringSync(
-    const JsonEncoder.withIndent('  ').convert(payload),
+Future<int> _messagesCountInNoSql() async {
+  return _mongoMessagesCollection.count();
+}
+
+void _saveMessageHistory({
+  Map<String, dynamic>? changedMessage,
+  List<String> removedMessageIds = const <String>[],
+}) {
+  unawaited(
+    _saveMessageHistoryInNoSql(
+      changedMessage: changedMessage,
+      removedMessageIds: removedMessageIds,
+    ),
   );
+}
+
+Future<void> _saveMessageHistoryInNoSql({
+  Map<String, dynamic>? changedMessage,
+  List<String> removedMessageIds = const <String>[],
+}) async {
+  if (changedMessage == null) {
+    await _replaceAllMessagesInNoSql(_group.messages);
+    return;
+  }
+
+  await _upsertMessageInNoSql(changedMessage);
+  if (removedMessageIds.isNotEmpty) {
+    await _deleteMessagesFromNoSqlByIds(removedMessageIds);
+  }
+  await _trimMessagesInNoSql();
+}
+
+Future<void> _replaceAllMessagesInNoSql(
+  List<Map<String, dynamic>> messages,
+) async {
+  await _mongoMessagesCollection.deleteMany(<String, dynamic>{});
+  final start = messages.length > _maxHistoryMessages
+      ? messages.length - _maxHistoryMessages
+      : 0;
+  final documents = <Map<String, dynamic>>[];
+  for (var index = start; index < messages.length; index++) {
+    documents.add(_messageRecordFromPayload(messages[index]));
+  }
+  if (documents.isNotEmpty) {
+    await _mongoMessagesCollection.insertMany(documents);
+  }
+}
+
+Future<void> _upsertMessageInNoSql(Map<String, dynamic> message) async {
+  final id = _normalizeMessageId(message['id']);
+  final record = _messageRecordFromPayload(message);
+  await _mongoMessagesCollection.replaceOne({'_id': id}, record, upsert: true);
+}
+
+Map<String, dynamic> _messageRecordFromPayload(Map<String, dynamic> message) {
+  final id = _normalizeMessageId(message['id']);
+  return <String, dynamic>{
+    '_id': id,
+    'created_at': _normalizeIsoTimestamp(message['createdAt']),
+    'chat_id': (message['chatId']?.toString() ?? _defaultGroupChatId).trim(),
+    'chat_type': (message['chatType']?.toString() ?? 'group').trim(),
+    'payload': message,
+  };
+}
+
+Future<void> _deleteMessagesFromNoSqlByIds(List<String> ids) async {
+  if (ids.isEmpty) {
+    return;
+  }
+  final normalizedIds = ids
+      .map((id) => id.trim())
+      .where((id) => id.isNotEmpty)
+      .toList(growable: false);
+  if (normalizedIds.isEmpty) {
+    return;
+  }
+  await _mongoMessagesCollection.deleteMany(<String, dynamic>{
+    '_id': <String, dynamic>{'\$in': normalizedIds},
+  });
+}
+
+Future<void> _trimMessagesInNoSql() async {
+  final rows = await _mongoMessagesCollection
+      .find(mongo.where.sortBy('created_at', descending: true))
+      .toList();
+  if (rows.length <= _maxHistoryMessages) {
+    return;
+  }
+  final staleIds = rows
+      .skip(_maxHistoryMessages)
+      .map((row) => (row['_id']?.toString() ?? '').trim())
+      .where((id) => id.isNotEmpty)
+      .toList(growable: false);
+  await _deleteMessagesFromNoSqlByIds(staleIds);
+}
+
+Future<void> _storeFileInNoSql({
+  required String fileId,
+  required String fileName,
+  required String extension,
+  required List<int> bytes,
+}) async {
+  final existing = await _mongoGridFs.findOne(mongo.where.id(fileId));
+  if (existing != null) {
+    await existing.delete();
+  }
+
+  final gridIn = _mongoGridFs
+      .createFile(Stream<List<int>>.value(bytes), fileName, <String, dynamic>{
+        'extension': extension,
+        'sizeBytes': bytes.length,
+        'createdAt': DateTime.now().toUtc(),
+      });
+  gridIn.id = fileId;
+  await gridIn.save();
+
+  final now = DateTime.now().toUtc().toIso8601String();
+  await _mongoFilesCollection.replaceOne(
+    {'_id': fileId},
+    <String, dynamic>{
+      '_id': fileId,
+      'name': fileName,
+      'extension': extension,
+      'size_bytes': bytes.length,
+      'created_at': now,
+    },
+    upsert: true,
+  );
+}
+
+Future<Map<String, dynamic>?> _fileFromNoSql(String fileId) async {
+  return _mongoFilesCollection.findOne({'_id': fileId});
+}
+
+Future<List<int>?> _readFileBytesFromNoSql(String fileId) async {
+  final out = await _mongoGridFs.findOne(mongo.where.id(fileId));
+  if (out == null) {
+    return null;
+  }
+  final chunks = await _mongoGridFs.chunks
+      .find(mongo.where.eq('files_id', out.id).sortBy('n'))
+      .toList();
+  if (chunks.isEmpty) {
+    return <int>[];
+  }
+  final bytes = BytesBuilder(copy: false);
+  for (final chunk in chunks) {
+    final data = chunk['data'];
+    if (data is mongo.BsonBinary) {
+      bytes.add(data.byteList);
+    } else if (data is List<int>) {
+      bytes.add(data);
+    }
+  }
+  return bytes.toBytes();
+}
+
+Future<void> _deleteFilesFromNoSqlByIds(List<String> ids) async {
+  final normalizedIds = ids
+      .map((id) => id.trim())
+      .where((id) => id.isNotEmpty)
+      .toList(growable: false);
+  if (normalizedIds.isEmpty) {
+    return;
+  }
+
+  for (final id in normalizedIds) {
+    final out = await _mongoGridFs.findOne(mongo.where.id(id));
+    if (out != null) {
+      await out.delete();
+    }
+  }
+
+  await _mongoFilesCollection.deleteMany(<String, dynamic>{
+    '_id': <String, dynamic>{'\$in': normalizedIds},
+  });
 }
 
 void _saveScheduledRules() {
@@ -407,41 +797,68 @@ void _startStorageCleanup() {
 }
 
 void _cleanupStorage() {
+  unawaited(_cleanupStorageInNoSql());
+}
+
+Future<void> _cleanupStorageInNoSql() async {
   final now = DateTime.now();
-  final entries = _listStorageFiles();
+  final rows = await _mongoFilesCollection.find().toList();
+  if (rows.isEmpty) {
+    return;
+  }
 
   var activeTotalBytes = 0;
   var deletedFiles = 0;
   var freedBytes = 0;
+  final staleIds = <String>[];
+  final active = <Map<String, dynamic>>[];
 
-  final active = <_StorageFileRecord>[];
-
-  for (final entry in entries) {
-    final age = now.difference(entry.modifiedAt);
-    if (age > _storageFileMaxAge) {
-      if (_deleteStorageFile(entry.file)) {
-        deletedFiles++;
-        freedBytes += entry.sizeBytes;
+  for (final row in rows) {
+    final id = (row['_id']?.toString() ?? '').trim();
+    final createdAt = DateTime.tryParse(
+      row['created_at']?.toString() ?? '',
+    )?.toLocal();
+    final size = (row['size_bytes'] as num?)?.toInt() ?? 0;
+    if (id.isEmpty || createdAt == null || size <= 0) {
+      if (id.isNotEmpty) {
+        staleIds.add(id);
       }
       continue;
     }
+    final age = now.difference(createdAt);
+    if (age > _storageFileMaxAge) {
+      staleIds.add(id);
+      deletedFiles++;
+      freedBytes += size;
+      continue;
+    }
 
-    active.add(entry);
-    activeTotalBytes += entry.sizeBytes;
+    active.add(<String, dynamic>{
+      'id': id,
+      'size': size,
+      'createdAt': createdAt,
+    });
+    activeTotalBytes += size;
   }
 
   if (activeTotalBytes > _storageMaxBytes) {
-    active.sort((a, b) => a.modifiedAt.compareTo(b.modifiedAt));
+    active.sort(
+      (a, b) =>
+          (a['createdAt'] as DateTime).compareTo(b['createdAt'] as DateTime),
+    );
     for (final entry in active) {
       if (activeTotalBytes <= _storageMaxBytes) {
         break;
       }
-      if (_deleteStorageFile(entry.file)) {
-        deletedFiles++;
-        freedBytes += entry.sizeBytes;
-        activeTotalBytes -= entry.sizeBytes;
-      }
+      staleIds.add(entry['id'] as String);
+      deletedFiles++;
+      freedBytes += entry['size'] as int;
+      activeTotalBytes -= entry['size'] as int;
     }
+  }
+
+  if (staleIds.isNotEmpty) {
+    await _deleteFilesFromNoSqlByIds(staleIds);
   }
 
   if (deletedFiles > 0) {
@@ -449,47 +866,6 @@ void _cleanupStorage() {
       'Storage cleanup removed $deletedFiles file(s), '
       'freed ${(freedBytes / (1024 * 1024)).toStringAsFixed(2)} MB.',
     );
-  }
-}
-
-List<_StorageFileRecord> _listStorageFiles() {
-  final files = <_StorageFileRecord>[];
-  final entries = _storageDir.listSync(followLinks: false);
-
-  for (final entity in entries) {
-    if (entity is! File) {
-      continue;
-    }
-
-    try {
-      final stat = entity.statSync();
-      if (stat.type != FileSystemEntityType.file) {
-        continue;
-      }
-      files.add(
-        _StorageFileRecord(
-          file: entity,
-          sizeBytes: stat.size,
-          modifiedAt: stat.modified,
-        ),
-      );
-    } catch (_) {
-      // Best effort: inaccessible file will be skipped.
-    }
-  }
-
-  return files;
-}
-
-bool _deleteStorageFile(File file) {
-  try {
-    if (!file.existsSync()) {
-      return false;
-    }
-    file.deleteSync();
-    return true;
-  } catch (_) {
-    return false;
   }
 }
 
@@ -732,8 +1108,49 @@ Map<String, dynamic>? _normalizeReplyPayload(Object? raw) {
     return null;
   }
 
-  final senderName = (map['senderName']?.toString() ?? 'Unknown').trim();
-  final text = (map['text']?.toString() ?? '').trim();
+  final senderName = _sanitizePlainText(
+    map['senderName']?.toString() ?? 'Unknown',
+    maxLength: 80,
+  );
+  final text = _sanitizePlainText(
+    map['text']?.toString() ?? '',
+    maxLength: 600,
+  );
+  final typeRaw = (map['type']?.toString() ?? 'text').trim().toLowerCase();
+  final type = switch (typeRaw) {
+    'file' => 'file',
+    'system' => 'system',
+    _ => 'text',
+  };
+
+  final fallbackText = type == 'file' ? 'Файл' : 'Сообщение';
+  return <String, dynamic>{
+    'messageId': messageId,
+    'senderName': senderName.isEmpty ? 'Unknown' : senderName,
+    'text': text.isEmpty ? fallbackText : text,
+    'type': type,
+  };
+}
+
+Map<String, dynamic>? _normalizeForwardPayload(Object? raw) {
+  if (raw is! Map) {
+    return null;
+  }
+
+  final map = _asMap(raw);
+  final messageId = (map['messageId']?.toString() ?? '').trim();
+  if (messageId.isEmpty) {
+    return null;
+  }
+
+  final senderName = _sanitizePlainText(
+    map['senderName']?.toString() ?? 'Unknown',
+    maxLength: 80,
+  );
+  final text = _sanitizePlainText(
+    map['text']?.toString() ?? '',
+    maxLength: 600,
+  );
   final typeRaw = (map['type']?.toString() ?? 'text').trim().toLowerCase();
   final type = switch (typeRaw) {
     'file' => 'file',
@@ -753,14 +1170,22 @@ Map<String, dynamic>? _normalizeReplyPayload(Object? raw) {
 Map<String, dynamic>? _normalizeLoadedMessage(Map<String, dynamic> raw) {
   final id = _normalizeMessageId(raw['id']);
   final senderId = (raw['senderId']?.toString() ?? '').trim();
-  final senderName = (raw['senderName']?.toString() ?? '').trim();
+  final senderName = _sanitizePlainText(
+    raw['senderName']?.toString() ?? '',
+    maxLength: 80,
+  );
   final createdAt = _normalizeIsoTimestamp(raw['createdAt']);
   final type = (raw['type']?.toString() ?? 'text').trim();
-  final text = (raw['text']?.toString() ?? '').trim();
+  final isEncrypted = raw['encrypted'] == true || raw['isEncrypted'] == true;
+  final textRaw = (raw['text']?.toString() ?? '').trim();
+  final text = isEncrypted
+      ? textRaw
+      : _sanitizePlainText(textRaw, maxLength: 4000);
   final isScheduled = raw['scheduled'] == true;
   final chatIdRaw = (raw['chatId']?.toString() ?? '').trim();
   final chatType = (raw['chatType']?.toString() ?? 'group').trim();
   final replyTo = _normalizeReplyPayload(raw['replyTo']);
+  final forwardedFrom = _normalizeForwardPayload(raw['forwardedFrom']);
   final isEdited = raw['edited'] == true || raw['isEdited'] == true;
   final editedAt = _normalizeOptionalIsoTimestamp(raw['editedAt']);
   final isDeleted = raw['deleted'] == true || raw['isDeleted'] == true;
@@ -770,8 +1195,9 @@ Map<String, dynamic>? _normalizeLoadedMessage(Map<String, dynamic> raw) {
   final mentions = _normalizeMentions(rawMentions: raw['mentions'], text: text);
   final deliveredTo = _normalizeUserLowerList(raw['deliveredTo']);
   final readBy = _normalizeUserLowerList(raw['readBy']);
-  final isEncrypted = raw['encrypted'] == true || raw['isEncrypted'] == true;
-  final encryption = raw['encryption'] is Map ? _asMap(raw['encryption']) : null;
+  final encryption = raw['encryption'] is Map
+      ? _asMap(raw['encryption'])
+      : null;
   final senderLower = senderName.trim().toLowerCase();
   if (senderLower.isNotEmpty) {
     if (!deliveredTo.contains(senderLower)) {
@@ -819,9 +1245,15 @@ Map<String, dynamic>? _normalizeLoadedMessage(Map<String, dynamic> raw) {
       'encrypted': isEncrypted,
       if (encryption != null) 'encryption': encryption,
       if (replyTo != null) 'replyTo': replyTo,
+      if (forwardedFrom != null) 'forwardedFrom': forwardedFrom,
     };
     if (type == 'file') {
-      normalized['attachment'] = _asMap(raw['attachment']);
+      final attachment = _asMap(raw['attachment']);
+      attachment['name'] = _sanitizePlainText(
+        attachment['name']?.toString() ?? 'file',
+        maxLength: 255,
+      );
+      normalized['attachment'] = attachment;
     }
     return normalized;
   }
@@ -849,9 +1281,15 @@ Map<String, dynamic>? _normalizeLoadedMessage(Map<String, dynamic> raw) {
     'encrypted': isEncrypted,
     if (encryption != null) 'encryption': encryption,
     if (replyTo != null) 'replyTo': replyTo,
+    if (forwardedFrom != null) 'forwardedFrom': forwardedFrom,
   };
   if (type == 'file') {
-    normalized['attachment'] = _asMap(raw['attachment']);
+    final attachment = _asMap(raw['attachment']);
+    attachment['name'] = _sanitizePlainText(
+      attachment['name']?.toString() ?? 'file',
+      maxLength: 255,
+    );
+    normalized['attachment'] = attachment;
   }
   return normalized;
 }
@@ -937,50 +1375,52 @@ Response _updateManifestHandler(Request request) {
   }
 }
 
-Response _filesHandler(Request request, String file) {
-  final normalized = p.normalize(file).replaceAll('\\', '/').trim();
-  final isUnsafePath =
-      normalized.isEmpty ||
-      normalized == '.' ||
-      normalized.startsWith('..') ||
-      normalized.contains('/..');
-  if (isUnsafePath) {
+Future<Response> _filesHandler(Request request, String file) async {
+  final fileId = file.trim();
+  final validId = RegExp(r'^[a-zA-Z0-9._-]{1,120}$').hasMatch(fileId);
+  if (!validId) {
     return _json({'error': 'Invalid file path.'}, statusCode: 400);
   }
 
-  final target = File(p.join(_storageDir.path, normalized));
-  if (!target.existsSync()) {
+  final item = await _fileFromNoSql(fileId);
+  if (item == null) {
     return _json({'error': 'File not found.'}, statusCode: 404);
   }
 
-  FileStat stat;
-  try {
-    stat = target.statSync();
-  } catch (_) {
-    return _json({'error': 'Unable to read file metadata.'}, statusCode: 500);
+  final bytes = await _readFileBytesFromNoSql(fileId);
+  if (bytes == null) {
+    return _json({'error': 'File payload not found.'}, statusCode: 404);
   }
-
-  if (stat.type != FileSystemEntityType.file) {
-    return _json({'error': 'File not found.'}, statusCode: 404);
+  final totalSize = bytes.length;
+  if (totalSize <= 0) {
+    return _json({'error': 'File payload is empty.'}, statusCode: 404);
   }
 
   final downloadFlag = request.url.queryParameters['download']?.trim();
   final forceDownload = downloadFlag == '1' || downloadFlag == 'true';
   final requestedName = request.url.queryParameters['name']?.trim() ?? '';
-  final fallbackName = p.basename(normalized);
+  final fallbackName = _sanitizePlainText(
+    item['name']?.toString() ?? 'file.bin',
+    maxLength: 255,
+  );
   final downloadName = _safeDownloadName(
     requestedName.isEmpty ? fallbackName : requestedName,
   );
+  final contentType = _contentTypeByFileName(downloadName);
+  final inlineAllowed = _isInlineMediaContentType(contentType);
 
   final headers = <String, String>{
-    HttpHeaders.contentTypeHeader: _contentTypeByFileName(downloadName),
+    HttpHeaders.contentTypeHeader: contentType,
     HttpHeaders.acceptRangesHeader: 'bytes',
+    HttpHeaders.xContentTypeOptionsHeader: 'nosniff',
+    'x-frame-options': 'DENY',
+    'referrer-policy': 'no-referrer',
+    'content-security-policy': "default-src 'none'; sandbox",
   };
-  if (forceDownload) {
+  if (forceDownload || !inlineAllowed) {
     headers['content-disposition'] = 'attachment; filename="$downloadName"';
   }
 
-  final totalSize = stat.size;
   final rangeHeader = request.headers[HttpHeaders.rangeHeader];
   final byteRange = _parseByteRange(rangeHeader, totalSize);
   if (byteRange != null) {
@@ -991,13 +1431,13 @@ Response _filesHandler(Request request, String file) {
     headers[HttpHeaders.contentRangeHeader] = 'bytes $start-$end/$totalSize';
     return Response(
       HttpStatus.partialContent,
-      body: target.openRead(start, end + 1),
+      body: Stream<List<int>>.value(bytes.sublist(start, end + 1)),
       headers: headers,
     );
   }
 
   headers[HttpHeaders.contentLengthHeader] = totalSize.toString();
-  return Response.ok(target.openRead(), headers: headers);
+  return Response.ok(Stream<List<int>>.value(bytes), headers: headers);
 }
 
 _ByteRange? _parseByteRange(String? header, int totalSize) {
@@ -1071,6 +1511,11 @@ String _contentTypeByFileName(String fileName) {
   };
 }
 
+bool _isInlineMediaContentType(String contentType) {
+  final normalized = contentType.toLowerCase();
+  return normalized.startsWith('audio/') || normalized.startsWith('video/');
+}
+
 void _handleSocket(WebSocketChannel channel, String? protocol) {
   String? userId;
   String? userName;
@@ -1078,7 +1523,7 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
 
   late final StreamSubscription<dynamic> subscription;
   subscription = channel.stream.listen(
-    (dynamic rawData) {
+    (dynamic rawData) async {
       try {
         if (rawData is! String) {
           _sendEnvelope(
@@ -1209,7 +1654,11 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
               return;
             }
 
-            final text = (payload['text']?.toString() ?? '').trim();
+            final isEncrypted = payload['encrypted'] == true;
+            final rawText = (payload['text']?.toString() ?? '').trim();
+            final text = isEncrypted
+                ? rawText
+                : _sanitizePlainText(rawText, maxLength: 4000);
             if (text.isEmpty) {
               return;
             }
@@ -1249,6 +1698,9 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
               return;
             }
             final replyTo = _normalizeReplyPayload(payload['replyTo']);
+            final forwardedFrom = _normalizeForwardPayload(
+              payload['forwardedFrom'],
+            );
 
             final message = <String, dynamic>{
               'id': _normalizeMessageId(payload['id']),
@@ -1270,10 +1722,11 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
               ).toList(growable: false),
               'deliveredTo': <String>[userName!.toLowerCase()],
               'readBy': <String>[userName!.toLowerCase()],
-              'encrypted': payload['encrypted'] == true,
+              'encrypted': isEncrypted,
               if (payload['encryption'] is Map)
                 'encryption': _asMap(payload['encryption']),
               if (replyTo != null) 'replyTo': replyTo,
+              if (forwardedFrom != null) 'forwardedFrom': forwardedFrom,
               if (directContext != null)
                 'participants': directContext.participantsLower.toList(),
             };
@@ -1332,7 +1785,7 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
             if (!joined || userId == null || userName == null) {
               return;
             }
-            _handleFileMessage(
+            await _handleFileMessage(
               channel: channel,
               userId: userId!,
               userName: userName!,
@@ -1440,12 +1893,12 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
   channel.sink.done.whenComplete(() => subscription.cancel());
 }
 
-void _handleFileMessage({
+Future<void> _handleFileMessage({
   required WebSocketChannel channel,
   required String userId,
   required String userName,
   required Map<String, dynamic> payload,
-}) {
+}) async {
   final chatId = (payload['chatId']?.toString() ?? '').trim();
   if (chatId.isEmpty) {
     _sendEnvelope(
@@ -1479,8 +1932,12 @@ void _handleFileMessage({
     return;
   }
   final replyTo = _normalizeReplyPayload(payload['replyTo']);
+  final forwardedFrom = _normalizeForwardPayload(payload['forwardedFrom']);
 
-  final fileName = (payload['name']?.toString() ?? '').trim();
+  final fileName = _sanitizePlainText(
+    payload['name']?.toString() ?? '',
+    maxLength: 255,
+  );
   final base64Content = payload['contentBase64']?.toString() ?? '';
 
   if (fileName.isEmpty || base64Content.isEmpty) {
@@ -1515,12 +1972,29 @@ void _handleFileMessage({
   }
 
   final extension = _normalizeExtension(payload['extension'], fileName);
+  final isEncrypted = payload['encrypted'] == true;
+  final captionRaw = (payload['text']?.toString() ?? 'Отправлен файл').trim();
+  final caption = isEncrypted
+      ? captionRaw
+      : _sanitizePlainText(captionRaw, maxLength: 4000);
   final safeName = _safeFileName(fileName);
   final storedName =
       '${DateTime.now().millisecondsSinceEpoch}_${_random.nextInt(100000)}_$safeName';
-  final targetPath = p.join(_storageDir.path, storedName);
-
-  File(targetPath).writeAsBytesSync(bytes);
+  try {
+    await _storeFileInNoSql(
+      fileId: storedName,
+      fileName: fileName,
+      extension: extension,
+      bytes: bytes,
+    );
+  } catch (_) {
+    _sendEnvelope(
+      channel,
+      type: 'error',
+      payload: {'message': 'Не удалось сохранить файл в хранилище.'},
+    );
+    return;
+  }
   _cleanupStorage();
 
   final message = <String, dynamic>{
@@ -1529,7 +2003,7 @@ void _handleFileMessage({
     'senderName': userName,
     'createdAt': _normalizeIsoTimestamp(payload['createdAt']),
     'type': 'file',
-    'text': (payload['text']?.toString() ?? 'Отправлен файл').trim(),
+    'text': caption,
     'scheduled': false,
     'chatId': directContext?.chatId ?? groupChatId!,
     'chatType': directContext == null ? 'group' : 'direct',
@@ -1539,13 +2013,15 @@ void _handleFileMessage({
     'reactions': const <String, Object>{},
     'mentions': _normalizeMentions(
       rawMentions: payload['mentions'],
-      text: (payload['text']?.toString() ?? '').trim(),
+      text: caption,
     ).toList(growable: false),
     'deliveredTo': <String>[userName.toLowerCase()],
     'readBy': <String>[userName.toLowerCase()],
-    'encrypted': payload['encrypted'] == true,
-    if (payload['encryption'] is Map) 'encryption': _asMap(payload['encryption']),
+    'encrypted': isEncrypted,
+    if (payload['encryption'] is Map)
+      'encryption': _asMap(payload['encryption']),
     if (replyTo != null) 'replyTo': replyTo,
+    if (forwardedFrom != null) 'forwardedFrom': forwardedFrom,
     if (directContext != null)
       'participants': directContext.participantsLower.toList(),
     'attachment': {
@@ -1567,7 +2043,11 @@ void _handleMessageEdit({
   required Map<String, dynamic> payload,
 }) {
   final messageId = (payload['id']?.toString() ?? '').trim();
-  final updatedText = (payload['text']?.toString() ?? '').trim();
+  final isEncrypted = payload['encrypted'] == true;
+  final updatedTextRaw = (payload['text']?.toString() ?? '').trim();
+  final updatedText = isEncrypted
+      ? updatedTextRaw
+      : _sanitizePlainText(updatedTextRaw, maxLength: 4000);
   if (messageId.isEmpty) {
     _sendEnvelope(
       channel,
@@ -1653,15 +2133,16 @@ void _handleMessageEdit({
   ).toList(growable: false);
 
   if (payload['encrypted'] is bool) {
-    message['encrypted'] = payload['encrypted'] == true;
+    message['encrypted'] = isEncrypted;
   }
   if (payload['encryption'] is Map) {
     message['encryption'] = _asMap(payload['encryption']);
-  } else if (payload.containsKey('encryption') && payload['encryption'] == null) {
+  } else if (payload.containsKey('encryption') &&
+      payload['encryption'] == null) {
     message.remove('encryption');
   }
 
-  _saveMessageHistory();
+  _saveMessageHistory(changedMessage: message);
   _broadcastMessageToAudience(type: 'message_updated', payload: message);
 }
 
@@ -1715,7 +2196,7 @@ void _handleMessageDelete({
   message['mentions'] = const <String>[];
   message['reactions'] = const <String, Object>{};
 
-  _saveMessageHistory();
+  _saveMessageHistory(changedMessage: message);
   _broadcastMessageToAudience(type: 'message_updated', payload: message);
 }
 
@@ -1766,7 +2247,7 @@ void _handleMessageReactionToggle({
   }
 
   message['reactions'] = reactions;
-  _saveMessageHistory();
+  _saveMessageHistory(changedMessage: message);
   _broadcastMessageToAudience(type: 'message_updated', payload: message);
 }
 
@@ -1809,7 +2290,7 @@ void _handleMessageDeliveryState({
   message['deliveredTo'] = delivered;
   message['readBy'] = readBy;
 
-  _saveMessageHistory();
+  _saveMessageHistory(changedMessage: message);
   _broadcastMessageToAudience(type: 'message_updated', payload: message);
 }
 
@@ -1874,7 +2355,9 @@ Set<String> _participantsLowerFromMessage(Map<String, dynamic> message) {
     }
   }
 
-  final chatId = _normalizeDirectChatId((message['chatId']?.toString() ?? '').trim());
+  final chatId = _normalizeDirectChatId(
+    (message['chatId']?.toString() ?? '').trim(),
+  );
   if (chatId == null) {
     return <String>{};
   }
@@ -1924,12 +2407,13 @@ Map<String, List<String>> _normalizeReactions(Object? raw) {
     if (reaction.isEmpty || value is! List) {
       return;
     }
-    final users = value
-        .map((entry) => entry.toString().trim().toLowerCase())
-        .where((entry) => entry.isNotEmpty)
-        .toSet()
-        .toList()
-      ..sort();
+    final users =
+        value
+            .map((entry) => entry.toString().trim().toLowerCase())
+            .where((entry) => entry.isNotEmpty)
+            .toSet()
+            .toList()
+          ..sort();
     if (users.isNotEmpty) {
       result[reaction] = users;
     }
@@ -2002,7 +2486,10 @@ void _handleScheduledConfigSet({
   }
 
   final enabled = payload['enabled'] == true;
-  final text = (payload['text']?.toString() ?? '').trim();
+  final text = _sanitizePlainText(
+    payload['text']?.toString() ?? '',
+    maxLength: 4000,
+  );
   final time = _normalizeScheduleTime(payload['time']) ?? '09:00';
   final timezoneOffsetMinutes = _clampTimezoneOffset(
     _toInt(payload['timezoneOffsetMinutes']) ?? 0,
@@ -2115,13 +2602,21 @@ void _cleanupConnection({
 
 void _appendMessage(Map<String, dynamic> message) {
   _group.messages.add(message);
+  final removedIds = <String>[];
   if (_group.messages.length > _maxHistoryMessages) {
-    _group.messages.removeRange(
+    final removed = _group.messages.sublist(
       0,
       _group.messages.length - _maxHistoryMessages,
     );
+    _group.messages.removeRange(0, removed.length);
+    for (final item in removed) {
+      final id = (item['id']?.toString() ?? '').trim();
+      if (id.isNotEmpty) {
+        removedIds.add(id);
+      }
+    }
   }
-  _saveMessageHistory();
+  _saveMessageHistory(changedMessage: message, removedMessageIds: removedIds);
 }
 
 void _broadcast({
@@ -2280,6 +2775,20 @@ String _safeIdentity(String raw) {
   return safe;
 }
 
+String _sanitizePlainText(String raw, {required int maxLength}) {
+  final withoutControls = raw
+      .replaceAll(RegExp(r'[\u0000-\u001F\u007F]'), ' ')
+      .trim();
+  if (withoutControls.isEmpty) {
+    return '';
+  }
+  final collapsed = withoutControls.replaceAll(RegExp(r'\s+'), ' ');
+  if (collapsed.length <= maxLength) {
+    return collapsed;
+  }
+  return '${collapsed.substring(0, maxLength - 1)}…';
+}
+
 String? _normalizeScheduleTime(Object? value) {
   final text = (value?.toString() ?? '').trim();
   final match = RegExp(r'^([01]?\d|2[0-3]):([0-5]\d)$').firstMatch(text);
@@ -2300,6 +2809,15 @@ int _clampTimezoneOffset(int value) {
     return 840;
   }
   return value;
+}
+
+int _readPositiveIntFromEnv(String key, {required int fallback}) {
+  final raw = (Platform.environment[key] ?? '').trim();
+  final parsed = int.tryParse(raw);
+  if (parsed == null || parsed < 1) {
+    return fallback;
+  }
+  return parsed;
 }
 
 int? _toInt(Object? raw) {
@@ -2357,7 +2875,13 @@ Response _json(Map<String, dynamic> data, {int statusCode = 200}) {
   return Response(
     statusCode,
     body: jsonEncode(data),
-    headers: const {'content-type': 'application/json; charset=utf-8'},
+    headers: const {
+      'content-type': 'application/json; charset=utf-8',
+      'x-content-type-options': 'nosniff',
+      'x-frame-options': 'DENY',
+      'referrer-policy': 'no-referrer',
+      'content-security-policy': "default-src 'none'; frame-ancestors 'none'",
+    },
   );
 }
 
@@ -2367,23 +2891,8 @@ class RoomState {
   final List<Map<String, dynamic>> messages = <Map<String, dynamic>>[];
 }
 
-class _StorageFileRecord {
-  const _StorageFileRecord({
-    required this.file,
-    required this.sizeBytes,
-    required this.modifiedAt,
-  });
-
-  final File file;
-  final int sizeBytes;
-  final DateTime modifiedAt;
-}
-
 class _ByteRange {
-  const _ByteRange({
-    required this.start,
-    required this.end,
-  });
+  const _ByteRange({required this.start, required this.end});
 
   final int start;
   final int end;

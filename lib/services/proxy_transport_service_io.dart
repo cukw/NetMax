@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 cukw
+
 import 'dart:io';
 
 import 'package:socks5_proxy/socks_client.dart';

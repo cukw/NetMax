@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 cukw
+
 import 'dart:async';
 
 import 'package:flutter/material.dart';
@@ -17,6 +20,7 @@ class MessageBubble extends StatelessWidget {
     this.isPinned = false,
     this.onAttachmentTap,
     this.onReply,
+    this.onForward,
     this.onEdit,
     this.onDelete,
     this.onReactionToggle,
@@ -32,6 +36,7 @@ class MessageBubble extends StatelessWidget {
   final bool isPinned;
   final VoidCallback? onAttachmentTap;
   final ValueChanged<ChatMessage>? onReply;
+  final ValueChanged<ChatMessage>? onForward;
   final ValueChanged<ChatMessage>? onEdit;
   final ValueChanged<ChatMessage>? onDelete;
   final Future<void> Function(ChatMessage message, String reaction)?
@@ -107,7 +112,11 @@ class MessageBubble extends StatelessWidget {
               Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Icon(Icons.push_pin_rounded, size: 12, color: textColor.withAlpha(190)),
+                  Icon(
+                    Icons.push_pin_rounded,
+                    size: 12,
+                    color: textColor.withAlpha(190),
+                  ),
                   const SizedBox(width: 4),
                   Text(
                     'Закреплено',
@@ -121,6 +130,14 @@ class MessageBubble extends StatelessWidget {
               ),
             ],
             const SizedBox(height: 5),
+            if (message.forwardedFrom != null) ...[
+              _ForwardPreview(
+                forward: message.forwardedFrom!,
+                textColor: textColor,
+                isMine: isMine,
+              ),
+              const SizedBox(height: 7),
+            ],
             if (message.replyTo != null) ...[
               _ReplyPreview(
                 reply: message.replyTo!,
@@ -168,39 +185,41 @@ class MessageBubble extends StatelessWidget {
               Wrap(
                 spacing: 6,
                 runSpacing: 6,
-                children: message.reactions.entries.map((entry) {
-                  final users = entry.value;
-                  final reactedByMe = users.any(
-                    (user) => user.trim().toLowerCase() == currentUserLower,
-                  );
-                  return InkWell(
-                    borderRadius: BorderRadius.circular(12),
-                    onTap: onReactionToggle == null
-                        ? null
-                        : () => onReactionToggle!(message, entry.key),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 4,
-                      ),
-                      decoration: BoxDecoration(
-                        color: reactedByMe
-                            ? textColor.withAlpha(34)
-                            : Colors.transparent,
+                children: message.reactions.entries
+                    .map((entry) {
+                      final users = entry.value;
+                      final reactedByMe = users.any(
+                        (user) => user.trim().toLowerCase() == currentUserLower,
+                      );
+                      return InkWell(
                         borderRadius: BorderRadius.circular(12),
-                        border: Border.all(color: textColor.withAlpha(90)),
-                      ),
-                      child: Text(
-                        '${entry.key} ${users.length}',
-                        style: TextStyle(
-                          color: textColor.withAlpha(220),
-                          fontSize: 12,
-                          fontWeight: FontWeight.w600,
+                        onTap: onReactionToggle == null
+                            ? null
+                            : () => onReactionToggle!(message, entry.key),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 4,
+                          ),
+                          decoration: BoxDecoration(
+                            color: reactedByMe
+                                ? textColor.withAlpha(34)
+                                : Colors.transparent,
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(color: textColor.withAlpha(90)),
+                          ),
+                          child: Text(
+                            '${entry.key} ${users.length}',
+                            style: TextStyle(
+                              color: textColor.withAlpha(220),
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
                         ),
-                      ),
-                    ),
-                  );
-                }).toList(growable: false),
+                      );
+                    })
+                    .toList(growable: false),
               ),
             ],
             const SizedBox(height: 4),
@@ -267,6 +286,19 @@ class MessageBubble extends StatelessWidget {
                       padding: const EdgeInsets.all(3),
                       child: Icon(
                         Icons.reply_rounded,
+                        size: 15,
+                        color: textColor.withAlpha(170),
+                      ),
+                    ),
+                  ),
+                if (onForward != null && !message.isDeleted)
+                  InkWell(
+                    borderRadius: BorderRadius.circular(8),
+                    onTap: () => onForward!(message),
+                    child: Padding(
+                      padding: const EdgeInsets.all(3),
+                      child: Icon(
+                        Icons.forward_rounded,
                         size: 15,
                         color: textColor.withAlpha(170),
                       ),
@@ -403,6 +435,65 @@ class _ReplyPreview extends StatelessWidget {
   }
 }
 
+class _ForwardPreview extends StatelessWidget {
+  const _ForwardPreview({
+    required this.forward,
+    required this.textColor,
+    required this.isMine,
+  });
+
+  final MessageForwardInfo forward;
+  final Color textColor;
+  final bool isMine;
+
+  @override
+  Widget build(BuildContext context) {
+    final background = isMine
+        ? Colors.white.withAlpha(34)
+        : Theme.of(context).colorScheme.primary.withAlpha(16);
+
+    final kindText = switch (forward.type) {
+      MessageType.file => '[Файл] ',
+      MessageType.system => '[Система] ',
+      _ => '',
+    };
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: background,
+        borderRadius: BorderRadius.circular(10),
+        border: Border(
+          left: BorderSide(color: textColor.withAlpha(145), width: 3),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Переслано от ${forward.senderName}',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: textColor.withAlpha(190),
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            '$kindText${forward.text}',
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(color: textColor.withAlpha(200), fontSize: 12),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _VoiceAttachmentView extends StatefulWidget {
   const _VoiceAttachmentView({
     required this.attachment,
@@ -430,10 +521,7 @@ class _VoiceAttachmentViewState extends State<_VoiceAttachmentView> {
 
   Duration _duration = Duration.zero;
   Duration _position = Duration.zero;
-  PlayerState _playerState = PlayerState(
-    false,
-    ProcessingState.idle,
-  );
+  PlayerState _playerState = PlayerState(false, ProcessingState.idle);
   double _playbackSpeed = 1.0;
   bool _isLoading = false;
   bool _sourceLoaded = false;
@@ -617,7 +705,9 @@ class _VoiceAttachmentViewState extends State<_VoiceAttachmentView> {
                         ),
                       )
                     : Icon(
-                        isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
+                        isPlaying
+                            ? Icons.pause_rounded
+                            : Icons.play_arrow_rounded,
                         color: widget.textColor,
                         size: 20,
                       ),

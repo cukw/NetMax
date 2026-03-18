@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 cukw
+
 import 'dart:async';
 import 'dart:typed_data';
 
@@ -50,9 +53,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Timer? _voiceRecordingTimer;
   List<String> _mentionSuggestions = const <String>[];
   _MentionQueryContext? _mentionContext;
-  String? _lastWebPopupNotificationId;
-  AppNotification? _webPopupNotification;
-  Timer? _webPopupTimer;
 
   bool _scheduledEnabledDraft = false;
   String _scheduledTimeDraft = '09:00';
@@ -80,7 +80,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _scrollController.dispose();
     _messageFocusNode.dispose();
     _chatSearchFocusNode.dispose();
-    _webPopupTimer?.cancel();
     super.dispose();
   }
 
@@ -312,40 +311,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
-  void _syncWebMessagePopup(AppNotification? latestNotification) {
-    if (!kIsWeb) {
-      return;
-    }
-    if (latestNotification == null ||
-        latestNotification.kind != NotificationKind.message) {
-      return;
-    }
-    if (latestNotification.id == _lastWebPopupNotificationId) {
-      return;
-    }
-
-    _lastWebPopupNotificationId = latestNotification.id;
-    _webPopupTimer?.cancel();
-
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _webPopupNotification = latestNotification;
-      });
-    });
-
-    _webPopupTimer = Timer(const Duration(seconds: 5), () {
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _webPopupNotification = null;
-      });
-    });
-  }
-
   void _startReply(ChatMessage message) {
     if (message.type == MessageType.system) {
       return;
@@ -388,13 +353,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
     final query = context.query.trim().toLowerCase();
     final candidates = chatProvider.mentionCandidates;
-    final suggestions = candidates.where((name) {
-      final normalized = name.trim().toLowerCase();
-      if (normalized.isEmpty) {
-        return false;
-      }
-      return query.isEmpty || normalized.contains(query);
-    }).toList(growable: false);
+    final suggestions = candidates
+        .where((name) {
+          final normalized = name.trim().toLowerCase();
+          if (normalized.isEmpty) {
+            return false;
+          }
+          return query.isEmpty || normalized.contains(query);
+        })
+        .toList(growable: false);
 
     _mentionContext = context;
     _mentionSuggestions = suggestions.take(8).toList(growable: false);
@@ -426,7 +393,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       return null;
     }
 
-    return _MentionQueryContext(start: atIndex, end: cursorOffset, query: query);
+    return _MentionQueryContext(
+      start: atIndex,
+      end: cursorOffset,
+      query: query,
+    );
   }
 
   void _clearMentionSuggestions() {
@@ -601,7 +572,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
 
     if (error != null) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(error)));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error)));
       return;
     }
 
@@ -714,7 +687,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       builder: (dialogContext) {
         return AlertDialog(
           title: const Text('Удалить сообщение'),
-          content: const Text('Сообщение будет скрыто для всех участников чата.'),
+          content: const Text(
+            'Сообщение будет скрыто для всех участников чата.',
+          ),
           actions: [
             TextButton(
               onPressed: () => Navigator.of(dialogContext).pop(false),
@@ -760,6 +735,120 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     ChatMessage message,
   ) async {
     await chatProvider.togglePinForChat(message);
+  }
+
+  Future<void> _forwardMessage(
+    ChatProvider chatProvider,
+    ChatMessage message,
+  ) async {
+    final targetChatId = await _pickForwardTargetChat(chatProvider);
+    if (!mounted || targetChatId == null) {
+      return;
+    }
+
+    final error = await chatProvider.forwardMessage(
+      message: message,
+      targetChatId: targetChatId,
+    );
+    if (!mounted) {
+      return;
+    }
+
+    final feedback = error ?? 'Сообщение переслано.';
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(feedback)));
+  }
+
+  Future<String?> _pickForwardTargetChat(ChatProvider chatProvider) async {
+    final source = chatProvider.chats;
+    var query = '';
+    String? selectedChatId;
+
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (sheetContext) {
+        return StatefulBuilder(
+          builder: (sheetContext, setSheetState) {
+            final threads = _resolveSidebarThreads(
+              chatProvider: chatProvider,
+              source: source,
+              query: query,
+            );
+
+            return SafeArea(
+              child: Padding(
+                padding: EdgeInsets.only(
+                  left: 12,
+                  right: 12,
+                  top: 8,
+                  bottom: MediaQuery.of(sheetContext).viewInsets.bottom + 12,
+                ),
+                child: SizedBox(
+                  height: MediaQuery.of(sheetContext).size.height * 0.75,
+                  child: Column(
+                    children: [
+                      TextField(
+                        onChanged: (value) {
+                          setSheetState(() {
+                            query = value;
+                          });
+                        },
+                        decoration: const InputDecoration(
+                          hintText: 'Куда переслать',
+                          prefixIcon: Icon(Icons.search_rounded),
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      Expanded(
+                        child: threads.isEmpty
+                            ? const Center(child: Text('Чат не найден'))
+                            : ListView.builder(
+                                itemCount: threads.length,
+                                itemBuilder: (context, index) {
+                                  final thread = threads[index];
+                                  final preview =
+                                      thread.lastMessagePreview?.trim() ?? '';
+                                  final title = _displayThreadTitle(thread);
+                                  return ListTile(
+                                    leading: Icon(
+                                      thread.type == ChatThreadType.group
+                                          ? Icons.groups_rounded
+                                          : Icons.person_rounded,
+                                    ),
+                                    title: Text(title),
+                                    subtitle: preview.isEmpty
+                                        ? null
+                                        : Text(
+                                            preview,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                          ),
+                                    trailing:
+                                        thread.id == chatProvider.selectedChatId
+                                        ? const Icon(Icons.check_circle_outline)
+                                        : null,
+                                    onTap: () {
+                                      selectedChatId = thread.id;
+                                      Navigator.of(sheetContext).pop();
+                                    },
+                                  );
+                                },
+                              ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+
+    return selectedChatId;
   }
 
   List<ChatMessage> _filteredMessagesForView(
@@ -821,11 +910,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
     final chats = chatProvider.chats;
     final messages = chatProvider.messages;
-    final latestNotification = chatProvider.latestNotification;
     final canSend = _messageController.text.trim().isNotEmpty;
 
     _maybeScrollOnNewMessage(messages.length);
-    _syncWebMessagePopup(latestNotification);
 
     return Scaffold(
       appBar: AppBar(
@@ -944,15 +1031,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         ],
       ),
       body: SafeArea(
-        child: Stack(
-          children: [
-            _selectedTab == 0
-                ? _buildChatTab(chatProvider, chats, messages, canSend)
-                : _buildSettingsTab(chatProvider),
-            if (kIsWeb && _webPopupNotification != null)
-              _buildWebMessagePopup(_webPopupNotification!),
-          ],
-        ),
+        child: _selectedTab == 0
+            ? _buildChatTab(chatProvider, chats, messages, canSend)
+            : _buildSettingsTab(chatProvider),
       ),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _selectedTab,
@@ -1287,7 +1368,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   Expanded(
                     child: Text(
                       ((pinned.text ?? '').trim().isEmpty
-                              ? (pinned.attachment?.name ?? 'Закрепленное сообщение')
+                              ? (pinned.attachment?.name ??
+                                    'Закрепленное сообщение')
                               : pinned.text!)
                           .trim(),
                       maxLines: 1,
@@ -1331,6 +1413,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 onReply: message.type == MessageType.system
                     ? null
                     : _startReply,
+                onForward: message.type == MessageType.system
+                    ? null
+                    : (msg) => _forwardMessage(chatProvider, msg),
                 onEdit: (message.type == MessageType.system || !isMine)
                     ? null
                     : (msg) => _editMessage(chatProvider, msg),
@@ -1644,53 +1729,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  Widget _buildWebMessagePopup(AppNotification notification) {
-    final theme = Theme.of(context);
-    return Positioned.fill(
-      child: IgnorePointer(
-        child: Container(
-          color: Colors.black.withAlpha(70),
-          alignment: Alignment.center,
-          child: Container(
-            constraints: const BoxConstraints(maxWidth: 420),
-            margin: const EdgeInsets.symmetric(horizontal: 16),
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-            decoration: BoxDecoration(
-              color: theme.colorScheme.surface,
-              borderRadius: BorderRadius.circular(14),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withAlpha(70),
-                  blurRadius: 20,
-                  offset: const Offset(0, 8),
-                ),
-              ],
-            ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  notification.title,
-                  style: theme.textTheme.titleSmall?.copyWith(
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-                const SizedBox(height: 6),
-                Text(
-                  notification.description,
-                  maxLines: 3,
-                  overflow: TextOverflow.ellipsis,
-                  style: theme.textTheme.bodyMedium,
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
   Widget _buildUpdateBanner(ChatProvider chatProvider) {
     final theme = Theme.of(context);
     final latestBuild = chatProvider.latestBuild ?? 0;
@@ -1811,7 +1849,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   return ListTile(
                     dense: true,
                     leading: const Icon(Icons.alternate_email_rounded),
-                    title: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis),
+                    title: Text(
+                      name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
                     onTap: () => _insertMention(name),
                   );
                 },
