@@ -8,14 +8,23 @@ class MessageBubble extends StatelessWidget {
     super.key,
     required this.message,
     required this.isMine,
+    required this.currentUserLower,
     this.onAttachmentTap,
     this.onReply,
+    this.onEdit,
+    this.onDelete,
+    this.onReactionToggle,
   });
 
   final ChatMessage message;
   final bool isMine;
+  final String currentUserLower;
   final VoidCallback? onAttachmentTap;
   final ValueChanged<ChatMessage>? onReply;
+  final ValueChanged<ChatMessage>? onEdit;
+  final ValueChanged<ChatMessage>? onDelete;
+  final Future<void> Function(ChatMessage message, String reaction)?
+  onReactionToggle;
 
   @override
   Widget build(BuildContext context) {
@@ -42,7 +51,9 @@ class MessageBubble extends StatelessWidget {
     }
 
     final hasFile =
-        message.type == MessageType.file && message.attachment != null;
+        message.type == MessageType.file &&
+        message.attachment != null &&
+        !message.isDeleted;
     final bubbleColor = isMine
         ? theme.colorScheme.primary
         : theme.colorScheme.surface;
@@ -50,6 +61,10 @@ class MessageBubble extends StatelessWidget {
         ? theme.colorScheme.onPrimary
         : theme.colorScheme.onSurface;
     final senderLabel = isMine ? 'Вы' : message.senderName;
+    final messageText = message.isDeleted
+        ? 'Сообщение удалено'
+        : (message.text ?? '');
+    final quickReactions = const <String>['👍', '❤️', '🔥', '😂', '👏', '😮'];
 
     return Align(
       alignment: isMine ? Alignment.centerRight : Alignment.centerLeft,
@@ -99,14 +114,80 @@ class MessageBubble extends StatelessWidget {
               ],
             ] else
               Text(
-                message.text ?? '',
-                style: TextStyle(color: textColor, fontSize: 15),
+                messageText,
+                style: TextStyle(
+                  color: textColor,
+                  fontSize: 15,
+                  fontStyle: message.isDeleted
+                      ? FontStyle.italic
+                      : FontStyle.normal,
+                ),
               ),
+            if (message.reactions.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                children: message.reactions.entries.map((entry) {
+                  final users = entry.value;
+                  final reactedByMe = users.any(
+                    (user) => user.trim().toLowerCase() == currentUserLower,
+                  );
+                  return InkWell(
+                    borderRadius: BorderRadius.circular(12),
+                    onTap: onReactionToggle == null
+                        ? null
+                        : () => onReactionToggle!(message, entry.key),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 4,
+                      ),
+                      decoration: BoxDecoration(
+                        color: reactedByMe
+                            ? textColor.withAlpha(34)
+                            : Colors.transparent,
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: textColor.withAlpha(90)),
+                      ),
+                      child: Text(
+                        '${entry.key} ${users.length}',
+                        style: TextStyle(
+                          color: textColor.withAlpha(220),
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  );
+                }).toList(growable: false),
+              ),
+            ],
             const SizedBox(height: 4),
             Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                if (onReply != null)
+                if (onReactionToggle != null && !message.isDeleted)
+                  PopupMenuButton<String>(
+                    padding: EdgeInsets.zero,
+                    iconSize: 17,
+                    icon: Icon(
+                      Icons.add_reaction_outlined,
+                      color: textColor.withAlpha(170),
+                    ),
+                    onSelected: (reaction) {
+                      onReactionToggle!(message, reaction);
+                    },
+                    itemBuilder: (context) => quickReactions
+                        .map(
+                          (reaction) => PopupMenuItem<String>(
+                            value: reaction,
+                            child: Text(reaction),
+                          ),
+                        )
+                        .toList(growable: false),
+                  ),
+                if (onReply != null && !message.isDeleted)
                   InkWell(
                     borderRadius: BorderRadius.circular(8),
                     onTap: () => onReply!(message),
@@ -119,7 +200,38 @@ class MessageBubble extends StatelessWidget {
                       ),
                     ),
                   ),
-                if (onReply != null) const SizedBox(width: 4),
+                if ((onEdit != null || onDelete != null) &&
+                    isMine &&
+                    !message.isDeleted)
+                  PopupMenuButton<String>(
+                    padding: EdgeInsets.zero,
+                    iconSize: 17,
+                    icon: Icon(
+                      Icons.more_horiz_rounded,
+                      color: textColor.withAlpha(170),
+                    ),
+                    onSelected: (value) {
+                      if (value == 'edit') {
+                        onEdit?.call(message);
+                      } else if (value == 'delete') {
+                        onDelete?.call(message);
+                      }
+                    },
+                    itemBuilder: (context) => <PopupMenuEntry<String>>[
+                      if (onEdit != null)
+                        const PopupMenuItem<String>(
+                          value: 'edit',
+                          child: Text('Редактировать'),
+                        ),
+                      if (onDelete != null)
+                        const PopupMenuItem<String>(
+                          value: 'delete',
+                          child: Text('Удалить'),
+                        ),
+                    ],
+                  ),
+                if (onReply != null || onReactionToggle != null)
+                  const SizedBox(width: 4),
                 Text(
                   DateFormat('HH:mm').format(message.createdAt),
                   style: TextStyle(
@@ -127,6 +239,30 @@ class MessageBubble extends StatelessWidget {
                     fontSize: 11,
                   ),
                 ),
+                if (message.isEdited && !message.isDeleted) ...[
+                  const SizedBox(width: 6),
+                  Text(
+                    'изм.',
+                    style: TextStyle(
+                      color: textColor.withAlpha(170),
+                      fontSize: 10,
+                    ),
+                  ),
+                ],
+                if (isMine && !message.isDeleted) ...[
+                  const SizedBox(width: 6),
+                  Icon(
+                    message.readBy.length > 1
+                        ? Icons.done_all_rounded
+                        : (message.deliveredTo.length > 1
+                              ? Icons.done_all_rounded
+                              : Icons.done_rounded),
+                    size: 15,
+                    color: message.readBy.length > 1
+                        ? Colors.lightBlueAccent
+                        : textColor.withAlpha(170),
+                  ),
+                ],
               ],
             ),
           ],

@@ -83,6 +83,32 @@ class MessageReplyInfo {
   }
 }
 
+class MessageEditHistoryItem {
+  const MessageEditHistoryItem({
+    required this.text,
+    required this.editedAt,
+  });
+
+  factory MessageEditHistoryItem.fromJson(Map<String, dynamic> json) {
+    return MessageEditHistoryItem(
+      text: (json['text']?.toString() ?? '').trim(),
+      editedAt:
+          DateTime.tryParse(json['editedAt']?.toString() ?? '') ??
+          DateTime.now(),
+    );
+  }
+
+  final String text;
+  final DateTime editedAt;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'text': text,
+      'editedAt': editedAt.toUtc().toIso8601String(),
+    };
+  }
+}
+
 class ChatMessage {
   const ChatMessage({
     required this.id,
@@ -92,6 +118,17 @@ class ChatMessage {
     required this.createdAt,
     required this.type,
     required this.isScheduled,
+    this.isEdited = false,
+    this.editedAt,
+    this.isDeleted = false,
+    this.deletedAt,
+    this.editHistory = const <MessageEditHistoryItem>[],
+    this.reactions = const <String, List<String>>{},
+    this.mentions = const <String>[],
+    this.deliveredTo = const <String>[],
+    this.readBy = const <String>[],
+    this.isEncrypted = false,
+    this.encryption,
     this.text,
     this.attachment,
     this.replyTo,
@@ -100,6 +137,8 @@ class ChatMessage {
   factory ChatMessage.fromJson(Map<String, dynamic> json) {
     final attachmentJson = json['attachment'];
     final replyJson = json['replyTo'];
+    final reactionsJson = json['reactions'];
+    final editHistoryRaw = json['editHistory'];
 
     return ChatMessage(
       id: json['id']?.toString() ?? '',
@@ -111,6 +150,57 @@ class ChatMessage {
           DateTime.now(),
       type: MessageTypeX.fromValue(json['type']?.toString() ?? 'text'),
       isScheduled: json['scheduled'] == true,
+      isEdited: json['edited'] == true || json['isEdited'] == true,
+      editedAt: DateTime.tryParse(json['editedAt']?.toString() ?? ''),
+      isDeleted: json['deleted'] == true || json['isDeleted'] == true,
+      deletedAt: DateTime.tryParse(json['deletedAt']?.toString() ?? ''),
+      editHistory: editHistoryRaw is List
+          ? editHistoryRaw
+                .map(
+                  (item) => item is Map
+                      ? MessageEditHistoryItem.fromJson(
+                          item.cast<String, dynamic>(),
+                        )
+                      : null,
+                )
+                .whereType<MessageEditHistoryItem>()
+                .toList(growable: false)
+          : const <MessageEditHistoryItem>[],
+      reactions: reactionsJson is Map
+          ? reactionsJson.map<String, List<String>>((key, value) {
+              final users = value is List
+                  ? value
+                        .map((entry) => entry.toString().trim())
+                        .where((entry) => entry.isNotEmpty)
+                        .toList(growable: false)
+                  : const <String>[];
+              return MapEntry(key.toString(), users);
+            })
+          : const <String, List<String>>{},
+      mentions: json['mentions'] is List
+          ? (json['mentions'] as List)
+                .map((entry) => entry.toString().trim().toLowerCase())
+                .where((entry) => entry.isNotEmpty)
+                .toList(growable: false)
+          : const <String>[],
+      deliveredTo: json['deliveredTo'] is List
+          ? (json['deliveredTo'] as List)
+                .map((entry) => entry.toString().trim().toLowerCase())
+                .where((entry) => entry.isNotEmpty)
+                .toList(growable: false)
+          : const <String>[],
+      readBy: json['readBy'] is List
+          ? (json['readBy'] as List)
+                .map((entry) => entry.toString().trim().toLowerCase())
+                .where((entry) => entry.isNotEmpty)
+                .toList(growable: false)
+          : const <String>[],
+      isEncrypted: json['encrypted'] == true || json['isEncrypted'] == true,
+      encryption: json['encryption'] is Map<String, dynamic>
+          ? json['encryption'] as Map<String, dynamic>
+          : json['encryption'] is Map
+          ? (json['encryption'] as Map).cast<String, dynamic>()
+          : null,
       text: json['text']?.toString(),
       attachment: attachmentJson is Map<String, dynamic>
           ? MessageAttachment.fromJson(attachmentJson)
@@ -144,6 +234,10 @@ class ChatMessage {
       isScheduled: false,
       text: text,
       replyTo: replyTo,
+      mentions: const <String>[],
+      reactions: const <String, List<String>>{},
+      deliveredTo: const <String>[],
+      readBy: const <String>[],
     );
   }
 
@@ -168,6 +262,10 @@ class ChatMessage {
       text: text,
       attachment: attachment,
       replyTo: replyTo,
+      mentions: const <String>[],
+      reactions: const <String, List<String>>{},
+      deliveredTo: const <String>[],
+      readBy: const <String>[],
     );
   }
 
@@ -186,6 +284,10 @@ class ChatMessage {
       type: MessageType.system,
       isScheduled: false,
       text: text,
+      mentions: const <String>[],
+      reactions: const <String, List<String>>{},
+      deliveredTo: const <String>[],
+      readBy: const <String>[],
     );
   }
 
@@ -196,9 +298,81 @@ class ChatMessage {
   final DateTime createdAt;
   final MessageType type;
   final bool isScheduled;
+  final bool isEdited;
+  final DateTime? editedAt;
+  final bool isDeleted;
+  final DateTime? deletedAt;
+  final List<MessageEditHistoryItem> editHistory;
+  final Map<String, List<String>> reactions;
+  final List<String> mentions;
+  final List<String> deliveredTo;
+  final List<String> readBy;
+  final bool isEncrypted;
+  final Map<String, dynamic>? encryption;
   final String? text;
   final MessageAttachment? attachment;
   final MessageReplyInfo? replyTo;
+
+  bool get isVoiceMessage {
+    if (type != MessageType.file || attachment == null) {
+      return false;
+    }
+    final extension = attachment!.extension.trim().toLowerCase();
+    return extension == 'm4a' ||
+        extension == 'aac' ||
+        extension == 'wav' ||
+        extension == 'ogg' ||
+        extension == 'mp3' ||
+        extension == 'opus';
+  }
+
+  ChatMessage copyWith({
+    String? id,
+    String? chatId,
+    String? senderId,
+    String? senderName,
+    DateTime? createdAt,
+    MessageType? type,
+    bool? isScheduled,
+    bool? isEdited,
+    DateTime? editedAt,
+    bool? isDeleted,
+    DateTime? deletedAt,
+    List<MessageEditHistoryItem>? editHistory,
+    Map<String, List<String>>? reactions,
+    List<String>? mentions,
+    List<String>? deliveredTo,
+    List<String>? readBy,
+    bool? isEncrypted,
+    Map<String, dynamic>? encryption,
+    String? text,
+    MessageAttachment? attachment,
+    MessageReplyInfo? replyTo,
+  }) {
+    return ChatMessage(
+      id: id ?? this.id,
+      chatId: chatId ?? this.chatId,
+      senderId: senderId ?? this.senderId,
+      senderName: senderName ?? this.senderName,
+      createdAt: createdAt ?? this.createdAt,
+      type: type ?? this.type,
+      isScheduled: isScheduled ?? this.isScheduled,
+      isEdited: isEdited ?? this.isEdited,
+      editedAt: editedAt ?? this.editedAt,
+      isDeleted: isDeleted ?? this.isDeleted,
+      deletedAt: deletedAt ?? this.deletedAt,
+      editHistory: editHistory ?? this.editHistory,
+      reactions: reactions ?? this.reactions,
+      mentions: mentions ?? this.mentions,
+      deliveredTo: deliveredTo ?? this.deliveredTo,
+      readBy: readBy ?? this.readBy,
+      isEncrypted: isEncrypted ?? this.isEncrypted,
+      encryption: encryption ?? this.encryption,
+      text: text ?? this.text,
+      attachment: attachment ?? this.attachment,
+      replyTo: replyTo ?? this.replyTo,
+    );
+  }
 
   Map<String, dynamic> toJson() {
     return {
@@ -209,6 +383,17 @@ class ChatMessage {
       'createdAt': createdAt.toUtc().toIso8601String(),
       'type': type.value,
       'scheduled': isScheduled,
+      'edited': isEdited,
+      'editedAt': editedAt?.toUtc().toIso8601String(),
+      'deleted': isDeleted,
+      'deletedAt': deletedAt?.toUtc().toIso8601String(),
+      'editHistory': editHistory.map((item) => item.toJson()).toList(),
+      'reactions': reactions,
+      'mentions': mentions,
+      'deliveredTo': deliveredTo,
+      'readBy': readBy,
+      'encrypted': isEncrypted,
+      'encryption': encryption,
       'text': text,
       'attachment': attachment?.toJson(),
       'replyTo': replyTo?.toJson(),

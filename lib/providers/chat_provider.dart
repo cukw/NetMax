@@ -53,6 +53,7 @@ class ChatProvider extends ChangeNotifier {
       'proxy_subscription_sources';
   static const String _dismissedUpdateSignatureKey =
       'dismissed_update_signature';
+  static const String _e2eeSecretKey = 'e2ee_secret';
 
   static const String _defaultServerUrl = 'ws://localhost:8080/ws';
   static const String _defaultSubscriptionSourcesRaw = String.fromEnvironment(
@@ -110,6 +111,7 @@ class ChatProvider extends ChangeNotifier {
   String _serverUrl = _defaultServerUrl;
   String _userName = '';
   String _userId = '';
+  String _e2eeSecret = '';
   String? _pendingPasswordForAuth;
   final Map<String, String> _passwordsByUserLower = <String, String>{};
 
@@ -172,6 +174,8 @@ class ChatProvider extends ChangeNotifier {
   String get serverUrl => _serverUrl;
   String get userName => _userName;
   String get userId => _userId;
+  String get encryptionKey => _e2eeSecret;
+  bool get isEncryptionEnabled => _e2eeSecret.trim().isNotEmpty;
   String? get lastError => _lastError;
 
   bool get isPickingFile => _isPickingFile;
@@ -325,6 +329,7 @@ class ChatProvider extends ChangeNotifier {
     _selectedChatId = normalized;
     _typingUsers.clear();
     _unreadByChatId[_selectedChatId] = 0;
+    _markSelectedChatMessagesAsRead();
     _safeNotify();
   }
 
@@ -456,6 +461,9 @@ class ChatProvider extends ChangeNotifier {
     final senderPrefix = isMyMessage(message)
         ? 'Вы: '
         : '${message.senderName}: ';
+    if (message.isDeleted) {
+      return '$senderPrefixСообщение удалено';
+    }
     if (message.type == MessageType.file) {
       final attachmentName = message.attachment?.name ?? 'Файл';
       final caption = (message.text ?? '').trim();
@@ -783,6 +791,7 @@ class ChatProvider extends ChangeNotifier {
       ..addAll(_parseSourceUrls(storedProxySourcesRaw));
 
     _userName = (prefs.getString(_userNameKey) ?? '').trim();
+    _e2eeSecret = (prefs.getString(_e2eeSecretKey) ?? '').trim();
 
     final storedUserId = (prefs.getString(_userIdKey) ?? '').trim();
     _userId = storedUserId.isEmpty ? _nextId() : storedUserId;
@@ -809,6 +818,7 @@ class ChatProvider extends ChangeNotifier {
     required String password,
     String? subscriptionSources,
     String? proxySubscriptionSources,
+    String? encryptionKey,
   }) async {
     final normalizedServerUrl = _normalizeServerUrl(serverUrl);
     final normalizedUserName = userName.trim();
@@ -833,6 +843,9 @@ class ChatProvider extends ChangeNotifier {
 
     _serverUrl = normalizedServerUrl;
     _userName = normalizedUserName;
+    if (encryptionKey != null) {
+      _e2eeSecret = encryptionKey.trim();
+    }
     _isScheduledAllowedByServer = _isScheduledAllowedForUser(_userName);
     _pendingPasswordForAuth = effectivePassword;
 
@@ -842,6 +855,9 @@ class ChatProvider extends ChangeNotifier {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_serverUrlKey, _serverUrl);
     await prefs.setString(_userNameKey, _userName);
+    if (encryptionKey != null) {
+      await prefs.setString(_e2eeSecretKey, _e2eeSecret);
+    }
     if (subscriptionSources != null) {
       _subscriptionSources
         ..clear()
@@ -1068,6 +1084,9 @@ class ChatProvider extends ChangeNotifier {
         case 'message':
           _handleMessage(payload);
           break;
+        case 'message_updated':
+          _handleMessageUpdated(payload);
+          break;
         case 'scheduled_config':
           _handleScheduledConfig(payload);
           break;
@@ -1240,7 +1259,7 @@ class ChatProvider extends ChangeNotifier {
     if (messagesRaw is List) {
       for (final item in messagesRaw) {
         final map = _asMap(item);
-        final message = ChatMessage.fromJson(map);
+        final message = _messageFromServerPayload(map);
         if (message.id.isEmpty || _messageIds.contains(message.id)) {
           continue;
         }
@@ -1253,6 +1272,7 @@ class ChatProvider extends ChangeNotifier {
     _messages.sort((a, b) => a.createdAt.compareTo(b.createdAt));
     _syncDirectChats();
     _ensureSelectedChatExists();
+    _markSelectedChatMessagesAsRead();
 
     if (_messages.isEmpty) {
       _messages.add(
@@ -1338,7 +1358,7 @@ class ChatProvider extends ChangeNotifier {
   }
 
   void _handleMessage(Map<String, dynamic> payload) {
-    final message = ChatMessage.fromJson(payload);
+    final message = _messageFromServerPayload(payload);
     if (message.id.isEmpty) {
       return;
     }
@@ -1349,6 +1369,11 @@ class ChatProvider extends ChangeNotifier {
     }
 
     final isMine = isMyMessage(message);
+    _sendDeliveryReceiptIfNeeded(message);
+    if (!isMine && message.chatId == _selectedChatId) {
+      _sendReadReceiptIfNeeded(message);
+    }
+
     if (!isMine && message.chatId != _selectedChatId) {
       _unreadByChatId[message.chatId] =
           (_unreadByChatId[message.chatId] ?? 0) + 1;
@@ -1360,15 +1385,36 @@ class ChatProvider extends ChangeNotifier {
       final messageText = (message.text ?? '').trim();
       final bodyText = isFile
           ? (messageText.isEmpty ? fileName : '$fileName — $messageText')
-          : messageText;
+          : (messageText.isEmpty ? 'Сообщение' : messageText);
+      final isMentioned = _isMentionedInMessage(message);
+      final title = isMentioned
+          ? 'Упоминание в чате'
+          : (isFile ? 'Новый файл' : 'Новое сообщение');
       _pushNotification(
         kind: NotificationKind.message,
-        title: isFile ? 'Новый файл' : 'Новое сообщение',
+        title: title,
         description: '${message.senderName}: $bodyText',
         showInSystem: true,
       );
     }
 
+    _safeNotify();
+  }
+
+  void _handleMessageUpdated(Map<String, dynamic> payload) {
+    final message = _messageFromServerPayload(payload);
+    if (message.id.isEmpty) {
+      return;
+    }
+
+    final changed = _upsertLocalMessage(message);
+    if (!changed) {
+      return;
+    }
+
+    if (!isMyMessage(message) && message.chatId == _selectedChatId) {
+      _sendReadReceiptIfNeeded(message);
+    }
     _safeNotify();
   }
 
@@ -1381,6 +1427,119 @@ class ChatProvider extends ChangeNotifier {
     _messages.add(message);
     _messages.sort((a, b) => a.createdAt.compareTo(b.createdAt));
     return true;
+  }
+
+  bool _upsertLocalMessage(ChatMessage message) {
+    final index = _messages.indexWhere((item) => item.id == message.id);
+    if (index < 0) {
+      return _appendLocalMessage(message);
+    }
+
+    final current = _messages[index];
+    if (current.toJson().toString() == message.toJson().toString()) {
+      return false;
+    }
+
+    _messages[index] = message;
+    _messages.sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    return true;
+  }
+
+  ChatMessage _messageFromServerPayload(Map<String, dynamic> payload) {
+    final normalized = Map<String, dynamic>.from(payload);
+    if (normalized['encrypted'] == true) {
+      final decryptedText = _decryptTextPayload(
+        (normalized['text']?.toString() ?? ''),
+        _asMap(normalized['encryption']),
+      );
+      if (decryptedText != null) {
+        normalized['text'] = decryptedText;
+      } else {
+        normalized['text'] = '[Не удалось расшифровать]';
+      }
+
+      final editHistoryRaw = normalized['editHistory'];
+      if (editHistoryRaw is List) {
+        final normalizedHistory = <Map<String, dynamic>>[];
+        for (final item in editHistoryRaw) {
+          final map = _asMap(item);
+          final decrypted = _decryptTextPayload(
+            (map['text']?.toString() ?? ''),
+            map['encryption'] is Map
+                ? _asMap(map['encryption'])
+                : _asMap(normalized['encryption']),
+          );
+          normalizedHistory.add(<String, dynamic>{
+            'text': decrypted ?? '[Не удалось расшифровать]',
+            'editedAt': map['editedAt'],
+            if (map['encryption'] is Map) 'encryption': _asMap(map['encryption']),
+          });
+        }
+        normalized['editHistory'] = normalizedHistory;
+      }
+    }
+
+    return ChatMessage.fromJson(normalized);
+  }
+
+  bool _isMentionedInMessage(ChatMessage message) {
+    final meLower = _userName.trim().toLowerCase();
+    if (meLower.isEmpty) {
+      return false;
+    }
+    return message.mentions.contains(meLower);
+  }
+
+  void _sendDeliveryReceiptIfNeeded(ChatMessage message) {
+    if (!isConnected || isMyMessage(message)) {
+      return;
+    }
+
+    final meLower = _userName.trim().toLowerCase();
+    if (meLower.isEmpty) {
+      return;
+    }
+    if (message.deliveredTo.contains(meLower)) {
+      return;
+    }
+
+    _sendEnvelope(
+      type: 'message_delivered',
+      payload: <String, dynamic>{'id': message.id},
+    );
+  }
+
+  void _sendReadReceiptIfNeeded(ChatMessage message) {
+    if (!isConnected || isMyMessage(message)) {
+      return;
+    }
+
+    final meLower = _userName.trim().toLowerCase();
+    if (meLower.isEmpty) {
+      return;
+    }
+    if (message.readBy.contains(meLower)) {
+      return;
+    }
+
+    _sendEnvelope(
+      type: 'message_read',
+      payload: <String, dynamic>{'id': message.id},
+    );
+  }
+
+  void _markSelectedChatMessagesAsRead() {
+    if (!isConnected) {
+      return;
+    }
+
+    final selectedChat = _selectedChatId;
+    for (final message in _messages) {
+      if (message.chatId != selectedChat) {
+        continue;
+      }
+      _sendReadReceiptIfNeeded(message);
+    }
   }
 
   void _handleServerError(Map<String, dynamic> payload) {
@@ -1505,6 +1664,7 @@ class ChatProvider extends ChangeNotifier {
           ? null
           : _replyPayloadFromMessage(replyTo);
       final createdAtIso = createdAt.toUtc().toIso8601String();
+      final mentions = _extractMentionsFromText(text);
       final added = _appendLocalMessage(
         ChatMessage.text(
           id: messageId,
@@ -1516,6 +1676,10 @@ class ChatProvider extends ChangeNotifier {
           replyTo: replyPayload == null
               ? null
               : MessageReplyInfo.fromJson(replyPayload),
+        ).copyWith(
+          mentions: mentions,
+          deliveredTo: <String>[_userName.trim().toLowerCase()],
+          readBy: <String>[_userName.trim().toLowerCase()],
         ),
       );
       if (added) {
@@ -1535,18 +1699,101 @@ class ChatProvider extends ChangeNotifier {
       return;
     }
 
+    final encryptedPayload = _encryptTextPayload(text);
+    final outgoingText = encryptedPayload?.cipherText ?? text;
+    final mentions = _extractMentionsFromText(text);
+
     _sendEnvelope(
       type: 'message',
       payload: {
         'id': _nextId(),
-        'text': text,
+        'text': outgoingText,
         'chatId': _selectedChatId,
+        'mentions': mentions,
+        if (encryptedPayload != null) 'encrypted': true,
+        if (encryptedPayload != null)
+          'encryption': <String, dynamic>{
+            'method': 'xor-v1',
+            'nonce': encryptedPayload.nonceBase64,
+          },
         if (replyTo != null) 'replyTo': _replyPayloadFromMessage(replyTo),
         'createdAt': DateTime.now().toUtc().toIso8601String(),
       },
     );
 
     updateTypingStatus('');
+  }
+
+  Future<String?> editMessage({
+    required ChatMessage message,
+    required String text,
+  }) async {
+    final normalizedText = text.trim();
+    if (normalizedText.isEmpty) {
+      return 'Текст сообщения не может быть пустым.';
+    }
+    if (!isConnected) {
+      return 'Нет подключения к серверу.';
+    }
+    if (!isMyMessage(message)) {
+      return 'Редактировать можно только свои сообщения.';
+    }
+    if (message.isDeleted) {
+      return 'Удаленное сообщение нельзя редактировать.';
+    }
+    if (message.type != MessageType.text && message.type != MessageType.file) {
+      return 'Этот тип сообщения нельзя редактировать.';
+    }
+
+    final encrypted = message.isEncrypted
+        ? _encryptTextPayload(normalizedText)
+        : null;
+    if (message.isEncrypted && encrypted == null) {
+      return 'Для редактирования зашифрованного сообщения нужен ключ шифрования.';
+    }
+    _sendEnvelope(
+      type: 'message_edit',
+      payload: <String, dynamic>{
+        'id': message.id,
+        'text': encrypted?.cipherText ?? normalizedText,
+        'mentions': _extractMentionsFromText(normalizedText),
+        if (encrypted != null) 'encrypted': true,
+        if (encrypted != null)
+          'encryption': <String, dynamic>{
+            'method': 'xor-v1',
+            'nonce': encrypted.nonceBase64,
+          },
+      },
+    );
+    return null;
+  }
+
+  Future<String?> deleteMessage(ChatMessage message) async {
+    if (!isConnected) {
+      return 'Нет подключения к серверу.';
+    }
+    if (!isMyMessage(message)) {
+      return 'Удалять можно только свои сообщения.';
+    }
+    if (message.isDeleted) {
+      return null;
+    }
+    _sendEnvelope(
+      type: 'message_delete',
+      payload: <String, dynamic>{'id': message.id},
+    );
+    return null;
+  }
+
+  Future<void> toggleReaction(ChatMessage message, String reaction) async {
+    final normalized = reaction.trim();
+    if (normalized.isEmpty || !isConnected || message.isDeleted) {
+      return;
+    }
+    _sendEnvelope(
+      type: 'message_reaction_toggle',
+      payload: <String, dynamic>{'id': message.id, 'reaction': normalized},
+    );
   }
 
   Future<PreparedFileUpload?> pickFileForSending() async {
@@ -1622,6 +1869,13 @@ class ChatProvider extends ChangeNotifier {
     }
 
     final normalizedCaption = caption.trim();
+    final encryptedCaption = normalizedCaption.isEmpty
+        ? null
+        : _encryptTextPayload(normalizedCaption);
+    final outgoingCaption = encryptedCaption?.cipherText ?? normalizedCaption;
+    final mentions = normalizedCaption.isEmpty
+        ? const <String>[]
+        : _extractMentionsFromText(normalizedCaption);
 
     _sendEnvelope(
       type: 'file',
@@ -1632,7 +1886,14 @@ class ChatProvider extends ChangeNotifier {
         'extension': file.extension,
         'sizeBytes': file.sizeBytes,
         'contentBase64': base64Encode(file.bytes),
-        'text': normalizedCaption,
+        'text': outgoingCaption,
+        'mentions': mentions,
+        if (encryptedCaption != null) 'encrypted': true,
+        if (encryptedCaption != null)
+          'encryption': <String, dynamic>{
+            'method': 'xor-v1',
+            'nonce': encryptedCaption.nonceBase64,
+          },
         if (replyTo != null) 'replyTo': _replyPayloadFromMessage(replyTo),
         'createdAt': DateTime.now().toUtc().toIso8601String(),
       },
@@ -1794,6 +2055,77 @@ class ChatProvider extends ChangeNotifier {
       _passwordsByUserKey,
       jsonEncode(_passwordsByUserLower),
     );
+  }
+
+  List<String> _extractMentionsFromText(String text) {
+    final normalized = text.trim().toLowerCase();
+    if (normalized.isEmpty || _allowedUsersByLower.isEmpty) {
+      return const <String>[];
+    }
+
+    final mentions = <String>{};
+    for (final key in _allowedUsersByLower.keys) {
+      if (normalized.contains('@$key')) {
+        mentions.add(key);
+      }
+    }
+    return mentions.toList(growable: false);
+  }
+
+  _EncryptedTextPayload? _encryptTextPayload(String plainText) {
+    final key = _e2eeSecret.trim();
+    if (key.isEmpty) {
+      return null;
+    }
+    final messageBytes = utf8.encode(plainText);
+    if (messageBytes.isEmpty) {
+      return null;
+    }
+
+    final keyBytes = utf8.encode(key);
+    final nonce = List<int>.generate(12, (_) => _random.nextInt(256));
+    final cipher = List<int>.generate(messageBytes.length, (index) {
+      final k = keyBytes[index % keyBytes.length];
+      final n = nonce[index % nonce.length];
+      return messageBytes[index] ^ k ^ n;
+    });
+
+    return _EncryptedTextPayload(
+      cipherText: base64Encode(cipher),
+      nonceBase64: base64Encode(nonce),
+    );
+  }
+
+  String? _decryptTextPayload(
+    String cipherText,
+    Map<String, dynamic>? encryption,
+  ) {
+    final key = _e2eeSecret.trim();
+    if (key.isEmpty) {
+      return null;
+    }
+
+    final nonceRaw = (encryption?['nonce']?.toString() ?? '').trim();
+    if (nonceRaw.isEmpty) {
+      return null;
+    }
+
+    try {
+      final cipher = base64Decode(cipherText);
+      final nonce = base64Decode(nonceRaw);
+      if (cipher.isEmpty || nonce.isEmpty) {
+        return null;
+      }
+      final keyBytes = utf8.encode(key);
+      final plain = List<int>.generate(cipher.length, (index) {
+        final k = keyBytes[index % keyBytes.length];
+        final n = nonce[index % nonce.length];
+        return cipher[index] ^ k ^ n;
+      });
+      return utf8.decode(plain);
+    } catch (_) {
+      return null;
+    }
   }
 
   List<String> _parseSourceUrls(String raw) {
@@ -2946,6 +3278,16 @@ class _MeshPendingMessage {
   final Map<String, dynamic>? replyTo;
   int attempts = 0;
   DateTime? lastAttemptAt;
+}
+
+class _EncryptedTextPayload {
+  const _EncryptedTextPayload({
+    required this.cipherText,
+    required this.nonceBase64,
+  });
+
+  final String cipherText;
+  final String nonceBase64;
 }
 
 class _ServerProbeResult {

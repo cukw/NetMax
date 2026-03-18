@@ -345,6 +345,99 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _ensureMessageInputFocus(force: true);
   }
 
+  Future<void> _editMessage(
+    ChatProvider chatProvider,
+    ChatMessage message,
+  ) async {
+    final controller = TextEditingController(text: message.text ?? '');
+    String? editedText;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: const Text('Редактировать сообщение'),
+          content: TextField(
+            controller: controller,
+            minLines: 2,
+            maxLines: 6,
+            autofocus: true,
+            decoration: const InputDecoration(hintText: 'Новый текст'),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('Отмена'),
+            ),
+            FilledButton(
+              onPressed: () {
+                editedText = controller.text.trim();
+                Navigator.of(dialogContext).pop();
+              },
+              child: const Text('Сохранить'),
+            ),
+          ],
+        );
+      },
+    );
+    controller.dispose();
+
+    if (!mounted || editedText == null) {
+      return;
+    }
+
+    final error = await chatProvider.editMessage(
+      message: message,
+      text: editedText!,
+    );
+    if (!mounted || error == null) {
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(error)));
+  }
+
+  Future<void> _deleteMessage(
+    ChatProvider chatProvider,
+    ChatMessage message,
+  ) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: const Text('Удалить сообщение'),
+          content: const Text('Сообщение будет скрыто для всех участников чата.'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+              child: const Text('Отмена'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(dialogContext).pop(true),
+              child: const Text('Удалить'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (confirmed != true || !mounted) {
+      return;
+    }
+
+    final error = await chatProvider.deleteMessage(message);
+    if (!mounted || error == null) {
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(error)));
+  }
+
+  Future<void> _toggleReaction(
+    ChatProvider chatProvider,
+    ChatMessage message,
+    String reaction,
+  ) async {
+    await chatProvider.toggleReaction(message, reaction);
+  }
+
   void _ensureMessageInputFocus({bool force = false}) {
     if (!mounted || _selectedTab != 0) {
       return;
@@ -815,12 +908,23 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               return MessageBubble(
                 message: message,
                 isMine: isMine,
+                currentUserLower: chatProvider.userName.trim().toLowerCase(),
                 onAttachmentTap: message.attachment == null
                     ? null
                     : () => _openAttachment(chatProvider, message.attachment!),
                 onReply: message.type == MessageType.system
                     ? null
                     : _startReply,
+                onEdit: (message.type == MessageType.system || !isMine)
+                    ? null
+                    : (msg) => _editMessage(chatProvider, msg),
+                onDelete: (message.type == MessageType.system || !isMine)
+                    ? null
+                    : (msg) => _deleteMessage(chatProvider, msg),
+                onReactionToggle: message.type == MessageType.system
+                    ? null
+                    : (msg, reaction) =>
+                          _toggleReaction(chatProvider, msg, reaction),
               );
             },
           ),
@@ -989,6 +1093,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     Text('Сервер: ${chatProvider.serverUrl}'),
                     const SizedBox(height: 4),
                     Text('Пользователь: ${chatProvider.userName}'),
+                    const SizedBox(height: 4),
+                    Text(
+                      'Шифрование: ${chatProvider.isEncryptionEnabled ? "включено" : "выключено"}',
+                    ),
                     const SizedBox(height: 10),
                     FilledButton.tonalIcon(
                       onPressed: () => _openConnectionSheet(chatProvider),
@@ -1347,10 +1455,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
     final userController = TextEditingController(text: chatProvider.userName);
     final passwordController = TextEditingController();
+    final encryptionController = TextEditingController(
+      text: chatProvider.encryptionKey,
+    );
     var hasSavedPassword = chatProvider.hasSavedPasswordForUser(
       userController.text,
     );
     var obscurePassword = true;
+    var obscureEncryption = true;
 
     final future = showModalBottomSheet<void>(
       context: context,
@@ -1450,6 +1562,30 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       ),
                     ),
                   ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: encryptionController,
+                    obscureText: obscureEncryption,
+                    autocorrect: false,
+                    enableSuggestions: false,
+                    decoration: InputDecoration(
+                      labelText: 'Ключ шифрования (опционально)',
+                      hintText:
+                          'Оставьте пустым, чтобы отправлять без шифрования',
+                      suffixIcon: IconButton(
+                        onPressed: () {
+                          setSheetState(() {
+                            obscureEncryption = !obscureEncryption;
+                          });
+                        },
+                        icon: Icon(
+                          obscureEncryption
+                              ? Icons.visibility_off_rounded
+                              : Icons.visibility_rounded,
+                        ),
+                      ),
+                    ),
+                  ),
                   if (hasSavedPassword) ...[
                     const SizedBox(height: 6),
                     Text(
@@ -1481,6 +1617,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                                     subscriptionController.text,
                                 proxySubscriptionSources:
                                     proxySubscriptionController.text,
+                                encryptionKey: encryptionController.text,
                               );
                               if (!context.mounted) {
                                 return;
@@ -1521,6 +1658,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       proxySubscriptionController.dispose();
       userController.dispose();
       passwordController.dispose();
+      encryptionController.dispose();
     });
   }
 

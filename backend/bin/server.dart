@@ -495,6 +495,14 @@ void _dispatchScheduledMessages() {
       'scheduled': true,
       'chatId': groupChatId,
       'chatType': 'group',
+      'edited': false,
+      'deleted': false,
+      'editHistory': const <Object>[],
+      'reactions': const <String, Object>{},
+      'mentions': _normalizeMentions(rawMentions: null, text: text).toList(),
+      'deliveredTo': <String>[rule.userName.toLowerCase()],
+      'readBy': <String>[rule.userName.toLowerCase()],
+      'encrypted': false,
     };
 
     _appendMessage(message);
@@ -595,6 +603,27 @@ String _buildDirectChatId(String firstLower, String secondLower) {
   return 'direct:${parts[0]}|${parts[1]}';
 }
 
+String? _normalizeDirectChatId(String raw) {
+  if (!_isDirectChatId(raw)) {
+    return null;
+  }
+  final tail = raw.substring('direct:'.length);
+  final parts = tail.split('|');
+  if (parts.length != 2) {
+    return null;
+  }
+  final first = parts[0].trim().toLowerCase();
+  final second = parts[1].trim().toLowerCase();
+  if (first.isEmpty || second.isEmpty || first == second) {
+    return null;
+  }
+  if (!_allowedUsersByLower.containsKey(first) ||
+      !_allowedUsersByLower.containsKey(second)) {
+    return null;
+  }
+  return _buildDirectChatId(first, second);
+}
+
 String? _normalizeGroupChatId(String raw, {bool requireExisting = true}) {
   final id = raw.trim().toLowerCase();
   if (id.isEmpty) {
@@ -686,6 +715,28 @@ Map<String, dynamic>? _normalizeLoadedMessage(Map<String, dynamic> raw) {
   final chatIdRaw = (raw['chatId']?.toString() ?? '').trim();
   final chatType = (raw['chatType']?.toString() ?? 'group').trim();
   final replyTo = _normalizeReplyPayload(raw['replyTo']);
+  final isEdited = raw['edited'] == true || raw['isEdited'] == true;
+  final editedAt = _normalizeOptionalIsoTimestamp(raw['editedAt']);
+  final isDeleted = raw['deleted'] == true || raw['isDeleted'] == true;
+  final deletedAt = _normalizeOptionalIsoTimestamp(raw['deletedAt']);
+  final editHistory = _normalizeEditHistory(raw['editHistory']);
+  final reactions = _normalizeReactions(raw['reactions']);
+  final mentions = _normalizeMentions(rawMentions: raw['mentions'], text: text);
+  final deliveredTo = _normalizeUserLowerList(raw['deliveredTo']);
+  final readBy = _normalizeUserLowerList(raw['readBy']);
+  final isEncrypted = raw['encrypted'] == true || raw['isEncrypted'] == true;
+  final encryption = raw['encryption'] is Map ? _asMap(raw['encryption']) : null;
+  final senderLower = senderName.trim().toLowerCase();
+  if (senderLower.isNotEmpty) {
+    if (!deliveredTo.contains(senderLower)) {
+      deliveredTo.add(senderLower);
+    }
+    if (!readBy.contains(senderLower)) {
+      readBy.add(senderLower);
+    }
+  }
+  deliveredTo.sort();
+  readBy.sort();
 
   if (type != 'text' && type != 'file' && type != 'system') {
     return null;
@@ -710,6 +761,17 @@ Map<String, dynamic>? _normalizeLoadedMessage(Map<String, dynamic> raw) {
       'chatId': direct.chatId,
       'chatType': 'direct',
       'participants': direct.participantsLower.toList(),
+      'edited': isEdited,
+      'editedAt': editedAt,
+      'deleted': isDeleted,
+      'deletedAt': deletedAt,
+      'editHistory': editHistory,
+      'reactions': reactions,
+      'mentions': mentions.toList(growable: false),
+      'deliveredTo': deliveredTo,
+      'readBy': readBy,
+      'encrypted': isEncrypted,
+      if (encryption != null) 'encryption': encryption,
       if (replyTo != null) 'replyTo': replyTo,
     };
     if (type == 'file') {
@@ -729,6 +791,17 @@ Map<String, dynamic>? _normalizeLoadedMessage(Map<String, dynamic> raw) {
     'scheduled': isScheduled,
     'chatId': groupChatId,
     'chatType': 'group',
+    'edited': isEdited,
+    'editedAt': editedAt,
+    'deleted': isDeleted,
+    'deletedAt': deletedAt,
+    'editHistory': editHistory,
+    'reactions': reactions,
+    'mentions': mentions.toList(growable: false),
+    'deliveredTo': deliveredTo,
+    'readBy': readBy,
+    'encrypted': isEncrypted,
+    if (encryption != null) 'encryption': encryption,
     if (replyTo != null) 'replyTo': replyTo,
   };
   if (type == 'file') {
@@ -975,7 +1048,7 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
 
             _sendScheduledConfig(channel: channel, userName: userName!);
 
-            // уведа при первом конекте, я бы вообще нахуй дропнул уведы о коннекте если честнро но думай сам
+            // Broadcast presence only for the first active session of user.
             if (isFirstSession) {
               _broadcast(
                 type: 'presence',
@@ -1045,21 +1118,26 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
               'scheduled': false,
               'chatId': directContext?.chatId ?? groupChatId!,
               'chatType': directContext == null ? 'group' : 'direct',
+              'edited': false,
+              'deleted': false,
+              'editHistory': const <Object>[],
+              'reactions': const <String, Object>{},
+              'mentions': _normalizeMentions(
+                rawMentions: payload['mentions'],
+                text: text,
+              ).toList(growable: false),
+              'deliveredTo': <String>[userName!.toLowerCase()],
+              'readBy': <String>[userName!.toLowerCase()],
+              'encrypted': payload['encrypted'] == true,
+              if (payload['encryption'] is Map)
+                'encryption': _asMap(payload['encryption']),
               if (replyTo != null) 'replyTo': replyTo,
               if (directContext != null)
                 'participants': directContext.participantsLower.toList(),
             };
 
             _appendMessage(message);
-            if (directContext == null) {
-              _broadcast(type: 'message', payload: message);
-            } else {
-              _broadcastToParticipants(
-                type: 'message',
-                payload: message,
-                participantsLower: directContext.participantsLower,
-              );
-            }
+            _broadcastMessageToAudience(type: 'message', payload: message);
             break;
 
           case 'typing':
@@ -1117,6 +1195,63 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
               userId: userId!,
               userName: userName!,
               payload: payload,
+            );
+            break;
+
+          case 'message_edit':
+            if (!joined || userId == null || userName == null) {
+              return;
+            }
+            _handleMessageEdit(
+              channel: channel,
+              userId: userId!,
+              userName: userName!,
+              payload: payload,
+            );
+            break;
+
+          case 'message_delete':
+            if (!joined || userId == null || userName == null) {
+              return;
+            }
+            _handleMessageDelete(
+              channel: channel,
+              userId: userId!,
+              userName: userName!,
+              payload: payload,
+            );
+            break;
+
+          case 'message_reaction_toggle':
+            if (!joined || userId == null || userName == null) {
+              return;
+            }
+            _handleMessageReactionToggle(
+              channel: channel,
+              userName: userName!,
+              payload: payload,
+            );
+            break;
+
+          case 'message_delivered':
+            if (!joined || userName == null) {
+              return;
+            }
+            _handleMessageDeliveryState(
+              userName: userName!,
+              payload: payload,
+              markAsRead: false,
+            );
+            break;
+
+          case 'message_read':
+            if (!joined || userName == null) {
+              return;
+            }
+            _handleMessageDeliveryState(
+              userName: userName!,
+              payload: payload,
+              markAsRead: true,
             );
             break;
 
@@ -1256,6 +1391,18 @@ void _handleFileMessage({
     'scheduled': false,
     'chatId': directContext?.chatId ?? groupChatId!,
     'chatType': directContext == null ? 'group' : 'direct',
+    'edited': false,
+    'deleted': false,
+    'editHistory': const <Object>[],
+    'reactions': const <String, Object>{},
+    'mentions': _normalizeMentions(
+      rawMentions: payload['mentions'],
+      text: (payload['text']?.toString() ?? '').trim(),
+    ).toList(growable: false),
+    'deliveredTo': <String>[userName.toLowerCase()],
+    'readBy': <String>[userName.toLowerCase()],
+    'encrypted': payload['encrypted'] == true,
+    if (payload['encryption'] is Map) 'encryption': _asMap(payload['encryption']),
     if (replyTo != null) 'replyTo': replyTo,
     if (directContext != null)
       'participants': directContext.participantsLower.toList(),
@@ -1268,15 +1415,422 @@ void _handleFileMessage({
   };
 
   _appendMessage(message);
-  if (directContext == null) {
-    _broadcast(type: 'message', payload: message);
-  } else {
-    _broadcastToParticipants(
-      type: 'message',
-      payload: message,
-      participantsLower: directContext.participantsLower,
+  _broadcastMessageToAudience(type: 'message', payload: message);
+}
+
+void _handleMessageEdit({
+  required WebSocketChannel channel,
+  required String userId,
+  required String userName,
+  required Map<String, dynamic> payload,
+}) {
+  final messageId = (payload['id']?.toString() ?? '').trim();
+  final updatedText = (payload['text']?.toString() ?? '').trim();
+  if (messageId.isEmpty) {
+    _sendEnvelope(
+      channel,
+      type: 'error',
+      payload: {'message': 'message id is required for edit.'},
     );
+    return;
   }
+  if (updatedText.isEmpty) {
+    _sendEnvelope(
+      channel,
+      type: 'error',
+      payload: {'message': 'Введите текст сообщения для редактирования.'},
+    );
+    return;
+  }
+
+  final message = _findMessageForUser(messageId: messageId, userName: userName);
+  if (message == null) {
+    _sendEnvelope(
+      channel,
+      type: 'error',
+      payload: {'message': 'Сообщение не найдено.'},
+    );
+    return;
+  }
+
+  final senderId = (message['senderId']?.toString() ?? '').trim();
+  if (senderId != userId) {
+    _sendEnvelope(
+      channel,
+      type: 'error',
+      payload: {'message': 'Редактировать можно только свои сообщения.'},
+    );
+    return;
+  }
+  if ((message['deleted'] == true) || (message['isDeleted'] == true)) {
+    _sendEnvelope(
+      channel,
+      type: 'error',
+      payload: {'message': 'Удаленное сообщение нельзя редактировать.'},
+    );
+    return;
+  }
+
+  final type = (message['type']?.toString() ?? 'text').trim().toLowerCase();
+  if (type != 'text' && type != 'file') {
+    _sendEnvelope(
+      channel,
+      type: 'error',
+      payload: {'message': 'Этот тип сообщения нельзя редактировать.'},
+    );
+    return;
+  }
+
+  final previousText = (message['text']?.toString() ?? '').trim();
+  if (previousText == updatedText) {
+    return;
+  }
+
+  final nowIso = DateTime.now().toUtc().toIso8601String();
+  final editHistory = _normalizeEditHistory(message['editHistory']);
+  if (previousText.isNotEmpty) {
+    final historyItem = <String, dynamic>{
+      'text': previousText,
+      'editedAt': nowIso,
+    };
+    if (message['encrypted'] == true && message['encryption'] is Map) {
+      historyItem['encryption'] = _asMap(message['encryption']);
+    }
+    editHistory.add(historyItem);
+  }
+
+  message['text'] = updatedText;
+  message['edited'] = true;
+  message['editedAt'] = nowIso;
+  message['editHistory'] = editHistory;
+  message['mentions'] = _normalizeMentions(
+    rawMentions: payload['mentions'],
+    text: updatedText,
+  ).toList(growable: false);
+
+  if (payload['encrypted'] is bool) {
+    message['encrypted'] = payload['encrypted'] == true;
+  }
+  if (payload['encryption'] is Map) {
+    message['encryption'] = _asMap(payload['encryption']);
+  } else if (payload.containsKey('encryption') && payload['encryption'] == null) {
+    message.remove('encryption');
+  }
+
+  _saveMessageHistory();
+  _broadcastMessageToAudience(type: 'message_updated', payload: message);
+}
+
+void _handleMessageDelete({
+  required WebSocketChannel channel,
+  required String userId,
+  required String userName,
+  required Map<String, dynamic> payload,
+}) {
+  final messageId = (payload['id']?.toString() ?? '').trim();
+  if (messageId.isEmpty) {
+    _sendEnvelope(
+      channel,
+      type: 'error',
+      payload: {'message': 'message id is required for delete.'},
+    );
+    return;
+  }
+
+  final message = _findMessageForUser(messageId: messageId, userName: userName);
+  if (message == null) {
+    _sendEnvelope(
+      channel,
+      type: 'error',
+      payload: {'message': 'Сообщение не найдено.'},
+    );
+    return;
+  }
+
+  final senderId = (message['senderId']?.toString() ?? '').trim();
+  if (senderId != userId) {
+    _sendEnvelope(
+      channel,
+      type: 'error',
+      payload: {'message': 'Удалять можно только свои сообщения.'},
+    );
+    return;
+  }
+  if (message['deleted'] == true || message['isDeleted'] == true) {
+    return;
+  }
+
+  final nowIso = DateTime.now().toUtc().toIso8601String();
+  message['deleted'] = true;
+  message['deletedAt'] = nowIso;
+  message['edited'] = false;
+  message['editedAt'] = null;
+  message['text'] = '';
+  message['mentions'] = const <String>[];
+  message['reactions'] = const <String, Object>{};
+
+  _saveMessageHistory();
+  _broadcastMessageToAudience(type: 'message_updated', payload: message);
+}
+
+void _handleMessageReactionToggle({
+  required WebSocketChannel channel,
+  required String userName,
+  required Map<String, dynamic> payload,
+}) {
+  final messageId = (payload['id']?.toString() ?? '').trim();
+  final reaction = (payload['reaction']?.toString() ?? '').trim();
+  if (messageId.isEmpty || reaction.isEmpty) {
+    _sendEnvelope(
+      channel,
+      type: 'error',
+      payload: {'message': 'id и reaction обязательны.'},
+    );
+    return;
+  }
+
+  final message = _findMessageForUser(messageId: messageId, userName: userName);
+  if (message == null) {
+    _sendEnvelope(
+      channel,
+      type: 'error',
+      payload: {'message': 'Сообщение не найдено.'},
+    );
+    return;
+  }
+
+  if (message['deleted'] == true || message['isDeleted'] == true) {
+    return;
+  }
+
+  final userLower = userName.toLowerCase();
+  final reactions = _normalizeReactions(message['reactions']);
+  final users = reactions[reaction] ?? <String>[];
+  if (users.contains(userLower)) {
+    users.remove(userLower);
+  } else {
+    users.add(userLower);
+  }
+
+  if (users.isEmpty) {
+    reactions.remove(reaction);
+  } else {
+    users.sort();
+    reactions[reaction] = users;
+  }
+
+  message['reactions'] = reactions;
+  _saveMessageHistory();
+  _broadcastMessageToAudience(type: 'message_updated', payload: message);
+}
+
+void _handleMessageDeliveryState({
+  required String userName,
+  required Map<String, dynamic> payload,
+  required bool markAsRead,
+}) {
+  final messageId = (payload['id']?.toString() ?? '').trim();
+  if (messageId.isEmpty) {
+    return;
+  }
+
+  final message = _findMessageForUser(messageId: messageId, userName: userName);
+  if (message == null) {
+    return;
+  }
+
+  final userLower = userName.toLowerCase();
+  final delivered = _normalizeUserLowerList(message['deliveredTo']);
+  final readBy = _normalizeUserLowerList(message['readBy']);
+  var changed = false;
+
+  if (!delivered.contains(userLower)) {
+    delivered.add(userLower);
+    changed = true;
+  }
+
+  if (markAsRead && !readBy.contains(userLower)) {
+    readBy.add(userLower);
+    changed = true;
+  }
+
+  if (!changed) {
+    return;
+  }
+
+  delivered.sort();
+  readBy.sort();
+  message['deliveredTo'] = delivered;
+  message['readBy'] = readBy;
+
+  _saveMessageHistory();
+  _broadcastMessageToAudience(type: 'message_updated', payload: message);
+}
+
+Map<String, dynamic>? _findMessageForUser({
+  required String messageId,
+  required String userName,
+}) {
+  final userLower = userName.trim().toLowerCase();
+  if (userLower.isEmpty) {
+    return null;
+  }
+
+  for (final message in _group.messages.reversed) {
+    final id = (message['id']?.toString() ?? '').trim();
+    if (id != messageId) {
+      continue;
+    }
+    if (_isMessageVisibleForUser(message: message, userNameLower: userLower)) {
+      return message;
+    }
+    return null;
+  }
+  return null;
+}
+
+void _broadcastMessageToAudience({
+  required String type,
+  required Map<String, dynamic> payload,
+  String? exceptUserId,
+}) {
+  final chatType = (payload['chatType']?.toString() ?? 'group')
+      .trim()
+      .toLowerCase();
+  if (chatType != 'direct') {
+    _broadcast(type: type, payload: payload, exceptUserId: exceptUserId);
+    return;
+  }
+
+  final participants = _participantsLowerFromMessage(payload);
+  if (participants.isEmpty) {
+    _broadcast(type: type, payload: payload, exceptUserId: exceptUserId);
+    return;
+  }
+
+  _broadcastToParticipants(
+    type: type,
+    payload: payload,
+    participantsLower: participants,
+    exceptUserId: exceptUserId,
+  );
+}
+
+Set<String> _participantsLowerFromMessage(Map<String, dynamic> message) {
+  final raw = message['participants'];
+  if (raw is List) {
+    final values = raw
+        .map((item) => item.toString().trim().toLowerCase())
+        .where((item) => item.isNotEmpty)
+        .toSet();
+    if (values.isNotEmpty) {
+      return values;
+    }
+  }
+
+  final chatId = _normalizeDirectChatId((message['chatId']?.toString() ?? '').trim());
+  if (chatId == null) {
+    return <String>{};
+  }
+  final tail = chatId.substring('direct:'.length);
+  final parts = tail.split('|');
+  if (parts.length != 2) {
+    return <String>{};
+  }
+  return <String>{parts[0], parts[1]};
+}
+
+List<Map<String, dynamic>> _normalizeEditHistory(Object? raw) {
+  if (raw is! List) {
+    return <Map<String, dynamic>>[];
+  }
+
+  final result = <Map<String, dynamic>>[];
+  for (final item in raw) {
+    if (item is! Map) {
+      continue;
+    }
+    final map = _asMap(item);
+    final text = (map['text']?.toString() ?? '').trim();
+    if (text.isEmpty) {
+      continue;
+    }
+    final normalized = <String, dynamic>{
+      'text': text,
+      'editedAt': _normalizeIsoTimestamp(map['editedAt']),
+    };
+    if (map['encryption'] is Map) {
+      normalized['encryption'] = _asMap(map['encryption']);
+    }
+    result.add(normalized);
+  }
+  return result;
+}
+
+Map<String, List<String>> _normalizeReactions(Object? raw) {
+  if (raw is! Map) {
+    return <String, List<String>>{};
+  }
+
+  final result = <String, List<String>>{};
+  raw.forEach((key, value) {
+    final reaction = key.toString().trim();
+    if (reaction.isEmpty || value is! List) {
+      return;
+    }
+    final users = value
+        .map((entry) => entry.toString().trim().toLowerCase())
+        .where((entry) => entry.isNotEmpty)
+        .toSet()
+        .toList()
+      ..sort();
+    if (users.isNotEmpty) {
+      result[reaction] = users;
+    }
+  });
+  return result;
+}
+
+List<String> _normalizeUserLowerList(Object? raw) {
+  if (raw is! List) {
+    return <String>[];
+  }
+  return raw
+      .map((entry) => entry.toString().trim().toLowerCase())
+      .where((entry) => entry.isNotEmpty)
+      .toSet()
+      .toList()
+    ..sort();
+}
+
+Set<String> _normalizeMentions({
+  required Object? rawMentions,
+  required String text,
+}) {
+  final result = <String>{};
+  if (rawMentions is List) {
+    for (final item in rawMentions) {
+      final key = item.toString().trim().toLowerCase();
+      if (key.isEmpty) {
+        continue;
+      }
+      if (_allowedUsersByLower.containsKey(key)) {
+        result.add(key);
+      }
+    }
+  }
+
+  final textLower = text.toLowerCase();
+  if (textLower.isNotEmpty) {
+    for (final entry in _allowedUsersByLower.entries) {
+      final token = '@${entry.key}';
+      if (textLower.contains(token)) {
+        result.add(entry.key);
+      }
+    }
+  }
+
+  return result;
 }
 
 void _handleScheduledConfigSet({
@@ -1524,6 +2078,18 @@ String _normalizeIsoTimestamp(Object? value) {
   final text = (value?.toString() ?? '').trim();
   final parsed = DateTime.tryParse(text);
   return (parsed ?? DateTime.now()).toUtc().toIso8601String();
+}
+
+String? _normalizeOptionalIsoTimestamp(Object? value) {
+  final text = (value?.toString() ?? '').trim();
+  if (text.isEmpty) {
+    return null;
+  }
+  final parsed = DateTime.tryParse(text);
+  if (parsed == null) {
+    return null;
+  }
+  return parsed.toUtc().toIso8601String();
 }
 
 String _normalizeExtension(Object? value, String fileName) {
