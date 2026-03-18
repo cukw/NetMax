@@ -8,6 +8,8 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:mongo_dart/mongo_dart.dart' as mongo;
+import 'package:mailer/mailer.dart';
+import 'package:mailer/smtp_server.dart';
 import 'package:path/path.dart' as p;
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as shelf_io;
@@ -29,11 +31,26 @@ const String _defaultMongoUri = 'mongodb://127.0.0.1:27017/netmax';
 const Duration _scheduleTickInterval = Duration(seconds: 20);
 const Duration _storageCleanupInterval = Duration(minutes: 30);
 const Duration _storageFileMaxAge = Duration(days: 14);
+const Duration _emailCodeTtl = Duration(minutes: 5);
+const int _emailCodeMaxAttempts = 5;
 const int _storageMaxBytes = 1024 * 1024 * 1024;
 final int _maxHistoryMessages = _readPositiveIntFromEnv(
   'NETMAX_HISTORY_LIMIT',
   fallback: 10000,
 );
+final bool _returnDevEmailCodeInResponse = _readBoolFromEnv(
+  'NETMAX_EMAIL_AUTH_RETURN_DEV_CODE',
+  fallback: true,
+);
+final String _smtpHost = (Platform.environment['NETMAX_SMTP_HOST'] ?? '').trim();
+final int _smtpPort = _readPositiveIntFromEnv('NETMAX_SMTP_PORT', fallback: 587);
+final String _smtpUsername =
+    (Platform.environment['NETMAX_SMTP_USERNAME'] ?? '').trim();
+final String _smtpPassword =
+    (Platform.environment['NETMAX_SMTP_PASSWORD'] ?? '').trim();
+final String _smtpFrom = (Platform.environment['NETMAX_SMTP_FROM'] ?? '').trim();
+final bool _smtpUseTls = _readBoolFromEnv('NETMAX_SMTP_TLS', fallback: true);
+final bool _smtpConfigured = _smtpHost.isNotEmpty && _smtpFrom.isNotEmpty;
 const String _defaultGroupChatId = 'group-general';
 const String _defaultGroupChatTitle = 'Общий чат';
 const Set<String> _scheduledRestrictedUsersLower = <String>{
@@ -44,9 +61,13 @@ const Set<String> _scheduledRestrictedUsersLower = <String>{
 final RoomState _group = RoomState();
 final Random _random = Random();
 
-late final List<String> _allowedUsers;
-late final Map<String, String> _allowedUsersByLower;
-late final Map<String, String> _passwordsByUserLower;
+final List<String> _allowedUsers = <String>[];
+final Map<String, String> _allowedUsersByLower = <String, String>{};
+final Map<String, String> _passwordsByUserLower = <String, String>{};
+final Map<String, String> _userLowerByPhone = <String, String>{};
+final Map<String, String> _userLowerByEmail = <String, String>{};
+final Map<String, _PendingEmailCode> _pendingEmailCodesByEmail =
+    <String, _PendingEmailCode>{};
 late final String _serverManagedE2eeKey;
 late final String _serverManagedE2eeKeySource;
 late final File _e2eeKeyFile;
@@ -106,6 +127,7 @@ Future<void> main() async {
     ..get('/chats', _chatsHandler)
     ..get('/scheduled-messages', _scheduledMessagesHandler)
     ..get('/update-manifest', _updateManifestHandler)
+    ..post('/auth/email/request-code', _emailRequestCodeHandler)
     ..get(
       '/ws',
       webSocketHandler(
@@ -141,6 +163,13 @@ Future<void> main() async {
   stdout.writeln('Messages loaded: ${_group.messages.length}');
   stdout.writeln('History limit: $_maxHistoryMessages');
   stdout.writeln('NoSQL backend: MongoDB (${_mongoDb.databaseName})');
+  stdout.writeln(
+    'Email auth: OTP ${_emailCodeTtl.inMinutes}m, '
+    'dev code in API: ${_returnDevEmailCodeInResponse ? "enabled" : "disabled"}',
+  );
+  stdout.writeln(
+    'SMTP: ${_smtpConfigured ? "configured" : "not configured (dev mode only)"}',
+  );
   stdout.writeln('E2EE key source: $_serverManagedE2eeKeySource');
   stdout.writeln(
     'Storage cleanup: every ${_storageCleanupInterval.inMinutes}m, '
@@ -158,9 +187,15 @@ void _loadAuthorizedUsers() {
     CREATE TABLE IF NOT EXISTS users (
       name_lower TEXT PRIMARY KEY,
       name TEXT NOT NULL,
-      password TEXT NOT NULL
+      password TEXT NOT NULL DEFAULT '',
+      phone_e164 TEXT,
+      email TEXT,
+      auth_type TEXT NOT NULL DEFAULT 'legacy',
+      created_at TEXT,
+      updated_at TEXT
     )
   ''');
+  _ensureUsersTableSchema();
 
   final configFile = File(
     p.join(Directory.current.path, _authConfigRelativePath),
@@ -185,7 +220,6 @@ void _loadAuthorizedUsers() {
   final usersRaw = decoded['allowedUsers'];
   final seedUsers = usersRaw is List ? usersRaw : const <Object>[];
 
-  final users = <String>[];
   final usersByLower = <String, String>{};
   final passwordsByLower = <String, String>{};
 
@@ -210,16 +244,27 @@ void _loadAuthorizedUsers() {
 
     usersByLower[lower] = name;
     passwordsByLower[lower] = password;
-    users.add(name);
   }
 
   final rows = _usersDb.select('SELECT COUNT(*) AS c FROM users');
   final existingUsersCount = rows.isEmpty
       ? 0
       : ((rows.first['c'] as num?)?.toInt() ?? 0);
-  if (existingUsersCount == 0 && users.isNotEmpty) {
+  if (existingUsersCount == 0 && usersByLower.isNotEmpty) {
+    final now = DateTime.now().toUtc().toIso8601String();
     final insert = _usersDb.prepare(
-      'INSERT INTO users (name_lower, name, password) VALUES (?, ?, ?)',
+      '''
+      INSERT INTO users (
+        name_lower,
+        name,
+        password,
+        phone_e164,
+        email,
+        auth_type,
+        created_at,
+        updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ''',
     );
     try {
       for (final entry in usersByLower.entries) {
@@ -227,6 +272,11 @@ void _loadAuthorizedUsers() {
           entry.key,
           entry.value,
           passwordsByLower[entry.key] ?? '',
+          null,
+          null,
+          'legacy',
+          now,
+          now,
         ]);
       }
     } finally {
@@ -234,54 +284,89 @@ void _loadAuthorizedUsers() {
     }
   }
 
-  final persisted = _usersDb.select(
-    'SELECT name_lower, name, password FROM users ORDER BY name COLLATE NOCASE ASC',
-  );
+  _reloadUsersCacheFromDb();
+}
 
-  users
-    ..clear()
-    ..addAll(
-      persisted
-          .map((row) => (row['name']?.toString() ?? '').trim())
-          .where((name) => name.isNotEmpty),
-    );
-  usersByLower
-    ..clear()
-    ..addEntries(
-      persisted
-          .map((row) {
-            final lower = (row['name_lower']?.toString() ?? '')
-                .trim()
-                .toLowerCase();
-            final name = (row['name']?.toString() ?? '').trim();
-            return MapEntry(lower, name);
-          })
-          .where((entry) => entry.key.isNotEmpty && entry.value.isNotEmpty),
-    );
-  passwordsByLower
-    ..clear()
-    ..addEntries(
-      persisted
-          .map((row) {
-            final lower = (row['name_lower']?.toString() ?? '')
-                .trim()
-                .toLowerCase();
-            final password = (row['password']?.toString() ?? '').trim();
-            return MapEntry(lower, password);
-          })
-          .where((entry) => entry.key.isNotEmpty && entry.value.isNotEmpty),
-    );
+void _ensureUsersTableSchema() {
+  final columns = _usersDb
+      .select('PRAGMA table_info(users)')
+      .map((row) => (row['name']?.toString() ?? '').trim().toLowerCase())
+      .where((name) => name.isNotEmpty)
+      .toSet();
 
-  if (users.isEmpty) {
-    throw StateError(
-      'Users store is empty. Add users to SQLite ($_usersDbRelativePath) '
-      'or define allowedUsers in $_authConfigRelativePath for bootstrap.',
+  if (!columns.contains('phone_e164')) {
+    _usersDb.execute('ALTER TABLE users ADD COLUMN phone_e164 TEXT');
+  }
+  if (!columns.contains('email')) {
+    _usersDb.execute('ALTER TABLE users ADD COLUMN email TEXT');
+  }
+  if (!columns.contains('auth_type')) {
+    _usersDb.execute(
+      "ALTER TABLE users ADD COLUMN auth_type TEXT NOT NULL DEFAULT 'legacy'",
     );
   }
+  if (!columns.contains('created_at')) {
+    _usersDb.execute('ALTER TABLE users ADD COLUMN created_at TEXT');
+  }
+  if (!columns.contains('updated_at')) {
+    _usersDb.execute('ALTER TABLE users ADD COLUMN updated_at TEXT');
+  }
 
-  _allowedUsers = List<String>.unmodifiable(users);
-  _allowedUsersByLower = Map<String, String>.unmodifiable(usersByLower);
-  _passwordsByUserLower = Map<String, String>.unmodifiable(passwordsByLower);
+  _usersDb.execute(
+    '''
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_e164
+      ON users(phone_e164)
+      WHERE phone_e164 IS NOT NULL AND phone_e164 <> ''
+    ''',
+  );
+  _usersDb.execute(
+    '''
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email
+      ON users(email)
+      WHERE email IS NOT NULL AND email <> ''
+    ''',
+  );
+  _usersDb.execute(
+    'CREATE UNIQUE INDEX IF NOT EXISTS idx_users_name_lower ON users(name_lower)',
+  );
+}
+
+void _reloadUsersCacheFromDb() {
+  final persisted = _usersDb.select(
+    '''
+    SELECT name_lower, name, password, phone_e164, email
+    FROM users
+    ORDER BY name COLLATE NOCASE ASC
+    ''',
+  );
+
+  _allowedUsers.clear();
+  _allowedUsersByLower.clear();
+  _passwordsByUserLower.clear();
+  _userLowerByPhone.clear();
+  _userLowerByEmail.clear();
+
+  for (final row in persisted) {
+    final lower = (row['name_lower']?.toString() ?? '').trim().toLowerCase();
+    final name = (row['name']?.toString() ?? '').trim();
+    if (lower.isEmpty || name.isEmpty) {
+      continue;
+    }
+
+    final password = (row['password']?.toString() ?? '').trim();
+    final phone = _normalizePhoneE164(row['phone_e164']);
+    final email = _normalizeEmail(row['email']);
+
+    _allowedUsers.add(name);
+    _allowedUsersByLower[lower] = name;
+    _passwordsByUserLower[lower] = password;
+    if (phone.isNotEmpty) {
+      _userLowerByPhone[phone] = lower;
+    }
+    if (email.isNotEmpty) {
+      _userLowerByEmail[email] = lower;
+    }
+  }
 }
 
 Future<void> _initializeNoSqlStore() async {
@@ -1324,6 +1409,8 @@ Response _healthHandler(Request request) {
     'onlineUsers': _group.clients.length,
     'uniqueOnlineUsers': _deduplicatedOnlineUsers().length,
     'authorizedUsers': _allowedUsers.length,
+    'phoneUsers': _userLowerByPhone.length,
+    'emailUsers': _userLowerByEmail.length,
     'groupChats': _groupChatTitlesById.length,
     'maxSessionsPerUser': _maxSessionsPerUser,
     'updateManifestAvailable': updateManifestFile.existsSync(),
@@ -1344,6 +1431,80 @@ Response _chatsHandler(Request request) {
     'allowedUsers': _allowedUsers,
     'count': _groupChatTitlesById.length,
   });
+}
+
+Future<Response> _emailRequestCodeHandler(Request request) async {
+  final rawBody = await request.readAsString();
+  if (rawBody.trim().isEmpty) {
+    return _json({'error': 'Request body is empty.'}, statusCode: 400);
+  }
+
+  Object? decoded;
+  try {
+    decoded = jsonDecode(rawBody);
+  } catch (_) {
+    return _json({'error': 'Invalid JSON body.'}, statusCode: 400);
+  }
+  if (decoded is! Map<String, dynamic>) {
+    return _json({'error': 'Invalid JSON shape.'}, statusCode: 400);
+  }
+
+  final payload = _asMap(decoded);
+  final phone = _normalizePhoneE164(payload['phone']);
+  final email = _normalizeEmail(payload['email']);
+  if (phone.isEmpty) {
+    return _json({
+      'error': 'Некорректный номер. Используйте формат +79991234567.',
+    }, statusCode: 400);
+  }
+  if (email.isEmpty) {
+    return _json({
+      'error': 'Некорректный email. Пример: user@example.com.',
+    }, statusCode: 400);
+  }
+
+  final existingByEmail = _userLowerByEmail[email];
+  final existingByPhone = _userLowerByPhone[phone];
+  if (existingByEmail != null &&
+      existingByPhone != null &&
+      existingByEmail != existingByPhone) {
+    return _json({
+      'error':
+          'Этот email уже привязан к другому номеру. Используйте email владельца номера.',
+    }, statusCode: 409);
+  }
+
+  final code = _issueEmailCode(email);
+  var emailSent = false;
+  if (_smtpConfigured) {
+    emailSent = await _sendAuthCodeByEmail(email: email, code: code);
+  }
+  stdout.writeln(
+    'Email auth code generated for $email (phone $phone). '
+    'smtpSent=${emailSent ? "yes" : "no"}',
+  );
+
+  final response = <String, dynamic>{
+    'ok': true,
+    'phone': phone,
+    'email': email,
+    'ttlSeconds': _emailCodeTtl.inSeconds,
+    'message': emailSent
+        ? 'Код подтверждения отправлен на почту.'
+        : 'Код подтверждения создан.',
+  };
+  if (_returnDevEmailCodeInResponse) {
+    response['devCode'] = code;
+    response['devMode'] = true;
+  }
+  if (!emailSent && !_returnDevEmailCodeInResponse) {
+    return _json({
+      'error':
+          'SMTP не настроен или отправка письма не удалась. Включите SMTP или DEV-режим.',
+    }, statusCode: 500);
+  }
+  response['smtpSent'] = emailSent;
+  return _json(response);
 }
 
 Response _scheduledMessagesHandler(Request request) {
@@ -1555,40 +1716,118 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
 
         switch (type) {
           case 'join':
-            final requestedName = _normalizeUserName(payload['userName']);
-            if (requestedName.isEmpty) {
-              _denyAndClose(
-                channel,
-                'Авторизация отклонена: укажите имя пользователя.',
-              );
-              return;
-            }
+            final authMethod =
+                (payload['authMethod']?.toString() ?? 'password')
+                    .trim()
+                    .toLowerCase();
 
-            final authorizedName =
-                _allowedUsersByLower[requestedName.toLowerCase()];
-            if (authorizedName == null) {
-              _denyAndClose(
-                channel,
-                'Авторизация отклонена: пользователь "$requestedName" не в списке.',
-              );
-              return;
-            }
+            String authorizedName;
+            if (authMethod == 'phone') {
+              final phone = _normalizePhoneE164(payload['phone']);
+              final email = _normalizeEmail(payload['email']);
+              if (phone.isEmpty) {
+                _denyAndClose(
+                  channel,
+                  'Авторизация отклонена: укажите номер в формате +79991234567.',
+                );
+                return;
+              }
+              if (email.isEmpty) {
+                _denyAndClose(
+                  channel,
+                  'Авторизация отклонена: укажите корректный email.',
+                );
+                return;
+              }
 
-            final providedPassword = (payload['password']?.toString() ?? '')
-                .trim();
-            if (providedPassword.isEmpty) {
-              _denyAndClose(
-                channel,
-                'Авторизация отклонена: пароль обязателен.',
-              );
-              return;
-            }
-            final expectedPassword =
-                _passwordsByUserLower[authorizedName.toLowerCase()];
-            if (expectedPassword == null ||
-                expectedPassword != providedPassword) {
-              _denyAndClose(channel, 'Авторизация отклонена: неверный пароль.');
-              return;
+              final code = (payload['code']?.toString() ?? '').trim();
+              final codeError = _consumeEmailCode(email: email, code: code);
+              if (codeError != null) {
+                _denyAndClose(channel, 'Авторизация отклонена: $codeError');
+                return;
+              }
+
+              final shouldRegister = payload['register'] == true;
+              if (shouldRegister &&
+                  !_userLowerByPhone.containsKey(phone) &&
+                  !_userLowerByEmail.containsKey(email)) {
+                final requestedProfile = _sanitizePlainText(
+                  _normalizeUserName(payload['profileName']),
+                  maxLength: 80,
+                );
+                final registeredName = _registerPhoneEmailUser(
+                  phoneE164: phone,
+                  email: email,
+                  requestedProfileName: requestedProfile,
+                );
+                stdout.writeln(
+                  'Phone+Email user registered: "$registeredName" ($phone, $email)',
+                );
+              }
+              if (shouldRegister) {
+                _bindPhoneEmailIfPossible(phoneE164: phone, email: email);
+              }
+
+              final userLower = _userLowerByPhone[phone];
+              if (userLower == null) {
+                _denyAndClose(
+                  channel,
+                  'Авторизация отклонена: номер не зарегистрирован. Включите регистрацию и укажите имя.',
+                );
+                return;
+              }
+              final userLowerByEmail = _userLowerByEmail[email];
+              if (userLowerByEmail == null || userLowerByEmail != userLower) {
+                _denyAndClose(
+                  channel,
+                  'Авторизация отклонена: номер и email принадлежат разным аккаунтам.',
+                );
+                return;
+              }
+
+              final byPhone = _allowedUsersByLower[userLower];
+              if (byPhone == null || byPhone.trim().isEmpty) {
+                _denyAndClose(
+                  channel,
+                  'Авторизация отклонена: пользователь по номеру не найден.',
+                );
+                return;
+              }
+              authorizedName = byPhone;
+            } else {
+              final requestedName = _normalizeUserName(payload['userName']);
+              if (requestedName.isEmpty) {
+                _denyAndClose(
+                  channel,
+                  'Авторизация отклонена: укажите имя пользователя.',
+                );
+                return;
+              }
+
+              final byName = _allowedUsersByLower[requestedName.toLowerCase()];
+              if (byName == null) {
+                _denyAndClose(
+                  channel,
+                  'Авторизация отклонена: пользователь "$requestedName" не в списке.',
+                );
+                return;
+              }
+
+              final providedPassword = (payload['password']?.toString() ?? '')
+                  .trim();
+              if (providedPassword.isEmpty) {
+                _denyAndClose(
+                  channel,
+                  'Авторизация отклонена: пароль обязателен.',
+                );
+                return;
+              }
+              final expectedPassword = _passwordsByUserLower[byName.toLowerCase()];
+              if (expectedPassword == null || expectedPassword != providedPassword) {
+                _denyAndClose(channel, 'Авторизация отклонена: неверный пароль.');
+                return;
+              }
+              authorizedName = byName;
             }
 
             // проверка лимита кол-ва сессий | _maxSessionsPerUser = 0 = без ограничений
@@ -2713,6 +2952,246 @@ String _normalizeUserName(Object? value) {
   return (value?.toString() ?? '').trim();
 }
 
+String _normalizePhoneE164(Object? value) {
+  var raw = (value?.toString() ?? '').trim();
+  if (raw.isEmpty) {
+    return '';
+  }
+
+  raw = raw.replaceAll(RegExp(r'[\s\-\(\)]'), '');
+  if (raw.startsWith('00')) {
+    raw = '+${raw.substring(2)}';
+  }
+  if (!raw.startsWith('+')) {
+    raw = '+$raw';
+  }
+  final normalized = raw.replaceAll(RegExp(r'[^0-9+]'), '');
+  if (!RegExp(r'^\+[1-9]\d{9,14}$').hasMatch(normalized)) {
+    return '';
+  }
+  return normalized;
+}
+
+String _normalizeEmail(Object? value) {
+  final raw = (value?.toString() ?? '').trim().toLowerCase();
+  if (raw.isEmpty) {
+    return '';
+  }
+  if (raw.length > 254) {
+    return '';
+  }
+  if (!RegExp(r'^[a-z0-9.!#$%&\'*+/=?^_`{|}~-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+$')
+      .hasMatch(raw)) {
+    return '';
+  }
+  return raw;
+}
+
+String _issueEmailCode(String email) {
+  final code = (100000 + _random.nextInt(900000)).toString();
+  _pendingEmailCodesByEmail[email] = _PendingEmailCode(
+    code: code,
+    expiresAt: DateTime.now().toUtc().add(_emailCodeTtl),
+    attemptsLeft: _emailCodeMaxAttempts,
+  );
+  return code;
+}
+
+String? _consumeEmailCode({required String email, required String code}) {
+  final normalizedCode = code.trim();
+  if (!RegExp(r'^\d{6}$').hasMatch(normalizedCode)) {
+    return 'код должен содержать 6 цифр.';
+  }
+
+  final pending = _pendingEmailCodesByEmail[email];
+  if (pending == null) {
+    return 'сначала запросите код.';
+  }
+
+  if (DateTime.now().toUtc().isAfter(pending.expiresAt)) {
+    _pendingEmailCodesByEmail.remove(email);
+    return 'код истек. Запросите новый код.';
+  }
+
+  if (pending.code != normalizedCode) {
+    pending.attemptsLeft -= 1;
+    if (pending.attemptsLeft <= 0) {
+      _pendingEmailCodesByEmail.remove(email);
+      return 'неверный код и исчерпаны попытки.';
+    }
+    return 'неверный код. Осталось попыток: ${pending.attemptsLeft}.';
+  }
+
+  _pendingEmailCodesByEmail.remove(email);
+  return null;
+}
+
+String _registerPhoneEmailUser({
+  required String phoneE164,
+  required String email,
+  required String requestedProfileName,
+}) {
+  final existingLower = _userLowerByPhone[phoneE164];
+  if (existingLower != null) {
+    final existing = _allowedUsersByLower[existingLower];
+    if (existing != null && existing.isNotEmpty) {
+      return existing;
+    }
+  }
+  final existingByEmail = _userLowerByEmail[email];
+  if (existingByEmail != null) {
+    final existing = _allowedUsersByLower[existingByEmail];
+    if (existing != null && existing.isNotEmpty) {
+      return existing;
+    }
+  }
+
+  final baseName = requestedProfileName.isEmpty
+      ? _buildDefaultPhoneProfileName(phoneE164)
+      : requestedProfileName;
+  final uniqueName = _pickUniqueUserName(baseName);
+  final lower = uniqueName.toLowerCase();
+  final now = DateTime.now().toUtc().toIso8601String();
+  final insert = _usersDb.prepare(
+    '''
+    INSERT INTO users (
+      name_lower,
+      name,
+      password,
+      phone_e164,
+      email,
+      auth_type,
+      created_at,
+      updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ''',
+  );
+  try {
+    insert.execute(<Object?>[
+      lower,
+      uniqueName,
+      '',
+      phoneE164,
+      email,
+      'phone_email',
+      now,
+      now,
+    ]);
+  } finally {
+    insert.dispose();
+  }
+
+  _reloadUsersCacheFromDb();
+  return uniqueName;
+}
+
+void _bindPhoneEmailIfPossible({
+  required String phoneE164,
+  required String email,
+}) {
+  final byPhone = _userLowerByPhone[phoneE164];
+  final byEmail = _userLowerByEmail[email];
+  if (byPhone == null && byEmail == null) {
+    return;
+  }
+  if (byPhone != null && byEmail != null && byPhone != byEmail) {
+    return;
+  }
+
+  final target = byPhone ?? byEmail;
+  if (target == null) {
+    return;
+  }
+
+  final now = DateTime.now().toUtc().toIso8601String();
+  final update = _usersDb.prepare(
+    '''
+    UPDATE users
+    SET phone_e164 = ?, email = ?, auth_type = ?, updated_at = ?
+    WHERE name_lower = ?
+    ''',
+  );
+  try {
+    update.execute(<Object?>[phoneE164, email, 'phone_email', now, target]);
+  } finally {
+    update.dispose();
+  }
+  _reloadUsersCacheFromDb();
+}
+
+Future<bool> _sendAuthCodeByEmail({
+  required String email,
+  required String code,
+}) async {
+  if (!_smtpConfigured) {
+    return false;
+  }
+  try {
+    final subject = 'NetMax code: $code';
+    final message = Message()
+      ..from = Address(_smtpFrom, 'NetMax')
+      ..recipients.add(email)
+      ..subject = subject
+      ..text = 'Ваш код подтверждения NetMax: $code\n'
+          'Срок действия: ${_emailCodeTtl.inMinutes} минут.\n'
+          'Если это были не вы, просто игнорируйте письмо.';
+
+    SmtpServer server;
+    if (_smtpUsername.isNotEmpty) {
+      server = SmtpServer(
+        _smtpHost,
+        port: _smtpPort,
+        ssl: _smtpUseTls,
+        username: _smtpUsername,
+        password: _smtpPassword,
+        allowInsecure: !_smtpUseTls,
+      );
+    } else {
+      server = SmtpServer(
+        _smtpHost,
+        port: _smtpPort,
+        ssl: _smtpUseTls,
+        allowInsecure: !_smtpUseTls,
+      );
+    }
+
+    await send(message, server);
+    return true;
+  } catch (error) {
+    stdout.writeln('SMTP send failed for $email: $error');
+    return false;
+  }
+}
+
+String _buildDefaultPhoneProfileName(String phoneE164) {
+  final digits = phoneE164.replaceAll(RegExp(r'[^0-9]'), '');
+  if (digits.isEmpty) {
+    return 'User';
+  }
+  final tail = digits.length <= 4 ? digits : digits.substring(digits.length - 4);
+  return 'User $tail';
+}
+
+String _pickUniqueUserName(String preferred) {
+  var base = _sanitizePlainText(preferred, maxLength: 80);
+  if (base.isEmpty) {
+    base = 'User';
+  }
+
+  var candidate = base;
+  var index = 1;
+  while (_allowedUsersByLower.containsKey(candidate.toLowerCase())) {
+    final suffix = ' $index';
+    final maxBaseLen = max(1, 80 - suffix.length);
+    final trimmedBase = base.length <= maxBaseLen
+        ? base
+        : base.substring(0, maxBaseLen).trim();
+    candidate = '$trimmedBase$suffix';
+    index += 1;
+  }
+  return candidate;
+}
+
 String _normalizeMessageId(Object? value) {
   final id = (value?.toString() ?? '').trim();
   if (id.isNotEmpty) {
@@ -2826,6 +3305,20 @@ int _readPositiveIntFromEnv(String key, {required int fallback}) {
   return parsed;
 }
 
+bool _readBoolFromEnv(String key, {required bool fallback}) {
+  final raw = (Platform.environment[key] ?? '').trim().toLowerCase();
+  if (raw.isEmpty) {
+    return fallback;
+  }
+  if (raw == '1' || raw == 'true' || raw == 'yes' || raw == 'on') {
+    return true;
+  }
+  if (raw == '0' || raw == 'false' || raw == 'no' || raw == 'off') {
+    return false;
+  }
+  return fallback;
+}
+
 int? _toInt(Object? raw) {
   if (raw is int) {
     return raw;
@@ -2912,6 +3405,18 @@ class _DirectChatContext {
 
   final String chatId;
   final Set<String> participantsLower;
+}
+
+class _PendingEmailCode {
+  _PendingEmailCode({
+    required this.code,
+    required this.expiresAt,
+    required this.attemptsLeft,
+  });
+
+  final String code;
+  final DateTime expiresAt;
+  int attemptsLeft;
 }
 
 class ScheduledMessageRule {

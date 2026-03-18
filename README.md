@@ -4,6 +4,7 @@
 
 ## Что уже реализовано
 - Авторизация по имени и паролю (пользователи хранятся в SQLite `backend/config/users.sqlite3`, `authorized_users.json` используется как bootstrap при первом запуске).
+- Регистрация и вход по `телефон + email` с подтверждением по email: запрос кода подтверждения на почту и вход по `телефон + email + код`; для нового номера можно создать профиль при первом входе.
 - Общий чат + личные сообщения (ЛС) между пользователями.
 - Поиск пользователя по имени для открытия ЛС.
 - Отправка и получение текстовых сообщений.
@@ -107,9 +108,24 @@ dart run bin/server.dart
 Если переменная не задана, backend создает и хранит стабильный ключ в `backend/config/e2ee_shared_key.txt`.
 Лимит истории сообщений на backend настраивается через `NETMAX_HISTORY_LIMIT` (по умолчанию `10000`).
 URI MongoDB задается через `NETMAX_MONGO_URI` (по умолчанию `mongodb://127.0.0.1:27017/netmax`).
+Для входа по `телефон + email` клиент вызывает `POST /auth/email/request-code` и затем подключается в WebSocket с `authMethod=phone` (payload: `phone`, `email`, `code`).
+Dev-режим возврата OTP-кода в API управляется `NETMAX_EMAIL_AUTH_RETURN_DEV_CODE` (`true` по умолчанию; в проде рекомендуется `false`).
+Для реальной отправки писем настройте SMTP:
+`NETMAX_SMTP_HOST`, `NETMAX_SMTP_PORT`, `NETMAX_SMTP_FROM`, опционально `NETMAX_SMTP_USERNAME`, `NETMAX_SMTP_PASSWORD`, `NETMAX_SMTP_TLS`.
 Формат server-подписки: JSON (`servers`/`endpoints`) или текстовый список `ws://`/`wss://` адресов.  
 Формат proxy-подписки (native): JSON (`proxies`) или текстовый список `http://...`, `https://...`, `socks5://...`.  
 Web-версия не настраивает custom proxy внутри приложения и использует сетевые настройки браузера/ОС.
+
+## Требования по железу
+Минимум для тестового/малого контура (до ~50 одновременно подключенных пользователей):
+- CPU: 2 vCPU
+- RAM: 2 GB (лучше 4 GB)
+- Диск: 20 GB SSD
+
+Рекомендовано для рабочего контура (до ~200 одновременно подключенных пользователей):
+- CPU: 4 vCPU
+- RAM: 8 GB
+- Диск: 40+ GB SSD (с учетом вложений и MongoDB volume)
 
 ## Радиус Mesh
 Текущий Mesh fallback использует локальную сеть (UDP multicast), а не Bluetooth.

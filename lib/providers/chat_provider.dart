@@ -29,6 +29,8 @@ import '../services/system_notification_service.dart';
 
 enum ChatConnectionStatus { disconnected, connecting, connected }
 
+enum ChatAuthMode { password, phone }
+
 class PreparedFileUpload {
   const PreparedFileUpload({
     required this.name,
@@ -52,6 +54,10 @@ class ChatProvider extends ChangeNotifier {
   static const String _serverUrlKey = 'server_url';
   static const String _userNameKey = 'user_name';
   static const String _userIdKey = 'user_id';
+  static const String _authModeKey = 'auth_mode';
+  static const String _authPhoneKey = 'auth_phone';
+  static const String _authEmailKey = 'auth_email';
+  static const String _authProfileNameKey = 'auth_profile_name';
   static const String _passwordsByUserKey = 'passwords_by_user';
   static const String _subscriptionSourcesKey = 'ws_subscription_sources';
   static const String _proxySubscriptionSourcesKey =
@@ -122,7 +128,13 @@ class ChatProvider extends ChangeNotifier {
   String _userName = '';
   String _userId = '';
   String _e2eeSecret = '';
+  ChatAuthMode _authMode = ChatAuthMode.password;
+  String _authPhone = '';
+  String _authEmail = '';
+  String _authProfileName = '';
+  bool _registerByPhone = false;
   String? _pendingPasswordForAuth;
+  String? _pendingPhoneCodeForAuth;
   final Map<String, String> _passwordsByUserLower = <String, String>{};
 
   String? _lastError;
@@ -184,6 +196,11 @@ class ChatProvider extends ChangeNotifier {
   String get serverUrl => _serverUrl;
   String get userName => _userName;
   String get userId => _userId;
+  ChatAuthMode get authMode => _authMode;
+  String get authPhone => _authPhone;
+  String get authEmail => _authEmail;
+  String get authProfileName => _authProfileName;
+  bool get registerByPhone => _registerByPhone;
   bool get isEncryptionEnabled => _e2eeSecret.trim().isNotEmpty;
   String? get lastError => _lastError;
 
@@ -843,6 +860,16 @@ class ChatProvider extends ChangeNotifier {
 
     final storedUserId = (prefs.getString(_userIdKey) ?? '').trim();
     _userId = storedUserId.isEmpty ? _nextId() : storedUserId;
+    final storedAuthMode = (prefs.getString(_authModeKey) ?? 'password')
+        .trim()
+        .toLowerCase();
+    _authMode = storedAuthMode == 'phone'
+        ? ChatAuthMode.phone
+        : ChatAuthMode.password;
+    _authPhone = (prefs.getString(_authPhoneKey) ?? '').trim();
+    _authEmail = (prefs.getString(_authEmailKey) ?? '').trim().toLowerCase();
+    _authProfileName = (prefs.getString(_authProfileNameKey) ?? '').trim();
+    _registerByPhone = false;
 
     await prefs.setString(_userIdKey, _userId);
     await prefs.setString(_serverUrlKey, _serverUrl);
@@ -866,39 +893,93 @@ class ChatProvider extends ChangeNotifier {
     required String password,
     String? subscriptionSources,
     String? proxySubscriptionSources,
+    ChatAuthMode authMode = ChatAuthMode.password,
+    String phone = '',
+    String email = '',
+    String phoneCode = '',
+    String profileName = '',
+    bool registerByPhone = false,
   }) async {
     final normalizedServerUrl = _normalizeServerUrl(serverUrl);
-    final normalizedUserName = userName.trim();
-
-    if (normalizedUserName.isEmpty) {
-      throw const FormatException(
-        'Введите имя пользователя из списка 30 авторизованных.',
-      );
-    }
-
-    final cacheKey = _passwordCacheKey(normalizedUserName);
-    final typedPassword = password.trim();
-    final cachedPassword = !_canPersistPasswordLocally || cacheKey.isEmpty
-        ? ''
-        : (_passwordsByUserLower[cacheKey] ?? '');
-    final effectivePassword = typedPassword.isNotEmpty
-        ? typedPassword
-        : cachedPassword;
-    if (effectivePassword.isEmpty) {
-      throw const FormatException('Введите пароль пользователя.');
-    }
 
     _serverUrl = normalizedServerUrl;
-    _userName = normalizedUserName;
-    _isScheduledAllowedByServer = _isScheduledAllowedForUser(_userName);
-    _pendingPasswordForAuth = effectivePassword;
+    _authMode = authMode;
+    _pendingPasswordForAuth = null;
+    _pendingPhoneCodeForAuth = null;
 
-    if (_canPersistPasswordLocally && cacheKey.isNotEmpty) {
-      _passwordsByUserLower[cacheKey] = effectivePassword;
+    if (authMode == ChatAuthMode.phone) {
+      final normalizedPhone = _normalizePhoneForAuth(phone);
+      final normalizedEmail = _normalizeEmailForAuth(email);
+      if (normalizedPhone.isEmpty) {
+        throw const FormatException(
+          'Введите номер в международном формате, например +79991234567.',
+        );
+      }
+      if (normalizedEmail.isEmpty) {
+        throw const FormatException(
+          'Введите корректный email, например user@example.com.',
+        );
+      }
+      final normalizedCode = phoneCode.trim();
+      if (!RegExp(r'^\d{6}$').hasMatch(normalizedCode)) {
+        throw const FormatException(
+          'Введите 6-значный код из письма.',
+        );
+      }
+
+      final normalizedProfile = _sanitizeTextForUi(profileName, maxLength: 80);
+      if (registerByPhone && normalizedProfile.isEmpty) {
+        throw const FormatException(
+          'Для регистрации нового аккаунта укажите имя профиля.',
+        );
+      }
+
+      _authPhone = normalizedPhone;
+      _authEmail = normalizedEmail;
+      _authProfileName = normalizedProfile;
+      _registerByPhone = registerByPhone;
+      _pendingPhoneCodeForAuth = normalizedCode;
+      if (normalizedProfile.isNotEmpty) {
+        _userName = normalizedProfile;
+      }
+    } else {
+      final normalizedUserName = userName.trim();
+      if (normalizedUserName.isEmpty) {
+        throw const FormatException('Введите имя пользователя.');
+      }
+
+      final cacheKey = _passwordCacheKey(normalizedUserName);
+      final typedPassword = password.trim();
+      final cachedPassword = !_canPersistPasswordLocally || cacheKey.isEmpty
+          ? ''
+          : (_passwordsByUserLower[cacheKey] ?? '');
+      final effectivePassword = typedPassword.isNotEmpty
+          ? typedPassword
+          : cachedPassword;
+      if (effectivePassword.isEmpty) {
+        throw const FormatException('Введите пароль пользователя.');
+      }
+
+      _userName = normalizedUserName;
+      _pendingPasswordForAuth = effectivePassword;
+      _authPhone = '';
+      _authEmail = '';
+      _authProfileName = '';
+      _registerByPhone = false;
+
+      if (_canPersistPasswordLocally && cacheKey.isNotEmpty) {
+        _passwordsByUserLower[cacheKey] = effectivePassword;
+      }
     }
+    _isScheduledAllowedByServer = _isScheduledAllowedForUser(_userName);
+
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_serverUrlKey, _serverUrl);
     await prefs.setString(_userNameKey, _userName);
+    await prefs.setString(_authModeKey, _authMode.name);
+    await prefs.setString(_authPhoneKey, _authPhone);
+    await prefs.setString(_authEmailKey, _authEmail);
+    await prefs.setString(_authProfileNameKey, _authProfileName);
     if (subscriptionSources != null) {
       _subscriptionSources
         ..clear()
@@ -918,7 +999,7 @@ class ChatProvider extends ChangeNotifier {
       );
     }
     await _refreshAllCandidates(force: true);
-    if (_canPersistPasswordLocally && cacheKey.isNotEmpty) {
+    if (_canPersistPasswordLocally) {
       await prefs.setString(
         _passwordsByUserKey,
         jsonEncode(_passwordsByUserLower),
@@ -926,6 +1007,68 @@ class ChatProvider extends ChangeNotifier {
     }
     await connect(force: true);
     await checkForUpdates();
+  }
+
+  Future<String> requestEmailAuthCode({
+    required String serverUrl,
+    required String phone,
+    required String email,
+  }) async {
+    final normalizedServerUrl = _normalizeServerUrl(serverUrl);
+    final normalizedPhone = _normalizePhoneForAuth(phone);
+    final normalizedEmail = _normalizeEmailForAuth(email);
+    if (normalizedPhone.isEmpty) {
+      throw const FormatException(
+        'Введите номер в международном формате, например +79991234567.',
+      );
+    }
+    if (normalizedEmail.isEmpty) {
+      throw const FormatException(
+        'Введите корректный email, например user@example.com.',
+      );
+    }
+
+    final uri = _emailCodeRequestUriFromServerUrl(normalizedServerUrl);
+    final response = await http
+        .post(
+          uri,
+          headers: const {
+            'accept': 'application/json',
+            'content-type': 'application/json',
+          },
+          body: jsonEncode(<String, dynamic>{
+            'phone': normalizedPhone,
+            'email': normalizedEmail,
+          }),
+        )
+        .timeout(const Duration(seconds: 10));
+
+    Map<String, dynamic> payload = <String, dynamic>{};
+    try {
+      payload = _asMap(jsonDecode(response.body));
+    } catch (_) {}
+
+    if (response.statusCode != 200) {
+      final apiError = (payload['error']?.toString() ?? '').trim();
+      if (apiError.isNotEmpty) {
+        throw FormatException(apiError);
+      }
+      throw FormatException(
+        'Сервер вернул HTTP ${response.statusCode} при запросе кода.',
+      );
+    }
+
+    final ttl = _toInt(payload['ttlSeconds']) ?? 300;
+    final devCode = (payload['devCode']?.toString() ?? '').trim();
+    _authPhone = normalizedPhone;
+    _authEmail = normalizedEmail;
+    _authMode = ChatAuthMode.phone;
+    _pendingPhoneCodeForAuth = null;
+
+    if (devCode.isNotEmpty) {
+      return 'Код отправлен на email (действует $ttl сек). DEV-код: $devCode';
+    }
+    return 'Код отправлен на email (действует $ttl сек).';
   }
 
   Future<void> connect({bool force = false, ProxyEndpoint? proxy}) async {
@@ -944,33 +1087,76 @@ class ChatProvider extends ChangeNotifier {
     _manualDisconnectRequested = false;
     _cancelReconnect(resetAttempt: false);
 
-    if (_userName.trim().isEmpty) {
-      _clearServerUnavailableMarker();
-      _deactivateMeshFallback();
-      _pushNotification(
-        kind: NotificationKind.system,
-        title: 'Авторизация',
-        description: 'Введите имя пользователя из whitelist.',
-        showInSystem: false,
-      );
-      _safeNotify();
-      return;
-    }
+    final usePhoneAuth = _authMode == ChatAuthMode.phone;
+    if (usePhoneAuth) {
+      if (_normalizePhoneForAuth(_authPhone).isEmpty) {
+        _clearServerUnavailableMarker();
+        _deactivateMeshFallback();
+        _pushNotification(
+          kind: NotificationKind.system,
+          title: 'Авторизация',
+          description: 'Введите номер телефона.',
+          showInSystem: false,
+        );
+        _safeNotify();
+        return;
+      }
+      if (_normalizeEmailForAuth(_authEmail).isEmpty) {
+        _clearServerUnavailableMarker();
+        _deactivateMeshFallback();
+        _pushNotification(
+          kind: NotificationKind.system,
+          title: 'Авторизация',
+          description: 'Введите корректный email.',
+          showInSystem: false,
+        );
+        _safeNotify();
+        return;
+      }
+      final code = _pendingPhoneCodeForAuth?.trim() ?? '';
+      if (!RegExp(r'^\d{6}$').hasMatch(code)) {
+        _clearServerUnavailableMarker();
+        _deactivateMeshFallback();
+        _pushNotification(
+          kind: NotificationKind.system,
+          title: 'Код подтверждения',
+          description: 'Укажите 6-значный код из письма для входа.',
+          showInSystem: false,
+        );
+        _setConnectionStatus(ChatConnectionStatus.disconnected);
+        _manualDisconnectRequested = true;
+        _safeNotify();
+        return;
+      }
+    } else {
+      if (_userName.trim().isEmpty) {
+        _clearServerUnavailableMarker();
+        _deactivateMeshFallback();
+        _pushNotification(
+          kind: NotificationKind.system,
+          title: 'Авторизация',
+          description: 'Введите имя пользователя.',
+          showInSystem: false,
+        );
+        _safeNotify();
+        return;
+      }
 
-    final passwordForAuth = _resolvedPasswordForCurrentUser;
-    if (passwordForAuth.isEmpty) {
-      _clearServerUnavailableMarker();
-      _deactivateMeshFallback();
-      _pushNotification(
-        kind: NotificationKind.system,
-        title: 'Требуется пароль',
-        description: 'Введите пароль пользователя в настройках подключения.',
-        showInSystem: false,
-      );
-      _setConnectionStatus(ChatConnectionStatus.disconnected);
-      _manualDisconnectRequested = true;
-      _safeNotify();
-      return;
+      final passwordForAuth = _resolvedPasswordForCurrentUser;
+      if (passwordForAuth.isEmpty) {
+        _clearServerUnavailableMarker();
+        _deactivateMeshFallback();
+        _pushNotification(
+          kind: NotificationKind.system,
+          title: 'Требуется пароль',
+          description: 'Введите пароль пользователя в настройках подключения.',
+          showInSystem: false,
+        );
+        _setConnectionStatus(ChatConnectionStatus.disconnected);
+        _manualDisconnectRequested = true;
+        _safeNotify();
+        return;
+      }
     }
 
     await _closeSocket(sendTypingOff: false, notify: false);
@@ -996,14 +1182,31 @@ class ChatProvider extends ChangeNotifier {
         cancelOnError: true,
       );
 
-      _sendEnvelope(
-        type: 'join',
-        payload: {
-          'userId': _userId,
-          'userName': _userName,
-          'password': passwordForAuth,
-        },
-      );
+      if (usePhoneAuth) {
+        _sendEnvelope(
+          type: 'join',
+          payload: {
+            'userId': _userId,
+            'authMethod': 'phone',
+            'phone': _authPhone,
+            'email': _authEmail,
+            'code': _pendingPhoneCodeForAuth?.trim(),
+            'register': _registerByPhone,
+            if (_authProfileName.trim().isNotEmpty)
+              'profileName': _authProfileName.trim(),
+          },
+        );
+      } else {
+        _sendEnvelope(
+          type: 'join',
+          payload: {
+            'userId': _userId,
+            'authMethod': 'password',
+            'userName': _userName,
+            'password': _resolvedPasswordForCurrentUser,
+          },
+        );
+      }
     } catch (error) {
       _activeProxyEndpoint = null;
       _setConnectionStatus(ChatConnectionStatus.disconnected);
@@ -1182,6 +1385,10 @@ class ChatProvider extends ChangeNotifier {
     SharedPreferences.getInstance().then((prefs) async {
       await prefs.setString(_userIdKey, _userId);
       await prefs.setString(_userNameKey, _userName);
+      await prefs.setString(_authModeKey, _authMode.name);
+      await prefs.setString(_authPhoneKey, _authPhone);
+      await prefs.setString(_authEmailKey, _authEmail);
+      await prefs.setString(_authProfileNameKey, _authProfileName);
       if (_canPersistPasswordLocally) {
         final password = _pendingPasswordForAuth?.trim();
         if (password != null && password.isNotEmpty) {
@@ -1197,6 +1404,7 @@ class ChatProvider extends ChangeNotifier {
       }
     });
     _pendingPasswordForAuth = null;
+    _pendingPhoneCodeForAuth = null;
 
     _safeNotify();
   }
@@ -3339,7 +3547,11 @@ class ChatProvider extends ChangeNotifier {
 
     _reconnectTimer = Timer(delay, () {
       _reconnectTimer = null;
-      if (_disposed || _manualDisconnectRequested || _userName.trim().isEmpty) {
+      final canReconnectByAuth = _authMode == ChatAuthMode.phone
+          ? (_normalizePhoneForAuth(_authPhone).isNotEmpty &&
+              _normalizeEmailForAuth(_authEmail).isNotEmpty)
+          : _userName.trim().isNotEmpty;
+      if (_disposed || _manualDisconnectRequested || !canReconnectByAuth) {
         return;
       }
       unawaited(connect(force: true));
@@ -3474,6 +3686,49 @@ class ChatProvider extends ChangeNotifier {
       path: path,
     );
     return cleaned.toString();
+  }
+
+  String _normalizePhoneForAuth(String input) {
+    var normalized = input.trim();
+    if (normalized.isEmpty) {
+      return '';
+    }
+    normalized = normalized.replaceAll(RegExp(r'[\s\-\(\)]'), '');
+    if (normalized.startsWith('00')) {
+      normalized = '+${normalized.substring(2)}';
+    }
+    if (!normalized.startsWith('+')) {
+      normalized = '+$normalized';
+    }
+    normalized = normalized.replaceAll(RegExp(r'[^0-9+]'), '');
+    if (!RegExp(r'^\+[1-9]\d{9,14}$').hasMatch(normalized)) {
+      return '';
+    }
+    return normalized;
+  }
+
+  String _normalizeEmailForAuth(String input) {
+    final normalized = input.trim().toLowerCase();
+    if (normalized.isEmpty || normalized.length > 254) {
+      return '';
+    }
+    final pattern =
+        RegExp(r"^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+$");
+    if (!pattern.hasMatch(normalized)) {
+      return '';
+    }
+    return normalized;
+  }
+
+  Uri _emailCodeRequestUriFromServerUrl(String wsUrl) {
+    final wsUri = Uri.parse(wsUrl);
+    final scheme = wsUri.scheme == 'wss' ? 'https' : 'http';
+    return Uri(
+      scheme: scheme,
+      host: wsUri.host,
+      port: wsUri.hasPort ? wsUri.port : null,
+      path: '/auth/email/request-code',
+    );
   }
 
   Future<void> checkForUpdates({bool notifyIfNoUpdate = false}) async {

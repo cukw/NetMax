@@ -2004,6 +2004,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
     final userController = TextEditingController(text: chatProvider.userName);
     final passwordController = TextEditingController();
+    final phoneController = TextEditingController(text: chatProvider.authPhone);
+    final emailController = TextEditingController(text: chatProvider.authEmail);
+    final codeController = TextEditingController();
+    final profileController = TextEditingController(
+      text: chatProvider.authProfileName.isEmpty
+          ? chatProvider.userName
+          : chatProvider.authProfileName,
+    );
+    var selectedAuthMode = chatProvider.authMode;
+    var registerByPhone = false;
+    var requestingPhoneCode = false;
     var hasSavedPassword = chatProvider.hasSavedPasswordForUser(
       userController.text,
     );
@@ -2033,7 +2044,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   ),
                   const SizedBox(height: 8),
                   const Text(
-                    'Укажите WebSocket URL сервера, имя пользователя и пароль.',
+                    'Укажите адрес сервера и способ авторизации.',
                   ),
                   const SizedBox(height: 12),
                   TextField(
@@ -2043,6 +2054,32 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       labelText: 'Server URL',
                       hintText: 'ws://localhost:8080/ws',
                     ),
+                  ),
+                  const SizedBox(height: 10),
+                  DropdownButtonFormField<ChatAuthMode>(
+                    key: ValueKey<ChatAuthMode>(selectedAuthMode),
+                    initialValue: selectedAuthMode,
+                    decoration: const InputDecoration(
+                      labelText: 'Метод авторизации',
+                    ),
+                    items: const [
+                      DropdownMenuItem(
+                        value: ChatAuthMode.password,
+                        child: Text('Логин + пароль'),
+                      ),
+                      DropdownMenuItem(
+                        value: ChatAuthMode.phone,
+                        child: Text('Телефон + email + код'),
+                      ),
+                    ],
+                    onChanged: (value) {
+                      if (value == null) {
+                        return;
+                      }
+                      setSheetState(() {
+                        selectedAuthMode = value;
+                      });
+                    },
                   ),
                   const SizedBox(height: 10),
                   TextField(
@@ -2068,51 +2105,163 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                           'http://proxy-list.local/proxies.txt\nПоддержка: http/https/socks5',
                     ),
                   ),
-                  const SizedBox(height: 10),
-                  TextField(
-                    controller: userController,
-                    onChanged: (value) {
-                      setSheetState(() {
-                        hasSavedPassword = chatProvider.hasSavedPasswordForUser(
-                          value,
-                        );
-                      });
-                    },
-                    decoration: const InputDecoration(
-                      labelText: 'Имя пользователя',
+                  if (selectedAuthMode == ChatAuthMode.password) ...[
+                    const SizedBox(height: 10),
+                    TextField(
+                      controller: userController,
+                      onChanged: (value) {
+                        setSheetState(() {
+                          hasSavedPassword = chatProvider.hasSavedPasswordForUser(
+                            value,
+                          );
+                        });
+                      },
+                      decoration: const InputDecoration(
+                        labelText: 'Имя пользователя',
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 10),
-                  TextField(
-                    controller: passwordController,
-                    obscureText: obscurePassword,
-                    autocorrect: false,
-                    enableSuggestions: false,
-                    decoration: InputDecoration(
-                      labelText: 'Пароль',
-                      hintText: hasSavedPassword
-                          ? 'Оставьте пустым, чтобы использовать сохраненный'
-                          : 'Введите пароль',
-                      suffixIcon: IconButton(
-                        onPressed: () {
-                          setSheetState(() {
-                            obscurePassword = !obscurePassword;
-                          });
-                        },
-                        icon: Icon(
-                          obscurePassword
-                              ? Icons.visibility_off_rounded
-                              : Icons.visibility_rounded,
+                    const SizedBox(height: 10),
+                    TextField(
+                      controller: passwordController,
+                      obscureText: obscurePassword,
+                      autocorrect: false,
+                      enableSuggestions: false,
+                      decoration: InputDecoration(
+                        labelText: 'Пароль',
+                        hintText: hasSavedPassword
+                            ? 'Оставьте пустым, чтобы использовать сохраненный'
+                            : 'Введите пароль',
+                        suffixIcon: IconButton(
+                          onPressed: () {
+                            setSheetState(() {
+                              obscurePassword = !obscurePassword;
+                            });
+                          },
+                          icon: Icon(
+                            obscurePassword
+                                ? Icons.visibility_off_rounded
+                                : Icons.visibility_rounded,
+                          ),
                         ),
                       ),
                     ),
-                  ),
-                  if (hasSavedPassword) ...[
-                    const SizedBox(height: 6),
-                    Text(
-                      'Пароль для этого пользователя уже сохранен на устройстве.',
-                      style: Theme.of(context).textTheme.bodySmall,
+                    if (hasSavedPassword) ...[
+                      const SizedBox(height: 6),
+                      Text(
+                        'Пароль для этого пользователя уже сохранен на устройстве.',
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                    ],
+                  ] else ...[
+                    const SizedBox(height: 10),
+                    TextField(
+                      controller: phoneController,
+                      keyboardType: TextInputType.phone,
+                      decoration: const InputDecoration(
+                        labelText: 'Номер телефона',
+                        hintText: '+79991234567',
+                      ),
                     ),
+                    const SizedBox(height: 10),
+                    TextField(
+                      controller: emailController,
+                      keyboardType: TextInputType.emailAddress,
+                      autocorrect: false,
+                      enableSuggestions: false,
+                      decoration: const InputDecoration(
+                        labelText: 'Email для кода',
+                        hintText: 'user@example.com',
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: codeController,
+                            keyboardType: TextInputType.number,
+                            inputFormatters: [
+                              FilteringTextInputFormatter.digitsOnly,
+                            ],
+                            decoration: const InputDecoration(
+                              labelText: 'Код подтверждения',
+                              hintText: '6 цифр',
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        FilledButton.tonal(
+                          onPressed: requestingPhoneCode
+                              ? null
+                              : () async {
+                                  setSheetState(() {
+                                    requestingPhoneCode = true;
+                                  });
+                                  try {
+                                    final info = await chatProvider
+                                        .requestEmailAuthCode(
+                                          serverUrl: serverController.text,
+                                          phone: phoneController.text,
+                                          email: emailController.text,
+                                        );
+                                    if (!context.mounted) {
+                                      return;
+                                    }
+                                    final devMatch = RegExp(
+                                      r'DEV-код:\s*(\d{6})',
+                                    ).firstMatch(info);
+                                    if (devMatch != null) {
+                                      codeController.text = devMatch.group(1)!;
+                                    }
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      SnackBar(content: Text(info)),
+                                    );
+                                  } catch (error) {
+                                    if (!context.mounted) {
+                                      return;
+                                    }
+                                    final message = _readableErrorMessage(error);
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      SnackBar(content: Text(message)),
+                                    );
+                                  } finally {
+                                    if (context.mounted) {
+                                      setSheetState(() {
+                                        requestingPhoneCode = false;
+                                      });
+                                    }
+                                  }
+                                },
+                          child: Text(
+                            requestingPhoneCode ? '...' : 'Запросить код',
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    SwitchListTile.adaptive(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('Новый аккаунт'),
+                      subtitle: const Text(
+                        'Включите, если номер еще не зарегистрирован.',
+                      ),
+                      value: registerByPhone,
+                      onChanged: (value) {
+                        setSheetState(() {
+                          registerByPhone = value;
+                        });
+                      },
+                    ),
+                    if (registerByPhone) ...[
+                      const SizedBox(height: 6),
+                      TextField(
+                        controller: profileController,
+                        decoration: const InputDecoration(
+                          labelText: 'Имя профиля',
+                          hintText: 'Например, Иван Петров',
+                        ),
+                      ),
+                    ],
                   ],
                   const SizedBox(height: 14),
                   Row(
@@ -2138,6 +2287,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                                     subscriptionController.text,
                                 proxySubscriptionSources:
                                     proxySubscriptionController.text,
+                                authMode: selectedAuthMode,
+                                phone: phoneController.text,
+                                email: emailController.text,
+                                phoneCode: codeController.text,
+                                profileName: profileController.text,
+                                registerByPhone: registerByPhone,
                               );
                               if (!context.mounted) {
                                 return;
@@ -2178,6 +2333,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       proxySubscriptionController.dispose();
       userController.dispose();
       passwordController.dispose();
+      phoneController.dispose();
+      emailController.dispose();
+      codeController.dispose();
+      profileController.dispose();
     });
   }
 
