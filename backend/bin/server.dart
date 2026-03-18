@@ -15,6 +15,7 @@ const String _updateManifestRelativePath = 'config/update_manifest.json';
 const String _scheduledConfigRelativePath = 'config/scheduled_messages.json';
 const String _groupChatsConfigRelativePath = 'config/group_chats.json';
 const String _messagesConfigRelativePath = 'config/messages_history.json';
+const String _e2eeKeyConfigRelativePath = 'config/e2ee_shared_key.txt';
 const Duration _scheduleTickInterval = Duration(seconds: 20);
 const Duration _storageCleanupInterval = Duration(minutes: 30);
 const Duration _storageFileMaxAge = Duration(days: 14);
@@ -34,6 +35,9 @@ late final Directory _storageDir;
 late final List<String> _allowedUsers;
 late final Map<String, String> _allowedUsersByLower;
 late final Map<String, String> _passwordsByUserLower;
+late final String _serverManagedE2eeKey;
+late final String _serverManagedE2eeKeySource;
+late final File _e2eeKeyFile;
 late final File _scheduledConfigFile;
 late final File _groupChatsConfigFile;
 late final File _messagesConfigFile;
@@ -62,7 +66,11 @@ Future<void> main() async {
   _messagesConfigFile = File(
     p.join(Directory.current.path, _messagesConfigRelativePath),
   );
+  _e2eeKeyFile = File(
+    p.join(Directory.current.path, _e2eeKeyConfigRelativePath),
+  );
 
+  _loadServerManagedE2eeKey();
   _loadAuthorizedUsers();
   _loadGroupChats();
   _loadMessageHistory();
@@ -110,6 +118,7 @@ Future<void> main() async {
   );
   stdout.writeln('Group chats loaded: ${_groupChatTitlesById.length}');
   stdout.writeln('Messages loaded: ${_group.messages.length}');
+  stdout.writeln('E2EE key source: $_serverManagedE2eeKeySource');
   stdout.writeln(
     'Storage cleanup: every ${_storageCleanupInterval.inMinutes}m, '
     'max age ${_storageFileMaxAge.inDays}d, max size '
@@ -187,6 +196,43 @@ void _loadAuthorizedUsers() {
   _allowedUsers = List<String>.unmodifiable(users);
   _allowedUsersByLower = Map<String, String>.unmodifiable(usersByLower);
   _passwordsByUserLower = Map<String, String>.unmodifiable(passwordsByLower);
+}
+
+void _loadServerManagedE2eeKey() {
+  final fromEnv = (Platform.environment['NETMAX_E2EE_SHARED_KEY'] ?? '').trim();
+  if (fromEnv.isNotEmpty) {
+    _serverManagedE2eeKey = fromEnv;
+    _serverManagedE2eeKeySource = 'env:NETMAX_E2EE_SHARED_KEY';
+    return;
+  }
+
+  if (_e2eeKeyFile.existsSync()) {
+    try {
+      final fromFile = _e2eeKeyFile.readAsStringSync().trim();
+      if (fromFile.isNotEmpty) {
+        _serverManagedE2eeKey = fromFile;
+        _serverManagedE2eeKeySource = _e2eeKeyConfigRelativePath;
+        return;
+      }
+    } catch (_) {
+      // Generate and rewrite key below if the file is unreadable.
+    }
+  }
+
+  final seed = <int>[
+    DateTime.now().microsecondsSinceEpoch & 0xFF,
+    ...List<int>.generate(31, (_) => _random.nextInt(256)),
+  ];
+  _serverManagedE2eeKey = base64UrlEncode(seed);
+  _serverManagedE2eeKeySource = _e2eeKeyConfigRelativePath;
+  try {
+    _e2eeKeyFile.parent.createSync(recursive: true);
+    _e2eeKeyFile.writeAsStringSync(_serverManagedE2eeKey);
+  } catch (_) {
+    stdout.writeln(
+      'Warning: failed to persist E2EE key at $_e2eeKeyConfigRelativePath.',
+    );
+  }
 }
 
 void _loadScheduledRules() {
@@ -1119,7 +1165,15 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
             _sendEnvelope(
               channel,
               type: 'auth_ok',
-              payload: {'userId': userId, 'userName': userName},
+              payload: {
+                'userId': userId,
+                'userName': userName,
+                'encryption': {
+                  'method': 'aes-gcm-256-v1',
+                  'sharedKey': _serverManagedE2eeKey,
+                  'source': 'server',
+                },
+              },
             );
 
             // список уникальных пользаков

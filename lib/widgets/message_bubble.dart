@@ -13,23 +13,31 @@ class MessageBubble extends StatelessWidget {
     required this.isMine,
     required this.currentUserLower,
     this.voicePlaybackUrl,
+    this.isFavorite = false,
+    this.isPinned = false,
     this.onAttachmentTap,
     this.onReply,
     this.onEdit,
     this.onDelete,
     this.onReactionToggle,
+    this.onToggleFavorite,
+    this.onTogglePin,
   });
 
   final ChatMessage message;
   final bool isMine;
   final String currentUserLower;
   final String? voicePlaybackUrl;
+  final bool isFavorite;
+  final bool isPinned;
   final VoidCallback? onAttachmentTap;
   final ValueChanged<ChatMessage>? onReply;
   final ValueChanged<ChatMessage>? onEdit;
   final ValueChanged<ChatMessage>? onDelete;
   final Future<void> Function(ChatMessage message, String reaction)?
   onReactionToggle;
+  final ValueChanged<ChatMessage>? onToggleFavorite;
+  final ValueChanged<ChatMessage>? onTogglePin;
 
   @override
   Widget build(BuildContext context) {
@@ -94,6 +102,24 @@ class MessageBubble extends StatelessWidget {
                 fontWeight: FontWeight.w700,
               ),
             ),
+            if (isPinned) ...[
+              const SizedBox(height: 2),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.push_pin_rounded, size: 12, color: textColor.withAlpha(190)),
+                  const SizedBox(width: 4),
+                  Text(
+                    'Закреплено',
+                    style: TextStyle(
+                      color: textColor.withAlpha(180),
+                      fontSize: 10,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+              ),
+            ],
             const SizedBox(height: 5),
             if (message.replyTo != null) ...[
               _ReplyPreview(
@@ -200,6 +226,38 @@ class MessageBubble extends StatelessWidget {
                           ),
                         )
                         .toList(growable: false),
+                  ),
+                if (onToggleFavorite != null && !message.isDeleted)
+                  InkWell(
+                    borderRadius: BorderRadius.circular(8),
+                    onTap: () => onToggleFavorite!(message),
+                    child: Padding(
+                      padding: const EdgeInsets.all(3),
+                      child: Icon(
+                        isFavorite
+                            ? Icons.star_rounded
+                            : Icons.star_border_rounded,
+                        size: 16,
+                        color: isFavorite
+                            ? Colors.amber
+                            : textColor.withAlpha(170),
+                      ),
+                    ),
+                  ),
+                if (onTogglePin != null && !message.isDeleted)
+                  InkWell(
+                    borderRadius: BorderRadius.circular(8),
+                    onTap: () => onTogglePin!(message),
+                    child: Padding(
+                      padding: const EdgeInsets.all(3),
+                      child: Icon(
+                        isPinned
+                            ? Icons.push_pin_rounded
+                            : Icons.push_pin_outlined,
+                        size: 16,
+                        color: textColor.withAlpha(170),
+                      ),
+                    ),
                   ),
                 if (onReply != null && !message.isDeleted)
                   InkWell(
@@ -376,6 +434,7 @@ class _VoiceAttachmentViewState extends State<_VoiceAttachmentView> {
     false,
     ProcessingState.idle,
   );
+  double _playbackSpeed = 1.0;
   bool _isLoading = false;
   bool _sourceLoaded = false;
 
@@ -495,6 +554,22 @@ class _VoiceAttachmentViewState extends State<_VoiceAttachmentView> {
     await player.seek(position);
   }
 
+  Future<void> _toggleSpeed() async {
+    final player = _player;
+    final next = _playbackSpeed >= 1.9
+        ? 1.0
+        : (_playbackSpeed >= 1.4 ? 2.0 : 1.5);
+    if (player != null) {
+      await player.setSpeed(next);
+    }
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _playbackSpeed = next;
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     final background = widget.isMine
@@ -575,6 +650,22 @@ class _VoiceAttachmentViewState extends State<_VoiceAttachmentView> {
                     size: 18,
                   ),
                 ),
+              TextButton(
+                onPressed: _toggleSpeed,
+                style: TextButton.styleFrom(
+                  minimumSize: const Size(36, 28),
+                  padding: const EdgeInsets.symmetric(horizontal: 6),
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                child: Text(
+                  '${_playbackSpeed.toStringAsFixed(_playbackSpeed == 1.0 ? 0 : 1)}x',
+                  style: TextStyle(
+                    color: widget.textColor.withAlpha(210),
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
             ],
           ),
           SliderTheme(

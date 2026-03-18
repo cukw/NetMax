@@ -55,7 +55,8 @@ class ChatProvider extends ChangeNotifier {
       'proxy_subscription_sources';
   static const String _dismissedUpdateSignatureKey =
       'dismissed_update_signature';
-  static const String _e2eeSecretKey = 'e2ee_secret';
+  static const String _favoriteMessageIdsKey = 'favorite_message_ids';
+  static const String _pinnedByChatKey = 'pinned_by_chat';
 
   static const String _defaultServerUrl = 'ws://localhost:8080/ws';
   static const String _defaultSubscriptionSourcesRaw = String.fromEnvironment(
@@ -95,6 +96,8 @@ class ChatProvider extends ChangeNotifier {
   final Map<String, String> _allowedUsersByLower = <String, String>{};
   final Map<String, String> _directChatPeerById = <String, String>{};
   final Map<String, int> _unreadByChatId = <String, int>{};
+  final Set<String> _favoriteMessageIds = <String>{};
+  final Map<String, String> _pinnedByChatId = <String, String>{};
   String _selectedChatId = _defaultGroupChatId;
   final Random _random = Random();
 
@@ -177,7 +180,6 @@ class ChatProvider extends ChangeNotifier {
   String get serverUrl => _serverUrl;
   String get userName => _userName;
   String get userId => _userId;
-  String get encryptionKey => _e2eeSecret;
   bool get isEncryptionEnabled => _e2eeSecret.trim().isNotEmpty;
   String? get lastError => _lastError;
 
@@ -272,6 +274,28 @@ class ChatProvider extends ChangeNotifier {
 
   List<AppNotification> get notifications =>
       List<AppNotification>.unmodifiable(_notifications.reversed);
+
+  bool isFavoriteMessage(String messageId) {
+    return _favoriteMessageIds.contains(messageId.trim());
+  }
+
+  bool isPinnedMessage(String chatId, String messageId) {
+    final current = _pinnedByChatId[chatId.trim()];
+    return current != null && current == messageId.trim();
+  }
+
+  ChatMessage? get pinnedMessageForSelectedChat {
+    final messageId = _pinnedByChatId[_selectedChatId];
+    if (messageId == null || messageId.isEmpty) {
+      return null;
+    }
+    for (final message in _messages) {
+      if (message.id == messageId) {
+        return message;
+      }
+    }
+    return null;
+  }
 
   List<String> get mentionCandidates {
     final meLower = _userName.trim().toLowerCase();
@@ -804,7 +828,17 @@ class ChatProvider extends ChangeNotifier {
       ..addAll(_parseSourceUrls(storedProxySourcesRaw));
 
     _userName = (prefs.getString(_userNameKey) ?? '').trim();
-    _e2eeSecret = (prefs.getString(_e2eeSecretKey) ?? '').trim();
+    _e2eeSecret = '';
+    _favoriteMessageIds
+      ..clear()
+      ..addAll(
+        _decodeStringSet(prefs.getStringList(_favoriteMessageIdsKey)),
+      );
+    _pinnedByChatId
+      ..clear()
+      ..addAll(
+        _decodeStringMap(prefs.getString(_pinnedByChatKey)),
+      );
 
     final storedUserId = (prefs.getString(_userIdKey) ?? '').trim();
     _userId = storedUserId.isEmpty ? _nextId() : storedUserId;
@@ -831,7 +865,6 @@ class ChatProvider extends ChangeNotifier {
     required String password,
     String? subscriptionSources,
     String? proxySubscriptionSources,
-    String? encryptionKey,
   }) async {
     final normalizedServerUrl = _normalizeServerUrl(serverUrl);
     final normalizedUserName = userName.trim();
@@ -856,9 +889,6 @@ class ChatProvider extends ChangeNotifier {
 
     _serverUrl = normalizedServerUrl;
     _userName = normalizedUserName;
-    if (encryptionKey != null) {
-      _e2eeSecret = encryptionKey.trim();
-    }
     _isScheduledAllowedByServer = _isScheduledAllowedForUser(_userName);
     _pendingPasswordForAuth = effectivePassword;
 
@@ -868,9 +898,6 @@ class ChatProvider extends ChangeNotifier {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_serverUrlKey, _serverUrl);
     await prefs.setString(_userNameKey, _userName);
-    if (encryptionKey != null) {
-      await prefs.setString(_e2eeSecretKey, _e2eeSecret);
-    }
     if (subscriptionSources != null) {
       _subscriptionSources
         ..clear()
@@ -1123,6 +1150,8 @@ class ChatProvider extends ChangeNotifier {
   void _handleAuthOk(Map<String, dynamic> payload) {
     final authorizedUserId = (payload['userId']?.toString() ?? '').trim();
     final authorizedUserName = (payload['userName']?.toString() ?? '').trim();
+    final encryptionPayload = _asMap(payload['encryption']);
+    final serverKey = (encryptionPayload['sharedKey']?.toString() ?? '').trim();
 
     if (authorizedUserId.isNotEmpty) {
       _userId = authorizedUserId;
@@ -1130,6 +1159,7 @@ class ChatProvider extends ChangeNotifier {
     if (authorizedUserName.isNotEmpty) {
       _userName = authorizedUserName;
     }
+    _e2eeSecret = serverKey;
     _isScheduledAllowedByServer = _isScheduledAllowedForUser(_userName);
     _syncDirectChats();
     _ensureSelectedChatExists();
@@ -1283,6 +1313,7 @@ class ChatProvider extends ChangeNotifier {
     }
 
     _messages.sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    _cleanupPinnedAndFavorites();
     _syncDirectChats();
     _ensureSelectedChatExists();
     _markSelectedChatMessagesAsRead();
@@ -1472,6 +1503,30 @@ class ChatProvider extends ChangeNotifier {
     _messages.removeRange(0, overflow);
     for (final message in removed) {
       _messageIds.remove(message.id);
+    }
+    _cleanupPinnedAndFavorites();
+  }
+
+  void _cleanupPinnedAndFavorites() {
+    final knownIds = _messages.map((message) => message.id).toSet();
+    final previousFavoritesCount = _favoriteMessageIds.length;
+    _favoriteMessageIds.removeWhere((id) => !knownIds.contains(id));
+
+    final staleChatIds = <String>[];
+    for (final entry in _pinnedByChatId.entries) {
+      if (!knownIds.contains(entry.value)) {
+        staleChatIds.add(entry.key);
+      }
+    }
+    for (final chatId in staleChatIds) {
+      _pinnedByChatId.remove(chatId);
+    }
+
+    if (_favoriteMessageIds.length != previousFavoritesCount) {
+      unawaited(_saveFavoritesCache());
+    }
+    if (staleChatIds.isNotEmpty) {
+      unawaited(_savePinnedCache());
     }
   }
 
@@ -1826,6 +1881,67 @@ class ChatProvider extends ChangeNotifier {
     );
   }
 
+  Future<void> toggleFavorite(ChatMessage message) async {
+    final id = message.id.trim();
+    if (id.isEmpty) {
+      return;
+    }
+    if (_favoriteMessageIds.contains(id)) {
+      _favoriteMessageIds.remove(id);
+    } else {
+      _favoriteMessageIds.add(id);
+    }
+    await _saveFavoritesCache();
+    _safeNotify();
+  }
+
+  Future<void> togglePinForChat(ChatMessage message) async {
+    final messageId = message.id.trim();
+    final chatId = message.chatId.trim();
+    if (messageId.isEmpty || chatId.isEmpty) {
+      return;
+    }
+    final currentPinned = _pinnedByChatId[chatId];
+    if (currentPinned == messageId) {
+      _pinnedByChatId.remove(chatId);
+    } else {
+      _pinnedByChatId[chatId] = messageId;
+    }
+    await _savePinnedCache();
+    _safeNotify();
+  }
+
+  List<ChatMessage> searchMessages({
+    required String query,
+    String? chatId,
+  }) {
+    final normalized = query.trim().toLowerCase();
+    if (normalized.isEmpty) {
+      return const <ChatMessage>[];
+    }
+
+    final targetChat = (chatId ?? _selectedChatId).trim();
+    final result = _messages.where((message) {
+      if (targetChat.isNotEmpty && message.chatId != targetChat) {
+        return false;
+      }
+      if (message.isDeleted) {
+        return false;
+      }
+      final sender = message.senderName.toLowerCase();
+      final text = (message.text ?? '').toLowerCase();
+      final fileName = (message.attachment?.name ?? '').toLowerCase();
+      final reply = (message.replyTo?.text ?? '').toLowerCase();
+      return sender.contains(normalized) ||
+          text.contains(normalized) ||
+          fileName.contains(normalized) ||
+          reply.contains(normalized);
+    }).toList(growable: false)
+      ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+
+    return result;
+  }
+
   Future<PreparedFileUpload?> pickFileForSending() async {
     if (!isConnected) {
       throw const FormatException(
@@ -2080,6 +2196,40 @@ class ChatProvider extends ChangeNotifier {
     }
   }
 
+  Set<String> _decodeStringSet(List<String>? raw) {
+    if (raw == null || raw.isEmpty) {
+      return <String>{};
+    }
+    return raw
+        .map((item) => item.trim())
+        .where((item) => item.isNotEmpty)
+        .toSet();
+  }
+
+  Map<String, String> _decodeStringMap(String? raw) {
+    if (raw == null || raw.trim().isEmpty) {
+      return <String, String>{};
+    }
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) {
+        return <String, String>{};
+      }
+      final result = <String, String>{};
+      decoded.forEach((key, value) {
+        final k = key.toString().trim();
+        final v = value.toString().trim();
+        if (k.isEmpty || v.isEmpty) {
+          return;
+        }
+        result[k] = v;
+      });
+      return result;
+    } catch (_) {
+      return <String, String>{};
+    }
+  }
+
   Future<void> _savePasswordCache() async {
     if (!_canPersistPasswordLocally) {
       return;
@@ -2089,6 +2239,19 @@ class ChatProvider extends ChangeNotifier {
       _passwordsByUserKey,
       jsonEncode(_passwordsByUserLower),
     );
+  }
+
+  Future<void> _saveFavoritesCache() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(
+      _favoriteMessageIdsKey,
+      _favoriteMessageIds.toList(growable: false),
+    );
+  }
+
+  Future<void> _savePinnedCache() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_pinnedByChatKey, jsonEncode(_pinnedByChatId));
   }
 
   List<String> _extractMentionsFromText(String text) {

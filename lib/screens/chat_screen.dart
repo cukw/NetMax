@@ -26,6 +26,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   final TextEditingController _messageController = TextEditingController();
   final TextEditingController _chatSearchController = TextEditingController();
+  final TextEditingController _messageSearchController =
+      TextEditingController();
   final TextEditingController _scheduledTextController =
       TextEditingController();
   final ScrollController _scrollController = ScrollController();
@@ -73,6 +75,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     unawaited(_audioRecorder.dispose());
     _messageController.dispose();
     _chatSearchController.dispose();
+    _messageSearchController.dispose();
     _scheduledTextController.dispose();
     _scrollController.dispose();
     _messageFocusNode.dispose();
@@ -498,6 +501,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           encoder: AudioEncoder.pcm16bits,
           sampleRate: 16000,
           numChannels: 1,
+          autoGain: true,
+          echoCancel: true,
+          noiseSuppress: true,
         ),
       );
 
@@ -740,6 +746,34 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     String reaction,
   ) async {
     await chatProvider.toggleReaction(message, reaction);
+  }
+
+  Future<void> _toggleFavorite(
+    ChatProvider chatProvider,
+    ChatMessage message,
+  ) async {
+    await chatProvider.toggleFavorite(message);
+  }
+
+  Future<void> _togglePin(
+    ChatProvider chatProvider,
+    ChatMessage message,
+  ) async {
+    await chatProvider.togglePinForChat(message);
+  }
+
+  List<ChatMessage> _filteredMessagesForView(
+    ChatProvider chatProvider,
+    List<ChatMessage> source,
+  ) {
+    final query = _messageSearchController.text.trim();
+    if (query.isEmpty) {
+      return source;
+    }
+    return chatProvider.searchMessages(
+      query: query,
+      chatId: chatProvider.selectedChatId,
+    );
   }
 
   void _ensureMessageInputFocus({bool force = false}) {
@@ -1175,6 +1209,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     required bool canSend,
     VoidCallback? onOpenChats,
   }) {
+    final visibleMessages = _filteredMessagesForView(chatProvider, messages);
+    final pinned = chatProvider.pinnedMessageForSelectedChat;
+    final searchActive = _messageSearchController.text.trim().isNotEmpty;
+
     return Column(
       children: [
         Padding(
@@ -1198,16 +1236,80 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
+              IconButton(
+                tooltip: 'Очистить поиск',
+                onPressed: searchActive
+                    ? () {
+                        _messageSearchController.clear();
+                        setState(() {});
+                      }
+                    : null,
+                icon: const Icon(Icons.search_off_rounded),
+              ),
             ],
           ),
         ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+          child: TextField(
+            controller: _messageSearchController,
+            onChanged: (_) => setState(() {}),
+            decoration: InputDecoration(
+              hintText: 'Поиск по сообщениям в текущем чате',
+              prefixIcon: const Icon(Icons.search_rounded),
+              suffixIcon: searchActive
+                  ? IconButton(
+                      tooltip: 'Очистить',
+                      onPressed: () {
+                        _messageSearchController.clear();
+                        setState(() {});
+                      },
+                      icon: const Icon(Icons.close_rounded),
+                    )
+                  : null,
+            ),
+          ),
+        ),
+        if (pinned != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            child: Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.secondaryContainer,
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.push_pin_rounded, size: 16),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      ((pinned.text ?? '').trim().isEmpty
+                              ? (pinned.attachment?.name ?? 'Закрепленное сообщение')
+                              : pinned.text!)
+                          .trim(),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Снять закреп',
+                    onPressed: () => _togglePin(chatProvider, pinned),
+                    icon: const Icon(Icons.close_rounded, size: 18),
+                  ),
+                ],
+              ),
+            ),
+          ),
         Expanded(
           child: ListView.builder(
             controller: _scrollController,
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-            itemCount: messages.length,
+            itemCount: visibleMessages.length,
             itemBuilder: (context, index) {
-              final message = messages[index];
+              final message = visibleMessages[index];
               final isMine = chatProvider.isMyMessage(message);
               final voicePlaybackUrl =
                   message.isVoiceMessage && message.attachment != null
@@ -1218,6 +1320,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 isMine: isMine,
                 currentUserLower: chatProvider.userName.trim().toLowerCase(),
                 voicePlaybackUrl: voicePlaybackUrl,
+                isFavorite: chatProvider.isFavoriteMessage(message.id),
+                isPinned: chatProvider.isPinnedMessage(
+                  message.chatId,
+                  message.id,
+                ),
                 onAttachmentTap: message.attachment == null
                     ? null
                     : () => _openAttachment(chatProvider, message.attachment!),
@@ -1234,6 +1341,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     ? null
                     : (msg, reaction) =>
                           _toggleReaction(chatProvider, msg, reaction),
+                onToggleFavorite: message.type == MessageType.system
+                    ? null
+                    : (msg) => _toggleFavorite(chatProvider, msg),
+                onTogglePin: message.type == MessageType.system
+                    ? null
+                    : (msg) => _togglePin(chatProvider, msg),
               );
             },
           ),
@@ -1367,6 +1480,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     chatProvider.selectChat(thread.id);
     _messageController.clear();
     _clearMentionSuggestions();
+    _messageSearchController.clear();
     _chatSearchController.clear();
     _replyToMessage = null;
     setState(() {});
@@ -1405,7 +1519,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     Text('Пользователь: ${chatProvider.userName}'),
                     const SizedBox(height: 4),
                     Text(
-                      'Шифрование: ${chatProvider.isEncryptionEnabled ? "включено" : "выключено"}',
+                      'Шифрование: ${chatProvider.isEncryptionEnabled ? "включено (серверный ключ)" : "выключено"}',
                     ),
                     const SizedBox(height: 10),
                     FilledButton.tonalIcon(
@@ -1780,11 +1894,29 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     : const Icon(Icons.attach_file_rounded),
               ),
               const SizedBox(width: 8),
-              IconButton.filledTonal(
-                onPressed: () => _toggleVoiceRecording(chatProvider),
-                tooltip: _isRecordingVoice ? 'Остановить запись' : 'Записать ГС',
-                icon: Icon(
-                  _isRecordingVoice ? Icons.stop_circle_rounded : Icons.mic_rounded,
+              GestureDetector(
+                onLongPressStart: (_) {
+                  if (_isRecordingVoice) {
+                    return;
+                  }
+                  unawaited(_startVoiceRecording(chatProvider));
+                },
+                onLongPressEnd: (_) {
+                  if (!_isRecordingVoice) {
+                    return;
+                  }
+                  unawaited(_stopVoiceRecording(chatProvider));
+                },
+                child: IconButton.filledTonal(
+                  onPressed: () => _toggleVoiceRecording(chatProvider),
+                  tooltip: _isRecordingVoice
+                      ? 'Остановить запись'
+                      : 'Записать ГС (или удерживайте)',
+                  icon: Icon(
+                    _isRecordingVoice
+                        ? Icons.stop_circle_rounded
+                        : Icons.mic_rounded,
+                  ),
                 ),
               ),
               const SizedBox(width: 8),
@@ -1830,14 +1962,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
     final userController = TextEditingController(text: chatProvider.userName);
     final passwordController = TextEditingController();
-    final encryptionController = TextEditingController(
-      text: chatProvider.encryptionKey,
-    );
     var hasSavedPassword = chatProvider.hasSavedPasswordForUser(
       userController.text,
     );
     var obscurePassword = true;
-    var obscureEncryption = true;
 
     final future = showModalBottomSheet<void>(
       context: context,
@@ -1937,30 +2065,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       ),
                     ),
                   ),
-                  const SizedBox(height: 10),
-                  TextField(
-                    controller: encryptionController,
-                    obscureText: obscureEncryption,
-                    autocorrect: false,
-                    enableSuggestions: false,
-                    decoration: InputDecoration(
-                      labelText: 'Ключ шифрования (опционально)',
-                      hintText:
-                          'Оставьте пустым, чтобы отправлять без шифрования',
-                      suffixIcon: IconButton(
-                        onPressed: () {
-                          setSheetState(() {
-                            obscureEncryption = !obscureEncryption;
-                          });
-                        },
-                        icon: Icon(
-                          obscureEncryption
-                              ? Icons.visibility_off_rounded
-                              : Icons.visibility_rounded,
-                        ),
-                      ),
-                    ),
-                  ),
                   if (hasSavedPassword) ...[
                     const SizedBox(height: 6),
                     Text(
@@ -1992,7 +2096,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                                     subscriptionController.text,
                                 proxySubscriptionSources:
                                     proxySubscriptionController.text,
-                                encryptionKey: encryptionController.text,
                               );
                               if (!context.mounted) {
                                 return;
@@ -2033,7 +2136,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       proxySubscriptionController.dispose();
       userController.dispose();
       passwordController.dispose();
-      encryptionController.dispose();
     });
   }
 
