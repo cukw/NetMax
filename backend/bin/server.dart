@@ -3001,7 +3001,7 @@ String _normalizeEmail(Object? value) {
   if (raw.length > 254) {
     return '';
   }
-  if (!RegExp(r'^[a-z0-9.!#$%&\'*+/=?^_`{|}~-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+$')
+  if (!RegExp(r"^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+$")
       .hasMatch(raw)) {
     return '';
   }
