@@ -1465,16 +1465,14 @@ Future<Response> _emailRequestCodeHandler(Request request) async {
 
   final existingByEmail = _userLowerByEmail[email];
   final existingByPhone = _userLowerByPhone[phone];
-  if (existingByEmail != null &&
-      existingByPhone != null &&
-      existingByEmail != existingByPhone) {
+  if (existingByEmail != null || existingByPhone != null) {
     return _json({
       'error':
-          'Этот email уже привязан к другому номеру. Используйте email владельца номера.',
+          'Аккаунт с таким телефоном или email уже существует. Код нужен только для регистрации нового аккаунта.',
     }, statusCode: 409);
   }
 
-  final code = _issueEmailCode(email);
+  final code = _issueEmailCode(phoneE164: phone, email: email);
   var emailSent = false;
   if (_smtpConfigured) {
     emailSent = await _sendAuthCodeByEmail(email: email, code: code);
@@ -1490,8 +1488,8 @@ Future<Response> _emailRequestCodeHandler(Request request) async {
     'email': email,
     'ttlSeconds': _emailCodeTtl.inSeconds,
     'message': emailSent
-        ? 'Код подтверждения отправлен на почту.'
-        : 'Код подтверждения создан.',
+        ? 'Код для регистрации отправлен на почту.'
+        : 'Код для регистрации создан.',
   };
   if (_returnDevEmailCodeInResponse) {
     response['devCode'] = code;
@@ -1723,6 +1721,15 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
 
             String authorizedName;
             if (authMethod == 'phone') {
+              final shouldRegister = payload['register'] == true;
+              if (!shouldRegister) {
+                _denyAndClose(
+                  channel,
+                  'Этот метод авторизации доступен только для создания нового аккаунта.',
+                );
+                return;
+              }
+
               final phone = _normalizePhoneE164(payload['phone']);
               final email = _normalizeEmail(payload['email']);
               if (phone.isEmpty) {
@@ -1739,34 +1746,48 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
                 );
                 return;
               }
+              final registerPassword = (payload['password']?.toString() ?? '')
+                  .trim();
+              if (registerPassword.length < 4) {
+                _denyAndClose(
+                  channel,
+                  'Для нового аккаунта задайте пароль длиной не менее 4 символов.',
+                );
+                return;
+              }
+              if (_userLowerByPhone.containsKey(phone) ||
+                  _userLowerByEmail.containsKey(email)) {
+                _denyAndClose(
+                  channel,
+                  'Аккаунт уже существует. Войдите через логин и пароль.',
+                );
+                return;
+              }
 
               final code = (payload['code']?.toString() ?? '').trim();
-              final codeError = _consumeEmailCode(email: email, code: code);
+              final codeError = _consumeEmailCode(
+                phoneE164: phone,
+                email: email,
+                code: code,
+              );
               if (codeError != null) {
                 _denyAndClose(channel, 'Авторизация отклонена: $codeError');
                 return;
               }
 
-              final shouldRegister = payload['register'] == true;
-              if (shouldRegister &&
-                  !_userLowerByPhone.containsKey(phone) &&
-                  !_userLowerByEmail.containsKey(email)) {
-                final requestedProfile = _sanitizePlainText(
-                  _normalizeUserName(payload['profileName']),
-                  maxLength: 80,
-                );
-                final registeredName = _registerPhoneEmailUser(
-                  phoneE164: phone,
-                  email: email,
-                  requestedProfileName: requestedProfile,
-                );
-                stdout.writeln(
-                  'Phone+Email user registered: "$registeredName" ($phone, $email)',
-                );
-              }
-              if (shouldRegister) {
-                _bindPhoneEmailIfPossible(phoneE164: phone, email: email);
-              }
+              final requestedProfile = _sanitizePlainText(
+                _normalizeUserName(payload['profileName']),
+                maxLength: 80,
+              );
+              final registeredName = _registerPhoneEmailUser(
+                phoneE164: phone,
+                email: email,
+                requestedProfileName: requestedProfile,
+                password: registerPassword,
+              );
+              stdout.writeln(
+                'Phone+Email user registered: "$registeredName" ($phone, $email)',
+              );
 
               final userLower = _userLowerByPhone[phone];
               if (userLower == null) {
@@ -2987,9 +3008,10 @@ String _normalizeEmail(Object? value) {
   return raw;
 }
 
-String _issueEmailCode(String email) {
+String _issueEmailCode({required String phoneE164, required String email}) {
   final code = (100000 + _random.nextInt(900000)).toString();
   _pendingEmailCodesByEmail[email] = _PendingEmailCode(
+    phoneE164: phoneE164,
     code: code,
     expiresAt: DateTime.now().toUtc().add(_emailCodeTtl),
     attemptsLeft: _emailCodeMaxAttempts,
@@ -2997,7 +3019,11 @@ String _issueEmailCode(String email) {
   return code;
 }
 
-String? _consumeEmailCode({required String email, required String code}) {
+String? _consumeEmailCode({
+  required String phoneE164,
+  required String email,
+  required String code,
+}) {
   final normalizedCode = code.trim();
   if (!RegExp(r'^\d{6}$').hasMatch(normalizedCode)) {
     return 'код должен содержать 6 цифр.';
@@ -3006,6 +3032,11 @@ String? _consumeEmailCode({required String email, required String code}) {
   final pending = _pendingEmailCodesByEmail[email];
   if (pending == null) {
     return 'сначала запросите код.';
+  }
+
+  if (pending.phoneE164 != phoneE164) {
+    _pendingEmailCodesByEmail.remove(email);
+    return 'код привязан к другому номеру. Запросите новый код.';
   }
 
   if (DateTime.now().toUtc().isAfter(pending.expiresAt)) {
@@ -3030,22 +3061,8 @@ String _registerPhoneEmailUser({
   required String phoneE164,
   required String email,
   required String requestedProfileName,
+  required String password,
 }) {
-  final existingLower = _userLowerByPhone[phoneE164];
-  if (existingLower != null) {
-    final existing = _allowedUsersByLower[existingLower];
-    if (existing != null && existing.isNotEmpty) {
-      return existing;
-    }
-  }
-  final existingByEmail = _userLowerByEmail[email];
-  if (existingByEmail != null) {
-    final existing = _allowedUsersByLower[existingByEmail];
-    if (existing != null && existing.isNotEmpty) {
-      return existing;
-    }
-  }
-
   final baseName = requestedProfileName.isEmpty
       ? _buildDefaultPhoneProfileName(phoneE164)
       : requestedProfileName;
@@ -3070,7 +3087,7 @@ String _registerPhoneEmailUser({
     insert.execute(<Object?>[
       lower,
       uniqueName,
-      '',
+      password,
       phoneE164,
       email,
       'phone_email',
@@ -3083,40 +3100,6 @@ String _registerPhoneEmailUser({
 
   _reloadUsersCacheFromDb();
   return uniqueName;
-}
-
-void _bindPhoneEmailIfPossible({
-  required String phoneE164,
-  required String email,
-}) {
-  final byPhone = _userLowerByPhone[phoneE164];
-  final byEmail = _userLowerByEmail[email];
-  if (byPhone == null && byEmail == null) {
-    return;
-  }
-  if (byPhone != null && byEmail != null && byPhone != byEmail) {
-    return;
-  }
-
-  final target = byPhone ?? byEmail;
-  if (target == null) {
-    return;
-  }
-
-  final now = DateTime.now().toUtc().toIso8601String();
-  final update = _usersDb.prepare(
-    '''
-    UPDATE users
-    SET phone_e164 = ?, email = ?, auth_type = ?, updated_at = ?
-    WHERE name_lower = ?
-    ''',
-  );
-  try {
-    update.execute(<Object?>[phoneE164, email, 'phone_email', now, target]);
-  } finally {
-    update.dispose();
-  }
-  _reloadUsersCacheFromDb();
 }
 
 Future<bool> _sendAuthCodeByEmail({
@@ -3409,11 +3392,13 @@ class _DirectChatContext {
 
 class _PendingEmailCode {
   _PendingEmailCode({
+    required this.phoneE164,
     required this.code,
     required this.expiresAt,
     required this.attemptsLeft,
   });
 
+  final String phoneE164;
   final String code;
   final DateTime expiresAt;
   int attemptsLeft;

@@ -108,7 +108,8 @@ dart run bin/server.dart
 Если переменная не задана, backend создает и хранит стабильный ключ в `backend/config/e2ee_shared_key.txt`.
 Лимит истории сообщений на backend настраивается через `NETMAX_HISTORY_LIMIT` (по умолчанию `10000`).
 URI MongoDB задается через `NETMAX_MONGO_URI` (по умолчанию `mongodb://127.0.0.1:27017/netmax`).
-Для входа по `телефон + email` клиент вызывает `POST /auth/email/request-code` и затем подключается в WebSocket с `authMethod=phone` (payload: `phone`, `email`, `code`).
+Для регистрации нового аккаунта по `телефон + email` клиент вызывает `POST /auth/email/request-code` и затем подключается в WebSocket с `authMethod=phone` (payload: `phone`, `email`, `code`, `register=true`, `password`).  
+Для существующих аккаунтов используйте обычный вход `логин + пароль`.
 Dev-режим возврата OTP-кода в API управляется `NETMAX_EMAIL_AUTH_RETURN_DEV_CODE` (`true` по умолчанию; в проде рекомендуется `false`).
 Для реальной отправки писем настройте SMTP:
 `NETMAX_SMTP_HOST`, `NETMAX_SMTP_PORT`, `NETMAX_SMTP_FROM`, опционально `NETMAX_SMTP_USERNAME`, `NETMAX_SMTP_PASSWORD`, `NETMAX_SMTP_TLS`.

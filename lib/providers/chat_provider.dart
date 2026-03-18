@@ -898,7 +898,6 @@ class ChatProvider extends ChangeNotifier {
     String email = '',
     String phoneCode = '',
     String profileName = '',
-    bool registerByPhone = false,
   }) async {
     final normalizedServerUrl = _normalizeServerUrl(serverUrl);
 
@@ -926,19 +925,21 @@ class ChatProvider extends ChangeNotifier {
           'Введите 6-значный код из письма.',
         );
       }
-
-      final normalizedProfile = _sanitizeTextForUi(profileName, maxLength: 80);
-      if (registerByPhone && normalizedProfile.isEmpty) {
+      final registerPassword = password.trim();
+      if (registerPassword.length < 4) {
         throw const FormatException(
-          'Для регистрации нового аккаунта укажите имя профиля.',
+          'Для нового аккаунта задайте пароль минимум из 4 символов.',
         );
       }
+
+      final normalizedProfile = _sanitizeTextForUi(profileName, maxLength: 80);
 
       _authPhone = normalizedPhone;
       _authEmail = normalizedEmail;
       _authProfileName = normalizedProfile;
-      _registerByPhone = registerByPhone;
+      _registerByPhone = true;
       _pendingPhoneCodeForAuth = normalizedCode;
+      _pendingPasswordForAuth = registerPassword;
       if (normalizedProfile.isNotEmpty) {
         _userName = normalizedProfile;
       }
@@ -1066,9 +1067,9 @@ class ChatProvider extends ChangeNotifier {
     _pendingPhoneCodeForAuth = null;
 
     if (devCode.isNotEmpty) {
-      return 'Код отправлен на email (действует $ttl сек). DEV-код: $devCode';
+      return 'Код для регистрации отправлен на email (действует $ttl сек). DEV-код: $devCode';
     }
-    return 'Код отправлен на email (действует $ttl сек).';
+    return 'Код для регистрации отправлен на email (действует $ttl сек).';
   }
 
   Future<void> connect({bool force = false, ProxyEndpoint? proxy}) async {
@@ -1120,7 +1121,22 @@ class ChatProvider extends ChangeNotifier {
         _pushNotification(
           kind: NotificationKind.system,
           title: 'Код подтверждения',
-          description: 'Укажите 6-значный код из письма для входа.',
+          description: 'Укажите 6-значный код из письма для регистрации.',
+          showInSystem: false,
+        );
+        _setConnectionStatus(ChatConnectionStatus.disconnected);
+        _manualDisconnectRequested = true;
+        _safeNotify();
+        return;
+      }
+      final registerPassword = _pendingPasswordForAuth?.trim() ?? '';
+      if (registerPassword.length < 4) {
+        _clearServerUnavailableMarker();
+        _deactivateMeshFallback();
+        _pushNotification(
+          kind: NotificationKind.system,
+          title: 'Регистрация',
+          description: 'Укажите пароль нового аккаунта (минимум 4 символа).',
           showInSystem: false,
         );
         _setConnectionStatus(ChatConnectionStatus.disconnected);
@@ -1191,7 +1207,8 @@ class ChatProvider extends ChangeNotifier {
             'phone': _authPhone,
             'email': _authEmail,
             'code': _pendingPhoneCodeForAuth?.trim(),
-            'register': _registerByPhone,
+            'register': true,
+            'password': _pendingPasswordForAuth?.trim(),
             if (_authProfileName.trim().isNotEmpty)
               'profileName': _authProfileName.trim(),
           },
@@ -1362,6 +1379,12 @@ class ChatProvider extends ChangeNotifier {
     }
     if (authorizedUserName.isNotEmpty) {
       _userName = authorizedUserName;
+    }
+    if (_authMode == ChatAuthMode.phone) {
+      // Phone+email+code is used only for account creation.
+      // After success switch to regular password login.
+      _authMode = ChatAuthMode.password;
+      _registerByPhone = false;
     }
     _e2eeSecret = serverKey;
     _isScheduledAllowedByServer = _isScheduledAllowedForUser(_userName);

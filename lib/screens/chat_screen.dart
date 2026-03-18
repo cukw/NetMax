@@ -2013,7 +2013,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           : chatProvider.authProfileName,
     );
     var selectedAuthMode = chatProvider.authMode;
-    var registerByPhone = false;
     var requestingPhoneCode = false;
     var hasSavedPassword = chatProvider.hasSavedPasswordForUser(
       userController.text,
@@ -2069,7 +2068,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       ),
                       DropdownMenuItem(
                         value: ChatAuthMode.phone,
-                        child: Text('Телефон + email + код'),
+                        child: Text('Регистрация: телефон + email'),
                       ),
                     ],
                     onChanged: (value) {
@@ -2081,6 +2080,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       });
                     },
                   ),
+                  if (selectedAuthMode == ChatAuthMode.phone) ...[
+                    const SizedBox(height: 8),
+                    Text(
+                      'Телефон, email и код используются только для создания нового аккаунта.',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ],
                   const SizedBox(height: 10),
                   TextField(
                     controller: subscriptionController,
@@ -2239,29 +2245,36 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       ],
                     ),
                     const SizedBox(height: 10),
-                    SwitchListTile.adaptive(
-                      contentPadding: EdgeInsets.zero,
-                      title: const Text('Новый аккаунт'),
-                      subtitle: const Text(
-                        'Включите, если номер еще не зарегистрирован.',
+                    TextField(
+                      controller: profileController,
+                      decoration: const InputDecoration(
+                        labelText: 'Имя профиля',
+                        hintText: 'Например, Иван Петров',
                       ),
-                      value: registerByPhone,
-                      onChanged: (value) {
-                        setSheetState(() {
-                          registerByPhone = value;
-                        });
-                      },
                     ),
-                    if (registerByPhone) ...[
-                      const SizedBox(height: 6),
-                      TextField(
-                        controller: profileController,
-                        decoration: const InputDecoration(
-                          labelText: 'Имя профиля',
-                          hintText: 'Например, Иван Петров',
+                    const SizedBox(height: 10),
+                    TextField(
+                      controller: passwordController,
+                      obscureText: obscurePassword,
+                      autocorrect: false,
+                      enableSuggestions: false,
+                      decoration: InputDecoration(
+                        labelText: 'Пароль нового аккаунта',
+                        hintText: 'Минимум 4 символа',
+                        suffixIcon: IconButton(
+                          onPressed: () {
+                            setSheetState(() {
+                              obscurePassword = !obscurePassword;
+                            });
+                          },
+                          icon: Icon(
+                            obscurePassword
+                                ? Icons.visibility_off_rounded
+                                : Icons.visibility_rounded,
+                          ),
                         ),
                       ),
-                    ],
+                    ),
                   ],
                   const SizedBox(height: 14),
                   Row(
@@ -2292,7 +2305,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                                 email: emailController.text,
                                 phoneCode: codeController.text,
                                 profileName: profileController.text,
-                                registerByPhone: registerByPhone,
                               );
                               if (!context.mounted) {
                                 return;
