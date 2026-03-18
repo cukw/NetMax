@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
 import 'package:record/record.dart';
@@ -21,6 +22,8 @@ class ChatScreen extends StatefulWidget {
 }
 
 class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
+  static const Duration _maxVoiceRecordingDuration = Duration(minutes: 3);
+
   final TextEditingController _messageController = TextEditingController();
   final TextEditingController _chatSearchController = TextEditingController();
   final TextEditingController _scheduledTextController =
@@ -510,14 +513,29 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         if (!mounted || startedAt == null) {
           return;
         }
+        final elapsed = DateTime.now().difference(startedAt);
         setState(() {
-          _voiceRecordingDuration = DateTime.now().difference(startedAt);
+          _voiceRecordingDuration = elapsed;
         });
+        if (elapsed >= _maxVoiceRecordingDuration) {
+          unawaited(_stopVoiceRecording(chatProvider));
+        }
       });
 
       setState(() {
         _isRecordingVoice = true;
       });
+    } on MissingPluginException {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Плагин записи не инициализирован. Нужна полная пересборка приложения.',
+          ),
+        ),
+      );
     } catch (error) {
       if (!mounted) {
         return;

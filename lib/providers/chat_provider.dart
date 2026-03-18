@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
+import 'package:crypto/crypto.dart' as crypto;
+import 'package:encrypt/encrypt.dart' as encrypt;
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -74,6 +76,7 @@ class ChatProvider extends ChangeNotifier {
   static const Duration _subscriptionConnectTimeout = Duration(seconds: 12);
   static const Duration _meshRetryInterval = Duration(seconds: 4);
   static const int _meshMaxRetryAttempts = 5;
+  static const int _clientMaxMessages = 1500;
   static const String _defaultGroupChatId = 'group-general';
   static const String _defaultGroupChatTitle = 'Общий чат';
   static const Set<String> _scheduledRestrictedUsersLower = <String>{
@@ -1436,6 +1439,7 @@ class ChatProvider extends ChangeNotifier {
     _messageIds.add(message.id);
     _messages.add(message);
     _messages.sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    _trimMessageCache();
     return true;
   }
 
@@ -1452,7 +1456,23 @@ class ChatProvider extends ChangeNotifier {
 
     _messages[index] = message;
     _messages.sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    _trimMessageCache();
     return true;
+  }
+
+  void _trimMessageCache() {
+    if (_messages.length <= _clientMaxMessages) {
+      return;
+    }
+    final overflow = _messages.length - _clientMaxMessages;
+    if (overflow <= 0) {
+      return;
+    }
+    final removed = _messages.take(overflow).toList(growable: false);
+    _messages.removeRange(0, overflow);
+    for (final message in removed) {
+      _messageIds.remove(message.id);
+    }
   }
 
   ChatMessage _messageFromServerPayload(Map<String, dynamic> payload) {
@@ -1723,7 +1743,7 @@ class ChatProvider extends ChangeNotifier {
         if (encryptedPayload != null) 'encrypted': true,
         if (encryptedPayload != null)
           'encryption': <String, dynamic>{
-            'method': 'xor-v1',
+            'method': encryptedPayload.method,
             'nonce': encryptedPayload.nonceBase64,
           },
         if (replyTo != null) 'replyTo': _replyPayloadFromMessage(replyTo),
@@ -1770,7 +1790,7 @@ class ChatProvider extends ChangeNotifier {
         if (encrypted != null) 'encrypted': true,
         if (encrypted != null)
           'encryption': <String, dynamic>{
-            'method': 'xor-v1',
+            'method': encrypted.method,
             'nonce': encrypted.nonceBase64,
           },
       },
@@ -1901,7 +1921,7 @@ class ChatProvider extends ChangeNotifier {
         if (encryptedCaption != null) 'encrypted': true,
         if (encryptedCaption != null)
           'encryption': <String, dynamic>{
-            'method': 'xor-v1',
+            'method': encryptedCaption.method,
             'nonce': encryptedCaption.nonceBase64,
           },
         if (replyTo != null) 'replyTo': _replyPayloadFromMessage(replyTo),
@@ -2083,26 +2103,26 @@ class ChatProvider extends ChangeNotifier {
   }
 
   _EncryptedTextPayload? _encryptTextPayload(String plainText) {
-    final key = _e2eeSecret.trim();
-    if (key.isEmpty) {
+    final secret = _e2eeSecret.trim();
+    if (secret.isEmpty) {
       return null;
     }
-    final messageBytes = utf8.encode(plainText);
-    if (messageBytes.isEmpty) {
+    final normalized = plainText.trim();
+    if (normalized.isEmpty) {
       return null;
     }
 
-    final keyBytes = utf8.encode(key);
-    final nonce = List<int>.generate(12, (_) => _random.nextInt(256));
-    final cipher = List<int>.generate(messageBytes.length, (index) {
-      final k = keyBytes[index % keyBytes.length];
-      final n = nonce[index % nonce.length];
-      return messageBytes[index] ^ k ^ n;
-    });
+    final key = _deriveEncryptionKey(secret);
+    final iv = encrypt.IV.fromSecureRandom(12);
+    final encrypter = encrypt.Encrypter(
+      encrypt.AES(key, mode: encrypt.AESMode.gcm, padding: null),
+    );
+    final encrypted = encrypter.encrypt(normalized, iv: iv);
 
     return _EncryptedTextPayload(
-      cipherText: base64Encode(cipher),
-      nonceBase64: base64Encode(nonce),
+      cipherText: encrypted.base64,
+      nonceBase64: iv.base64,
+      method: 'aes-gcm-256-v1',
     );
   }
 
@@ -2110,23 +2130,61 @@ class ChatProvider extends ChangeNotifier {
     String cipherText,
     Map<String, dynamic>? encryption,
   ) {
-    final key = _e2eeSecret.trim();
-    if (key.isEmpty) {
+    final secret = _e2eeSecret.trim();
+    if (secret.isEmpty) {
       return null;
     }
 
+    final method = (encryption?['method']?.toString() ?? '')
+        .trim()
+        .toLowerCase();
     final nonceRaw = (encryption?['nonce']?.toString() ?? '').trim();
     if (nonceRaw.isEmpty) {
       return null;
     }
 
+    if (method.isEmpty || method == 'xor-v1') {
+      return _decryptLegacyXor(
+        cipherText: cipherText,
+        nonceBase64: nonceRaw,
+        secret: secret,
+      );
+    }
+
+    if (method != 'aes-gcm-256-v1' && method != 'aes-gcm-256') {
+      return null;
+    }
+
+    try {
+      final key = _deriveEncryptionKey(secret);
+      final iv = encrypt.IV.fromBase64(nonceRaw);
+      final encrypted = encrypt.Encrypted.fromBase64(cipherText);
+      final encrypter = encrypt.Encrypter(
+        encrypt.AES(key, mode: encrypt.AESMode.gcm, padding: null),
+      );
+      return encrypter.decrypt(encrypted, iv: iv);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  encrypt.Key _deriveEncryptionKey(String secret) {
+    final digest = crypto.sha256.convert(utf8.encode(secret)).bytes;
+    return encrypt.Key(Uint8List.fromList(digest));
+  }
+
+  String? _decryptLegacyXor({
+    required String cipherText,
+    required String nonceBase64,
+    required String secret,
+  }) {
     try {
       final cipher = base64Decode(cipherText);
-      final nonce = base64Decode(nonceRaw);
+      final nonce = base64Decode(nonceBase64);
       if (cipher.isEmpty || nonce.isEmpty) {
         return null;
       }
-      final keyBytes = utf8.encode(key);
+      final keyBytes = utf8.encode(secret);
       final plain = List<int>.generate(cipher.length, (index) {
         final k = keyBytes[index % keyBytes.length];
         final n = nonce[index % nonce.length];
@@ -3294,10 +3352,12 @@ class _EncryptedTextPayload {
   const _EncryptedTextPayload({
     required this.cipherText,
     required this.nonceBase64,
+    required this.method,
   });
 
   final String cipherText;
   final String nonceBase64;
+  final String method;
 }
 
 class _ServerProbeResult {
