@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
+import 'package:record/record.dart';
 
 import '../models/app_notification.dart';
 import '../models/chat_message.dart';
@@ -34,6 +36,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   int _lastMessageCount = 0;
   int _selectedTab = 0;
   ChatMessage? _replyToMessage;
+  final AudioRecorder _audioRecorder = AudioRecorder();
+  StreamSubscription<Uint8List>? _voiceStreamSubscription;
+  final BytesBuilder _voicePcmBuffer = BytesBuilder(copy: false);
+  bool _isRecordingVoice = false;
+  DateTime? _voiceRecordingStartedAt;
+  Duration _voiceRecordingDuration = Duration.zero;
+  Timer? _voiceRecordingTimer;
+  List<String> _mentionSuggestions = const <String>[];
+  _MentionQueryContext? _mentionContext;
   String? _lastWebPopupNotificationId;
   AppNotification? _webPopupNotification;
   Timer? _webPopupTimer;
@@ -54,6 +65,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _voiceRecordingTimer?.cancel();
+    _voiceStreamSubscription?.cancel();
+    unawaited(_audioRecorder.dispose());
     _messageController.dispose();
     _chatSearchController.dispose();
     _scheduledTextController.dispose();
@@ -83,6 +97,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final text = _messageController.text;
     chatProvider.sendText(text, replyTo: _replyToMessage);
     _messageController.clear();
+    _clearMentionSuggestions();
     _replyToMessage = null;
     chatProvider.updateTypingStatus('');
     setState(() {});
@@ -343,6 +358,277 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       _replyToMessage = null;
     });
     _ensureMessageInputFocus(force: true);
+  }
+
+  void _onMessageChanged(ChatProvider chatProvider, String value) {
+    chatProvider.updateTypingStatus(value);
+    _updateMentionSuggestions(chatProvider);
+    setState(() {});
+  }
+
+  void _updateMentionSuggestions(ChatProvider chatProvider) {
+    final text = _messageController.text;
+    final selection = _messageController.selection;
+    var cursor = selection.baseOffset;
+    if (cursor < 0 || cursor > text.length) {
+      cursor = text.length;
+    }
+
+    final context = _extractMentionContext(text: text, cursorOffset: cursor);
+    if (context == null) {
+      _clearMentionSuggestions();
+      return;
+    }
+
+    final query = context.query.trim().toLowerCase();
+    final candidates = chatProvider.mentionCandidates;
+    final suggestions = candidates.where((name) {
+      final normalized = name.trim().toLowerCase();
+      if (normalized.isEmpty) {
+        return false;
+      }
+      return query.isEmpty || normalized.contains(query);
+    }).toList(growable: false);
+
+    _mentionContext = context;
+    _mentionSuggestions = suggestions.take(8).toList(growable: false);
+  }
+
+  _MentionQueryContext? _extractMentionContext({
+    required String text,
+    required int cursorOffset,
+  }) {
+    if (text.isEmpty || cursorOffset <= 0) {
+      return null;
+    }
+
+    final left = text.substring(0, cursorOffset);
+    final atIndex = left.lastIndexOf('@');
+    if (atIndex < 0) {
+      return null;
+    }
+
+    if (atIndex > 0) {
+      final beforeAt = left[atIndex - 1];
+      if (!RegExp(r'[\s(>\[\{]').hasMatch(beforeAt)) {
+        return null;
+      }
+    }
+
+    final query = left.substring(atIndex + 1);
+    if (query.contains(RegExp(r'[\s\n\r]'))) {
+      return null;
+    }
+
+    return _MentionQueryContext(start: atIndex, end: cursorOffset, query: query);
+  }
+
+  void _clearMentionSuggestions() {
+    _mentionContext = null;
+    _mentionSuggestions = const <String>[];
+  }
+
+  void _insertMention(String userName) {
+    final context = _mentionContext;
+    if (context == null) {
+      return;
+    }
+
+    final text = _messageController.text;
+    if (context.start < 0 ||
+        context.end < context.start ||
+        context.end > text.length) {
+      _clearMentionSuggestions();
+      return;
+    }
+
+    final mentionText = '@$userName ';
+    final newText =
+        '${text.substring(0, context.start)}$mentionText${text.substring(context.end)}';
+    final cursor = context.start + mentionText.length;
+    _messageController.value = TextEditingValue(
+      text: newText,
+      selection: TextSelection.collapsed(offset: cursor),
+    );
+    _clearMentionSuggestions();
+    _ensureMessageInputFocus(force: true);
+    setState(() {});
+  }
+
+  Future<void> _toggleVoiceRecording(ChatProvider chatProvider) async {
+    if (_isRecordingVoice) {
+      await _stopVoiceRecording(chatProvider);
+      return;
+    }
+    await _startVoiceRecording(chatProvider);
+  }
+
+  Future<void> _startVoiceRecording(ChatProvider chatProvider) async {
+    if (!chatProvider.isConnected) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Сначала подключитесь к серверу.')),
+      );
+      return;
+    }
+
+    try {
+      final hasPermission = await _audioRecorder.hasPermission();
+      if (!hasPermission) {
+        if (!mounted) {
+          return;
+        }
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Нет доступа к микрофону.')),
+        );
+        return;
+      }
+
+      _voicePcmBuffer.clear();
+      await _voiceStreamSubscription?.cancel();
+      _voiceStreamSubscription = null;
+
+      final stream = await _audioRecorder.startStream(
+        const RecordConfig(
+          encoder: AudioEncoder.pcm16bits,
+          sampleRate: 16000,
+          numChannels: 1,
+        ),
+      );
+
+      _voiceStreamSubscription = stream.listen((chunk) {
+        _voicePcmBuffer.add(chunk);
+      });
+
+      _voiceRecordingTimer?.cancel();
+      _voiceRecordingStartedAt = DateTime.now();
+      _voiceRecordingDuration = Duration.zero;
+      _voiceRecordingTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+        final startedAt = _voiceRecordingStartedAt;
+        if (!mounted || startedAt == null) {
+          return;
+        }
+        setState(() {
+          _voiceRecordingDuration = DateTime.now().difference(startedAt);
+        });
+      });
+
+      setState(() {
+        _isRecordingVoice = true;
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Не удалось начать запись: $error')),
+      );
+    }
+  }
+
+  Future<void> _stopVoiceRecording(ChatProvider chatProvider) async {
+    try {
+      await _audioRecorder.stop();
+      await _voiceStreamSubscription?.cancel();
+      _voiceStreamSubscription = null;
+    } catch (_) {}
+
+    _voiceRecordingTimer?.cancel();
+    _voiceRecordingTimer = null;
+
+    final pcmBytes = _voicePcmBuffer.takeBytes();
+    final duration = _voiceRecordingDuration;
+    _voiceRecordingStartedAt = null;
+    _voiceRecordingDuration = Duration.zero;
+
+    if (mounted) {
+      setState(() {
+        _isRecordingVoice = false;
+      });
+    } else {
+      _isRecordingVoice = false;
+    }
+
+    if (pcmBytes.isEmpty || duration.inMilliseconds < 500) {
+      return;
+    }
+
+    final wavBytes = _wrapPcm16AsWav(
+      pcmBytes: Uint8List.fromList(pcmBytes),
+      sampleRate: 16000,
+      channels: 1,
+    );
+    final stamp = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
+    final prepared = PreparedFileUpload(
+      name: 'voice_$stamp.wav',
+      extension: 'WAV',
+      sizeBytes: wavBytes.length,
+      bytes: wavBytes,
+    );
+
+    final error = await chatProvider.sendPickedFile(
+      prepared,
+      replyTo: _replyToMessage,
+    );
+    if (!mounted) {
+      return;
+    }
+
+    if (error != null) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(error)));
+      return;
+    }
+
+    _replyToMessage = null;
+    setState(() {});
+    _scrollToBottom();
+    _ensureMessageInputFocus(force: true);
+  }
+
+  Uint8List _wrapPcm16AsWav({
+    required Uint8List pcmBytes,
+    required int sampleRate,
+    required int channels,
+  }) {
+    const bitsPerSample = 16;
+    final byteRate = sampleRate * channels * (bitsPerSample ~/ 8);
+    final blockAlign = channels * (bitsPerSample ~/ 8);
+    final dataLength = pcmBytes.length;
+    final fileLength = 36 + dataLength;
+
+    final header = ByteData(44);
+    void writeAscii(int offset, String value) {
+      for (var i = 0; i < value.length; i++) {
+        header.setUint8(offset + i, value.codeUnitAt(i));
+      }
+    }
+
+    writeAscii(0, 'RIFF');
+    header.setUint32(4, fileLength, Endian.little);
+    writeAscii(8, 'WAVE');
+    writeAscii(12, 'fmt ');
+    header.setUint32(16, 16, Endian.little);
+    header.setUint16(20, 1, Endian.little);
+    header.setUint16(22, channels, Endian.little);
+    header.setUint32(24, sampleRate, Endian.little);
+    header.setUint32(28, byteRate, Endian.little);
+    header.setUint16(32, blockAlign, Endian.little);
+    header.setUint16(34, bitsPerSample, Endian.little);
+    writeAscii(36, 'data');
+    header.setUint32(40, dataLength, Endian.little);
+
+    final bytes = BytesBuilder(copy: false);
+    bytes.add(header.buffer.asUint8List());
+    bytes.add(pcmBytes);
+    return bytes.toBytes();
+  }
+
+  String _formatRecordingDuration(Duration duration) {
+    final minutes = duration.inMinutes.toString().padLeft(2, '0');
+    final seconds = (duration.inSeconds % 60).toString().padLeft(2, '0');
+    return '$minutes:$seconds';
   }
 
   Future<void> _editMessage(
@@ -1057,6 +1343,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     chatProvider.updateTypingStatus('');
     chatProvider.selectChat(thread.id);
     _messageController.clear();
+    _clearMentionSuggestions();
     _chatSearchController.clear();
     _replyToMessage = null;
     setState(() {});
@@ -1365,6 +1652,66 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
       child: Column(
         children: [
+          if (_mentionSuggestions.isNotEmpty)
+            Container(
+              width: double.infinity,
+              margin: const EdgeInsets.only(bottom: 8),
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.surface,
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(
+                  color: Theme.of(context).dividerColor.withAlpha(120),
+                ),
+              ),
+              constraints: const BoxConstraints(maxHeight: 180),
+              child: ListView.separated(
+                shrinkWrap: true,
+                itemCount: _mentionSuggestions.length,
+                separatorBuilder: (_, _) =>
+                    Divider(height: 1, color: Theme.of(context).dividerColor),
+                itemBuilder: (context, index) {
+                  final name = _mentionSuggestions[index];
+                  return ListTile(
+                    dense: true,
+                    leading: const Icon(Icons.alternate_email_rounded),
+                    title: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis),
+                    onTap: () => _insertMention(name),
+                  );
+                },
+              ),
+            ),
+          if (_isRecordingVoice)
+            Container(
+              width: double.infinity,
+              margin: const EdgeInsets.only(bottom: 8),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.errorContainer,
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    Icons.mic_rounded,
+                    color: Theme.of(context).colorScheme.onErrorContainer,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'Идет запись голосового: ${_formatRecordingDuration(_voiceRecordingDuration)}',
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.onErrorContainer,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: () => _toggleVoiceRecording(chatProvider),
+                    child: const Text('Стоп'),
+                  ),
+                ],
+              ),
+            ),
           if (reply != null)
             Container(
               width: double.infinity,
@@ -1410,6 +1757,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     : const Icon(Icons.attach_file_rounded),
               ),
               const SizedBox(width: 8),
+              IconButton.filledTonal(
+                onPressed: () => _toggleVoiceRecording(chatProvider),
+                tooltip: _isRecordingVoice ? 'Остановить запись' : 'Записать ГС',
+                icon: Icon(
+                  _isRecordingVoice ? Icons.stop_circle_rounded : Icons.mic_rounded,
+                ),
+              ),
+              const SizedBox(width: 8),
               Expanded(
                 child: TextField(
                   controller: _messageController,
@@ -1418,10 +1773,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   minLines: 1,
                   maxLines: 5,
                   textInputAction: TextInputAction.send,
-                  onChanged: (value) {
-                    chatProvider.updateTypingStatus(value);
-                    setState(() {});
-                  },
+                  onChanged: (value) => _onMessageChanged(chatProvider, value),
                   onSubmitted: (_) => _sendMessage(chatProvider),
                   decoration: InputDecoration(
                     hintText: chatProvider.isConnected
@@ -1777,4 +2129,16 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
     return raw;
   }
+}
+
+class _MentionQueryContext {
+  const _MentionQueryContext({
+    required this.start,
+    required this.end,
+    required this.query,
+  });
+
+  final int start;
+  final int end;
+  final String query;
 }

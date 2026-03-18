@@ -1453,8 +1453,10 @@ void _handleMessageEdit({
     return;
   }
 
-  final senderId = (message['senderId']?.toString() ?? '').trim();
-  if (senderId != userId) {
+  final senderNameLower = (message['senderName']?.toString() ?? '')
+      .trim()
+      .toLowerCase();
+  if (senderNameLower != userName.toLowerCase()) {
     _sendEnvelope(
       channel,
       type: 'error',
@@ -1547,8 +1549,10 @@ void _handleMessageDelete({
     return;
   }
 
-  final senderId = (message['senderId']?.toString() ?? '').trim();
-  if (senderId != userId) {
+  final senderNameLower = (message['senderName']?.toString() ?? '')
+      .trim()
+      .toLowerCase();
+  if (senderNameLower != userName.toLowerCase()) {
     _sendEnvelope(
       channel,
       type: 'error',

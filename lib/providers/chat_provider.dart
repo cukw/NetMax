@@ -270,6 +270,16 @@ class ChatProvider extends ChangeNotifier {
   List<AppNotification> get notifications =>
       List<AppNotification>.unmodifiable(_notifications.reversed);
 
+  List<String> get mentionCandidates {
+    final meLower = _userName.trim().toLowerCase();
+    final result = _allowedUsersByLower.entries
+        .where((entry) => entry.key != meLower)
+        .map((entry) => entry.value)
+        .toList(growable: false)
+      ..sort((a, b) => a.compareTo(b));
+    return result;
+  }
+
   bool isMyMessage(ChatMessage message) {
     final senderId = message.senderId.trim();
     if (senderId.isNotEmpty && senderId == _userId) {

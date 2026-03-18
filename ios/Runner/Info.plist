@@ -50,5 +50,7 @@
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>NetMax использует микрофон для записи голосовых сообщений.</string>
 </dict>
 </plist>
