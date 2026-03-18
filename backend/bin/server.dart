@@ -694,7 +694,9 @@ Future<void> _storeFileInNoSql({
   required String extension,
   required List<int> bytes,
 }) async {
-  final existing = await _mongoGridFs.findOne(mongo.where.id(fileId));
+  final existing = await _mongoGridFs.findOne(
+    mongo.where.eq('_id', fileId),
+  );
   if (existing != null) {
     await existing.delete();
   }
@@ -727,7 +729,9 @@ Future<Map<String, dynamic>?> _fileFromNoSql(String fileId) async {
 }
 
 Future<List<int>?> _readFileBytesFromNoSql(String fileId) async {
-  final out = await _mongoGridFs.findOne(mongo.where.id(fileId));
+  final out = await _mongoGridFs.findOne(
+    mongo.where.eq('_id', fileId),
+  );
   if (out == null) {
     return null;
   }
@@ -759,7 +763,9 @@ Future<void> _deleteFilesFromNoSqlByIds(List<String> ids) async {
   }
 
   for (final id in normalizedIds) {
-    final out = await _mongoGridFs.findOne(mongo.where.id(id));
+    final out = await _mongoGridFs.findOne(
+      mongo.where.eq('_id', id),
+    );
     if (out != null) {
       await out.delete();
     }
@@ -1412,7 +1418,7 @@ Future<Response> _filesHandler(Request request, String file) async {
   final headers = <String, String>{
     HttpHeaders.contentTypeHeader: contentType,
     HttpHeaders.acceptRangesHeader: 'bytes',
-    HttpHeaders.xContentTypeOptionsHeader: 'nosniff',
+    'x-content-type-options': 'nosniff',
     'x-frame-options': 'DENY',
     'referrer-policy': 'no-referrer',
     'content-security-policy': "default-src 'none'; sandbox",
