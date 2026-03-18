@@ -1963,6 +1963,10 @@ class ChatProvider extends ChangeNotifier {
     return null;
   }
 
+  String attachmentPlaybackUrl(MessageAttachment attachment) {
+    return _attachmentUri(attachment, forceDownload: false).toString();
+  }
+
   List<int>? _resolveBytes(PlatformFile file) {
     final bytes = file.bytes;
     if (bytes != null && bytes.isNotEmpty) {

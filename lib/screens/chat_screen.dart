@@ -1209,10 +1209,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             itemBuilder: (context, index) {
               final message = messages[index];
               final isMine = chatProvider.isMyMessage(message);
+              final voicePlaybackUrl =
+                  message.isVoiceMessage && message.attachment != null
+                  ? chatProvider.attachmentPlaybackUrl(message.attachment!)
+                  : null;
               return MessageBubble(
                 message: message,
                 isMine: isMine,
                 currentUserLower: chatProvider.userName.trim().toLowerCase(),
+                voicePlaybackUrl: voicePlaybackUrl,
                 onAttachmentTap: message.attachment == null
                     ? null
                     : () => _openAttachment(chatProvider, message.attachment!),

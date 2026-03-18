@@ -927,14 +927,102 @@ Response _filesHandler(Request request, String file) {
   );
 
   final headers = <String, String>{
-    HttpHeaders.contentTypeHeader: 'application/octet-stream',
-    HttpHeaders.contentLengthHeader: stat.size.toString(),
+    HttpHeaders.contentTypeHeader: _contentTypeByFileName(downloadName),
+    HttpHeaders.acceptRangesHeader: 'bytes',
   };
   if (forceDownload) {
     headers['content-disposition'] = 'attachment; filename="$downloadName"';
   }
 
+  final totalSize = stat.size;
+  final rangeHeader = request.headers[HttpHeaders.rangeHeader];
+  final byteRange = _parseByteRange(rangeHeader, totalSize);
+  if (byteRange != null) {
+    final start = byteRange.start;
+    final end = byteRange.end;
+    final length = end - start + 1;
+    headers[HttpHeaders.contentLengthHeader] = length.toString();
+    headers[HttpHeaders.contentRangeHeader] = 'bytes $start-$end/$totalSize';
+    return Response(
+      HttpStatus.partialContent,
+      body: target.openRead(start, end + 1),
+      headers: headers,
+    );
+  }
+
+  headers[HttpHeaders.contentLengthHeader] = totalSize.toString();
   return Response.ok(target.openRead(), headers: headers);
+}
+
+_ByteRange? _parseByteRange(String? header, int totalSize) {
+  if (header == null || header.trim().isEmpty || totalSize <= 0) {
+    return null;
+  }
+
+  final match = RegExp(r'^bytes=(\d*)-(\d*)$').firstMatch(header.trim());
+  if (match == null) {
+    return null;
+  }
+
+  final startRaw = match.group(1) ?? '';
+  final endRaw = match.group(2) ?? '';
+
+  int? start;
+  int? end;
+
+  if (startRaw.isEmpty && endRaw.isEmpty) {
+    return null;
+  }
+
+  if (startRaw.isNotEmpty) {
+    start = int.tryParse(startRaw);
+  }
+  if (endRaw.isNotEmpty) {
+    end = int.tryParse(endRaw);
+  }
+
+  if (start == null && end != null) {
+    if (end <= 0) {
+      return null;
+    }
+    start = totalSize - end;
+    end = totalSize - 1;
+  }
+
+  start ??= 0;
+  end ??= totalSize - 1;
+
+  if (start < 0 || end < 0 || start >= totalSize) {
+    return null;
+  }
+  if (end >= totalSize) {
+    end = totalSize - 1;
+  }
+  if (end < start) {
+    return null;
+  }
+
+  return _ByteRange(start: start, end: end);
+}
+
+String _contentTypeByFileName(String fileName) {
+  final ext = p.extension(fileName).replaceFirst('.', '').trim().toLowerCase();
+  return switch (ext) {
+    'wav' => 'audio/wav',
+    'mp3' => 'audio/mpeg',
+    'm4a' => 'audio/mp4',
+    'aac' => 'audio/aac',
+    'ogg' => 'audio/ogg',
+    'opus' => 'audio/ogg',
+    'flac' => 'audio/flac',
+    'txt' => 'text/plain; charset=utf-8',
+    'json' => 'application/json; charset=utf-8',
+    'pdf' => 'application/pdf',
+    'png' => 'image/png',
+    'jpg' || 'jpeg' => 'image/jpeg',
+    'gif' => 'image/gif',
+    _ => 'application/octet-stream',
+  };
 }
 
 void _handleSocket(WebSocketChannel channel, String? protocol) {
@@ -2235,6 +2323,16 @@ class _StorageFileRecord {
   final File file;
   final int sizeBytes;
   final DateTime modifiedAt;
+}
+
+class _ByteRange {
+  const _ByteRange({
+    required this.start,
+    required this.end,
+  });
+
+  final int start;
+  final int end;
 }
 
 class _DirectChatContext {
