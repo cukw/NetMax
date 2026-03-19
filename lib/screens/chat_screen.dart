@@ -2042,16 +2042,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
                   ),
                   const SizedBox(height: 8),
-                  const Text(
-                    'Укажите адрес сервера и способ авторизации.',
-                  ),
+                  const Text('Укажите адрес сервера и способ авторизации.'),
                   const SizedBox(height: 12),
                   TextField(
                     controller: serverController,
                     keyboardType: TextInputType.url,
                     decoration: const InputDecoration(
                       labelText: 'Server URL',
-                      hintText: 'ws://localhost:8080/ws',
+                      hintText: 'wss://155.212.141.80/ws',
                     ),
                   ),
                   const SizedBox(height: 10),
@@ -2117,9 +2115,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       controller: userController,
                       onChanged: (value) {
                         setSheetState(() {
-                          hasSavedPassword = chatProvider.hasSavedPasswordForUser(
-                            value,
-                          );
+                          hasSavedPassword = chatProvider
+                              .hasSavedPasswordForUser(value);
                         });
                       },
                       decoration: const InputDecoration(
@@ -2226,7 +2223,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                                     if (!context.mounted) {
                                       return;
                                     }
-                                    final message = _readableErrorMessage(error);
+                                    final message = _readableErrorMessage(
+                                      error,
+                                    );
                                     ScaffoldMessenger.of(context).showSnackBar(
                                       SnackBar(content: Text(message)),
                                     );

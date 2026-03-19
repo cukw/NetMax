@@ -28,6 +28,8 @@ const String _messagesConfigRelativePath = 'config/messages_history.json';
 const String _e2eeKeyConfigRelativePath = 'config/e2ee_shared_key.txt';
 const String _mongoUriEnv = 'NETMAX_MONGO_URI';
 const String _defaultMongoUri = 'mongodb://127.0.0.1:27017/netmax';
+const String _bindHostEnv = 'NETMAX_BIND_HOST';
+const String _defaultBindHost = '127.0.0.1';
 const Duration _scheduleTickInterval = Duration(seconds: 20);
 const Duration _storageCleanupInterval = Duration(minutes: 30);
 const Duration _storageFileMaxAge = Duration(days: 14);
@@ -42,13 +44,18 @@ final bool _returnDevEmailCodeInResponse = _readBoolFromEnv(
   'NETMAX_EMAIL_AUTH_RETURN_DEV_CODE',
   fallback: true,
 );
-final String _smtpHost = (Platform.environment['NETMAX_SMTP_HOST'] ?? '').trim();
-final int _smtpPort = _readPositiveIntFromEnv('NETMAX_SMTP_PORT', fallback: 587);
+final String _smtpHost = (Platform.environment['NETMAX_SMTP_HOST'] ?? '')
+    .trim();
+final int _smtpPort = _readPositiveIntFromEnv(
+  'NETMAX_SMTP_PORT',
+  fallback: 587,
+);
 final String _smtpUsername =
     (Platform.environment['NETMAX_SMTP_USERNAME'] ?? '').trim();
 final String _smtpPassword =
     (Platform.environment['NETMAX_SMTP_PASSWORD'] ?? '').trim();
-final String _smtpFrom = (Platform.environment['NETMAX_SMTP_FROM'] ?? '').trim();
+final String _smtpFrom = (Platform.environment['NETMAX_SMTP_FROM'] ?? '')
+    .trim();
 final bool _smtpUseTls = _readBoolFromEnv('NETMAX_SMTP_TLS', fallback: true);
 final bool _smtpConfigured = _smtpHost.isNotEmpty && _smtpFrom.isNotEmpty;
 const String _defaultGroupChatId = 'group-general';
@@ -144,13 +151,21 @@ Future<void> main() async {
       .addHandler(router.call);
 
   final port = int.parse(Platform.environment['PORT'] ?? '8080');
-  final server = await shelf_io.serve(handler, InternetAddress.anyIPv4, port);
+  final bindHost = (Platform.environment[_bindHostEnv] ?? _defaultBindHost)
+      .trim();
+  final bindAddress = _resolveBindAddress(bindHost);
+  final server = await shelf_io.serve(handler, bindAddress, port);
 
   stdout.writeln(
-    'NetMax backend is running on http://${server.address.host}:${server.port}',
+    'NetMax backend bind: ${server.address.address}:${server.port}',
   );
-  stdout.writeln('WebSocket endpoint: ws://<host>:${server.port}/ws');
-  stdout.writeln('Files endpoint: http://<host>:${server.port}/files/<file>');
+  stdout.writeln(
+    'Local WebSocket endpoint: ws://${server.address.host}:${server.port}/ws',
+  );
+  stdout.writeln(
+    'Local files endpoint: http://${server.address.host}:${server.port}/files/<file>',
+  );
+  stdout.writeln('Use Nginx reverse proxy for public HTTPS/WSS endpoints.');
   stdout.writeln('Authorized users loaded: ${_allowedUsers.length}');
   stdout.writeln(
     'Session limit per user: '
@@ -176,6 +191,24 @@ Future<void> main() async {
     'max age ${_storageFileMaxAge.inDays}d, max size '
     '${(_storageMaxBytes / (1024 * 1024)).round()} MB',
   );
+}
+
+InternetAddress _resolveBindAddress(String rawHost) {
+  final host = rawHost.trim();
+  if (host.isEmpty) {
+    return InternetAddress.loopbackIPv4;
+  }
+  if (host == '0.0.0.0') {
+    return InternetAddress.anyIPv4;
+  }
+  if (host == '::') {
+    return InternetAddress.anyIPv6;
+  }
+  final parsed = InternetAddress.tryParse(host);
+  if (parsed != null) {
+    return parsed;
+  }
+  return InternetAddress.loopbackIPv4;
 }
 
 void _loadAuthorizedUsers() {
@@ -252,8 +285,7 @@ void _loadAuthorizedUsers() {
       : ((rows.first['c'] as num?)?.toInt() ?? 0);
   if (existingUsersCount == 0 && usersByLower.isNotEmpty) {
     final now = DateTime.now().toUtc().toIso8601String();
-    final insert = _usersDb.prepare(
-      '''
+    final insert = _usersDb.prepare('''
       INSERT INTO users (
         name_lower,
         name,
@@ -264,8 +296,7 @@ void _loadAuthorizedUsers() {
         created_at,
         updated_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ''',
-    );
+      ''');
     try {
       for (final entry in usersByLower.entries) {
         insert.execute(<Object?>[
@@ -312,33 +343,27 @@ void _ensureUsersTableSchema() {
     _usersDb.execute('ALTER TABLE users ADD COLUMN updated_at TEXT');
   }
 
-  _usersDb.execute(
-    '''
+  _usersDb.execute('''
     CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_e164
       ON users(phone_e164)
       WHERE phone_e164 IS NOT NULL AND phone_e164 <> ''
-    ''',
-  );
-  _usersDb.execute(
-    '''
+    ''');
+  _usersDb.execute('''
     CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email
       ON users(email)
       WHERE email IS NOT NULL AND email <> ''
-    ''',
-  );
+    ''');
   _usersDb.execute(
     'CREATE UNIQUE INDEX IF NOT EXISTS idx_users_name_lower ON users(name_lower)',
   );
 }
 
 void _reloadUsersCacheFromDb() {
-  final persisted = _usersDb.select(
-    '''
+  final persisted = _usersDb.select('''
     SELECT name_lower, name, password, phone_e164, email
     FROM users
     ORDER BY name COLLATE NOCASE ASC
-    ''',
-  );
+    ''');
 
   _allowedUsers.clear();
   _allowedUsersByLower.clear();
@@ -779,9 +804,7 @@ Future<void> _storeFileInNoSql({
   required String extension,
   required List<int> bytes,
 }) async {
-  final existing = await _mongoGridFs.findOne(
-    mongo.where.eq('_id', fileId),
-  );
+  final existing = await _mongoGridFs.findOne(mongo.where.eq('_id', fileId));
   if (existing != null) {
     await existing.delete();
   }
@@ -814,9 +837,7 @@ Future<Map<String, dynamic>?> _fileFromNoSql(String fileId) async {
 }
 
 Future<List<int>?> _readFileBytesFromNoSql(String fileId) async {
-  final out = await _mongoGridFs.findOne(
-    mongo.where.eq('_id', fileId),
-  );
+  final out = await _mongoGridFs.findOne(mongo.where.eq('_id', fileId));
   if (out == null) {
     return null;
   }
@@ -848,9 +869,7 @@ Future<void> _deleteFilesFromNoSqlByIds(List<String> ids) async {
   }
 
   for (final id in normalizedIds) {
-    final out = await _mongoGridFs.findOne(
-      mongo.where.eq('_id', id),
-    );
+    final out = await _mongoGridFs.findOne(mongo.where.eq('_id', id));
     if (out != null) {
       await out.delete();
     }
@@ -1714,10 +1733,9 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
 
         switch (type) {
           case 'join':
-            final authMethod =
-                (payload['authMethod']?.toString() ?? 'password')
-                    .trim()
-                    .toLowerCase();
+            final authMethod = (payload['authMethod']?.toString() ?? 'password')
+                .trim()
+                .toLowerCase();
 
             String authorizedName;
             if (authMethod == 'phone') {
@@ -1843,9 +1861,14 @@ void _handleSocket(WebSocketChannel channel, String? protocol) {
                 );
                 return;
               }
-              final expectedPassword = _passwordsByUserLower[byName.toLowerCase()];
-              if (expectedPassword == null || expectedPassword != providedPassword) {
-                _denyAndClose(channel, 'Авторизация отклонена: неверный пароль.');
+              final expectedPassword =
+                  _passwordsByUserLower[byName.toLowerCase()];
+              if (expectedPassword == null ||
+                  expectedPassword != providedPassword) {
+                _denyAndClose(
+                  channel,
+                  'Авторизация отклонена: неверный пароль.',
+                );
                 return;
               }
               authorizedName = byName;
@@ -3001,8 +3024,9 @@ String _normalizeEmail(Object? value) {
   if (raw.length > 254) {
     return '';
   }
-  if (!RegExp(r"^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+$")
-      .hasMatch(raw)) {
+  if (!RegExp(
+    r"^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+$",
+  ).hasMatch(raw)) {
     return '';
   }
   return raw;
@@ -3069,8 +3093,7 @@ String _registerPhoneEmailUser({
   final uniqueName = _pickUniqueUserName(baseName);
   final lower = uniqueName.toLowerCase();
   final now = DateTime.now().toUtc().toIso8601String();
-  final insert = _usersDb.prepare(
-    '''
+  final insert = _usersDb.prepare('''
     INSERT INTO users (
       name_lower,
       name,
@@ -3081,8 +3104,7 @@ String _registerPhoneEmailUser({
       created_at,
       updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ''',
-  );
+    ''');
   try {
     insert.execute(<Object?>[
       lower,
@@ -3115,7 +3137,8 @@ Future<bool> _sendAuthCodeByEmail({
       ..from = Address(_smtpFrom, 'NetMax')
       ..recipients.add(email)
       ..subject = subject
-      ..text = 'Ваш код подтверждения NetMax: $code\n'
+      ..text =
+          'Ваш код подтверждения NetMax: $code\n'
           'Срок действия: ${_emailCodeTtl.inMinutes} минут.\n'
           'Если это были не вы, просто игнорируйте письмо.';
 
@@ -3151,7 +3174,9 @@ String _buildDefaultPhoneProfileName(String phoneE164) {
   if (digits.isEmpty) {
     return 'User';
   }
-  final tail = digits.length <= 4 ? digits : digits.substring(digits.length - 4);
+  final tail = digits.length <= 4
+      ? digits
+      : digits.substring(digits.length - 4);
   return 'User $tail';
 }
 

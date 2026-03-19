@@ -67,7 +67,11 @@ class ChatProvider extends ChangeNotifier {
   static const String _favoriteMessageIdsKey = 'favorite_message_ids';
   static const String _pinnedByChatKey = 'pinned_by_chat';
 
-  static const String _defaultServerUrl = 'ws://localhost:8080/ws';
+  static const String _defaultServerUrl = 'wss://155.212.141.80/ws';
+  static const bool _meshFallbackEnabled = bool.fromEnvironment(
+    'NETMAX_ENABLE_MESH_FALLBACK',
+    defaultValue: false,
+  );
   static const String _defaultSubscriptionSourcesRaw = String.fromEnvironment(
     'NETMAX_WS_SUBSCRIPTION_SOURCES',
     defaultValue: '',
@@ -921,9 +925,7 @@ class ChatProvider extends ChangeNotifier {
       }
       final normalizedCode = phoneCode.trim();
       if (!RegExp(r'^\d{6}$').hasMatch(normalizedCode)) {
-        throw const FormatException(
-          'Введите 6-значный код из письма.',
-        );
+        throw const FormatException('Введите 6-значный код из письма.');
       }
       final registerPassword = password.trim();
       if (registerPassword.length < 4) {
@@ -1184,6 +1186,21 @@ class ChatProvider extends ChangeNotifier {
 
     try {
       final uri = Uri.parse(_serverUrl);
+      final transportError = _validateServerTransport(uri);
+      if (transportError != null) {
+        _activeProxyEndpoint = null;
+        _setConnectionStatus(ChatConnectionStatus.disconnected);
+        _lastError = transportError;
+        _manualDisconnectRequested = true;
+        _pushNotification(
+          kind: NotificationKind.system,
+          title: 'Ошибка подключения',
+          description: transportError,
+          showInSystem: true,
+        );
+        _safeNotify();
+        return;
+      }
       final session = await _proxyTransport.openWebSocket(
         uri: uri,
         proxy: proxy,
@@ -3346,7 +3363,7 @@ class ChatProvider extends ChangeNotifier {
     }
 
     if (!isConnected) {
-      if (_meshTransport.isSupported) {
+      if (_meshFallbackEnabled && _meshTransport.isSupported) {
         await _activateMeshFallback();
       }
       _scheduleReconnectIfNeeded();
@@ -3360,7 +3377,7 @@ class ChatProvider extends ChangeNotifier {
     if (_connectionStatus == ChatConnectionStatus.connected) {
       return;
     }
-    if (!_meshTransport.isSupported) {
+    if (!_meshFallbackEnabled || !_meshTransport.isSupported) {
       return;
     }
 
@@ -3572,7 +3589,7 @@ class ChatProvider extends ChangeNotifier {
       _reconnectTimer = null;
       final canReconnectByAuth = _authMode == ChatAuthMode.phone
           ? (_normalizePhoneForAuth(_authPhone).isNotEmpty &&
-              _normalizeEmailForAuth(_authEmail).isNotEmpty)
+                _normalizeEmailForAuth(_authEmail).isNotEmpty)
           : _userName.trim().isNotEmpty;
       if (_disposed || _manualDisconnectRequested || !canReconnectByAuth) {
         return;
@@ -3689,14 +3706,16 @@ class ChatProvider extends ChangeNotifier {
     }
 
     if (!normalized.contains('://')) {
-      normalized = 'ws://$normalized';
+      normalized = 'wss://$normalized';
     }
 
     var uri = Uri.parse(normalized);
 
     if (uri.scheme == 'http') {
-      uri = uri.replace(scheme: 'ws');
+      uri = uri.replace(scheme: 'wss');
     } else if (uri.scheme == 'https') {
+      uri = uri.replace(scheme: 'wss');
+    } else if (uri.scheme == 'ws' && !_isLoopbackHost(uri.host)) {
       uri = uri.replace(scheme: 'wss');
     }
 
@@ -3709,6 +3728,24 @@ class ChatProvider extends ChangeNotifier {
       path: path,
     );
     return cleaned.toString();
+  }
+
+  String? _validateServerTransport(Uri uri) {
+    final scheme = uri.scheme.trim().toLowerCase();
+    if (scheme != 'ws' && scheme != 'wss') {
+      return 'Неверный протокол сервера. Используйте wss://<host>/ws.';
+    }
+    if (scheme == 'ws' && !_isLoopbackHost(uri.host)) {
+      return 'Небезопасный ws:// запрещен. Используйте wss://<host>/ws.';
+    }
+    return null;
+  }
+
+  bool _isLoopbackHost(String host) {
+    final normalized = host.trim().toLowerCase();
+    return normalized == 'localhost' ||
+        normalized == '127.0.0.1' ||
+        normalized == '::1';
   }
 
   String _normalizePhoneForAuth(String input) {
@@ -3735,8 +3772,9 @@ class ChatProvider extends ChangeNotifier {
     if (normalized.isEmpty || normalized.length > 254) {
       return '';
     }
-    final pattern =
-        RegExp(r"^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+$");
+    final pattern = RegExp(
+      r"^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+$",
+    );
     if (!pattern.hasMatch(normalized)) {
       return '';
     }
