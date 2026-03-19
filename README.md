@@ -110,6 +110,15 @@ dart run bin/server.dart
 
 В UI поле URL сервера скрыто. Для non-web сборок fallback по умолчанию: `wss://155.212.141.80/ws`.
 
+Для релизных native-сборок (Android/iOS/macOS/Windows/Linux) адрес можно зафиксировать при сборке:
+```bash
+flutter build apk --release --dart-define=NETMAX_SERVER_URL=wss://155.212.141.80/ws
+```
+
+В CI (`.github/workflows/build-all-platforms.yml`) это уже учитывается:
+- если задан repo variable `NETMAX_SERVER_URL`, он подставляется в сборки;
+- если не задан, используется `wss://155.212.141.80/ws`.
+
 Опционально можно добавить источники подписок (HTTP/HTTPS, одна ссылка на строку) в окне подключения.  
 Ключ шифрования теперь управляется сервером и передается клиенту после авторизации (пользователь вручную ключ не вводит).  
 Задается на сервере через переменную `NETMAX_E2EE_SHARED_KEY`.
