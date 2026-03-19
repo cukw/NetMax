@@ -51,7 +51,6 @@ class ChatProvider extends ChangeNotifier {
   }
 
   static const String _themeModeKey = 'theme_mode';
-  static const String _serverUrlKey = 'server_url';
   static const String _userNameKey = 'user_name';
   static const String _userIdKey = 'user_id';
   static const String _authModeKey = 'auth_mode';
@@ -67,7 +66,11 @@ class ChatProvider extends ChangeNotifier {
   static const String _favoriteMessageIdsKey = 'favorite_message_ids';
   static const String _pinnedByChatKey = 'pinned_by_chat';
 
-  static const String _defaultServerUrl = 'wss://155.212.141.80/ws';
+  static final String _defaultServerUrl = _resolveDefaultServerUrl();
+  static const String _serverUrlOverride = String.fromEnvironment(
+    'NETMAX_SERVER_URL',
+    defaultValue: '',
+  );
   static const bool _meshFallbackEnabled = bool.fromEnvironment(
     'NETMAX_ENABLE_MESH_FALLBACK',
     defaultValue: false,
@@ -99,6 +102,48 @@ class ChatProvider extends ChangeNotifier {
   };
   static final RegExp _unsafeControlChars = RegExp(r'[\u0000-\u001F\u007F]');
 
+  static String _resolveDefaultServerUrl() {
+    if (kIsWeb) {
+      final auto = _resolveServerUrlFromBrowserHost();
+      if (auto != null) {
+        return auto;
+      }
+    }
+
+    final override = _serverUrlOverride.trim();
+    if (override.isNotEmpty) {
+      return override;
+    }
+
+    return 'wss://155.212.141.80/ws';
+  }
+
+  static String? _resolveServerUrlFromBrowserHost() {
+    final base = Uri.base;
+    final scheme = base.scheme.trim().toLowerCase();
+    if (scheme != 'http' && scheme != 'https') {
+      return null;
+    }
+
+    final host = base.host.trim();
+    if (host.isEmpty) {
+      return null;
+    }
+
+    final wsScheme = scheme == 'https' ? 'wss' : 'ws';
+    final hasPort =
+        base.hasPort &&
+        !((wsScheme == 'ws' && base.port == 80) ||
+            (wsScheme == 'wss' && base.port == 443));
+
+    return Uri(
+      scheme: wsScheme,
+      host: host,
+      port: hasPort ? base.port : null,
+      path: '/ws',
+    ).toString();
+  }
+
   final List<ChatMessage> _messages = <ChatMessage>[];
   final List<AppNotification> _notifications = <AppNotification>[];
   final Set<String> _messageIds = <String>{};
@@ -110,6 +155,7 @@ class ChatProvider extends ChangeNotifier {
   final Map<String, String> _allowedUsersByLower = <String, String>{};
   final Map<String, String> _directChatPeerById = <String, String>{};
   final Map<String, int> _unreadByChatId = <String, int>{};
+  final List<_QueuedOutgoingText> _offlineTextQueue = <_QueuedOutgoingText>[];
   final Set<String> _favoriteMessageIds = <String>{};
   final Map<String, String> _pinnedByChatId = <String, String>{};
   String _selectedChatId = _defaultGroupChatId;
@@ -209,6 +255,7 @@ class ChatProvider extends ChangeNotifier {
   String? get lastError => _lastError;
 
   bool get isPickingFile => _isPickingFile;
+  int get queuedOutgoingTextCount => _offlineTextQueue.length;
   int get onlineUsersCount => _onlineUsers.length + (isConnected ? 1 : 0);
   List<String> get typingUsers => _typingUsers.values.toList(growable: false);
   bool get isCheckingUpdates => _isCheckingUpdates;
@@ -367,6 +414,10 @@ class ChatProvider extends ChangeNotifier {
     }
 
     if (_connectionStatus == ChatConnectionStatus.disconnected) {
+      final queued = _offlineTextQueue.length;
+      if (queued > 0) {
+        return 'Не подключено • В очереди: $queued';
+      }
       return 'Не подключено';
     }
 
@@ -832,11 +883,10 @@ class ChatProvider extends ChangeNotifier {
       );
     }
 
-    final storedServerUrl = prefs.getString(_serverUrlKey) ?? _defaultServerUrl;
     try {
-      _serverUrl = _normalizeServerUrl(storedServerUrl);
+      _serverUrl = _normalizeServerUrl(_defaultServerUrl);
     } catch (_) {
-      _serverUrl = _defaultServerUrl;
+      _serverUrl = 'wss://155.212.141.80/ws';
     }
 
     final storedSourcesRaw =
@@ -876,7 +926,7 @@ class ChatProvider extends ChangeNotifier {
     _registerByPhone = false;
 
     await prefs.setString(_userIdKey, _userId);
-    await prefs.setString(_serverUrlKey, _serverUrl);
+    await prefs.remove('server_url');
   }
 
   Future<void> setThemeMode(ThemeMode mode) async {
@@ -892,7 +942,6 @@ class ChatProvider extends ChangeNotifier {
   }
 
   Future<void> applyConnectionSettings({
-    required String serverUrl,
     required String userName,
     required String password,
     String? subscriptionSources,
@@ -903,9 +952,6 @@ class ChatProvider extends ChangeNotifier {
     String phoneCode = '',
     String profileName = '',
   }) async {
-    final normalizedServerUrl = _normalizeServerUrl(serverUrl);
-
-    _serverUrl = normalizedServerUrl;
     _authMode = authMode;
     _pendingPasswordForAuth = null;
     _pendingPhoneCodeForAuth = null;
@@ -977,7 +1023,6 @@ class ChatProvider extends ChangeNotifier {
     _isScheduledAllowedByServer = _isScheduledAllowedForUser(_userName);
 
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_serverUrlKey, _serverUrl);
     await prefs.setString(_userNameKey, _userName);
     await prefs.setString(_authModeKey, _authMode.name);
     await prefs.setString(_authPhoneKey, _authPhone);
@@ -1013,11 +1058,9 @@ class ChatProvider extends ChangeNotifier {
   }
 
   Future<String> requestEmailAuthCode({
-    required String serverUrl,
     required String phone,
     required String email,
   }) async {
-    final normalizedServerUrl = _normalizeServerUrl(serverUrl);
     final normalizedPhone = _normalizePhoneForAuth(phone);
     final normalizedEmail = _normalizeEmailForAuth(email);
     if (normalizedPhone.isEmpty) {
@@ -1031,7 +1074,7 @@ class ChatProvider extends ChangeNotifier {
       );
     }
 
-    final uri = _emailCodeRequestUriFromServerUrl(normalizedServerUrl);
+    final uri = _emailCodeRequestUriFromServerUrl(_serverUrl);
     final response = await http
         .post(
           uri,
@@ -1446,6 +1489,7 @@ class ChatProvider extends ChangeNotifier {
     _pendingPasswordForAuth = null;
     _pendingPhoneCodeForAuth = null;
 
+    unawaited(_flushOfflineTextQueue());
     _safeNotify();
   }
 
@@ -1656,10 +1700,13 @@ class ChatProvider extends ChangeNotifier {
       return;
     }
 
-    final added = _appendLocalMessage(message);
-    if (!added) {
+    final changed = _upsertLocalMessage(
+      message.copyWith(localState: MessageLocalState.none),
+    );
+    if (!changed) {
       return;
     }
+    _offlineTextQueue.removeWhere((item) => item.messageId == message.id);
 
     final isMine = isMyMessage(message);
     _sendDeliveryReceiptIfNeeded(message);
@@ -1695,7 +1742,9 @@ class ChatProvider extends ChangeNotifier {
   }
 
   void _handleMessageUpdated(Map<String, dynamic> payload) {
-    final message = _messageFromServerPayload(payload);
+    final message = _messageFromServerPayload(
+      payload,
+    ).copyWith(localState: MessageLocalState.none);
     if (message.id.isEmpty) {
       return;
     }
@@ -2088,7 +2137,22 @@ class ChatProvider extends ChangeNotifier {
       return;
     }
 
+    final replyPayload = replyTo == null
+        ? null
+        : _replyPayloadFromMessage(replyTo);
+    final outgoing = _QueuedOutgoingText(
+      messageId: _nextId(),
+      chatId: _selectedChatId,
+      text: text,
+      createdAtIso: DateTime.now().toUtc().toIso8601String(),
+      mentions: _extractMentionsFromText(text),
+      replyTo: replyPayload,
+    );
+
     if (!isConnected && !_isMeshFallbackActive) {
+      _queueOfflineTextMessage(outgoing);
+      unawaited(connect(force: true));
+      updateTypingStatus('');
       return;
     }
 
@@ -2138,29 +2202,146 @@ class ChatProvider extends ChangeNotifier {
       return;
     }
 
-    final encryptedPayload = _encryptTextPayload(text);
-    final outgoingText = encryptedPayload?.cipherText ?? text;
-    final mentions = _extractMentionsFromText(text);
+    _appendLocalOutgoingTextMessage(outgoing, state: MessageLocalState.sending);
+    final sent = _sendQueuedTextEnvelope(outgoing);
+    if (!sent) {
+      _queueOfflineTextMessage(
+        outgoing,
+        addLocalMessage: false,
+        state: MessageLocalState.queued,
+      );
+      _markServerUnavailable();
+      _scheduleReconnectIfNeeded();
+    }
 
-    _sendEnvelope(
+    updateTypingStatus('');
+  }
+
+  void _appendLocalOutgoingTextMessage(
+    _QueuedOutgoingText outgoing, {
+    required MessageLocalState state,
+  }) {
+    final localMessage =
+        ChatMessage.text(
+          id: outgoing.messageId,
+          chatId: outgoing.chatId,
+          senderId: _userId,
+          senderName: _userName,
+          createdAt:
+              DateTime.tryParse(outgoing.createdAtIso)?.toLocal() ??
+              DateTime.now(),
+          text: outgoing.text,
+          replyTo: outgoing.replyTo == null
+              ? null
+              : MessageReplyInfo.fromJson(outgoing.replyTo!),
+        ).copyWith(
+          mentions: outgoing.mentions,
+          deliveredTo: <String>[_userName.trim().toLowerCase()],
+          readBy: <String>[_userName.trim().toLowerCase()],
+          localState: state,
+        );
+
+    if (_messageIds.contains(outgoing.messageId)) {
+      _upsertLocalMessage(localMessage);
+    } else {
+      _appendLocalMessage(localMessage);
+    }
+    _safeNotify();
+  }
+
+  void _queueOfflineTextMessage(
+    _QueuedOutgoingText outgoing, {
+    bool addLocalMessage = true,
+    MessageLocalState state = MessageLocalState.queued,
+  }) {
+    if (addLocalMessage) {
+      _appendLocalOutgoingTextMessage(outgoing, state: state);
+    } else {
+      _setMessageLocalState(outgoing.messageId, state);
+    }
+    _pushOfflineTextQueue(outgoing);
+    _pushNotification(
+      kind: NotificationKind.system,
+      title: 'Сообщение в очереди',
+      description: 'Отправится автоматически после восстановления подключения.',
+      showInSystem: false,
+    );
+    _safeNotify();
+  }
+
+  void _pushOfflineTextQueue(_QueuedOutgoingText outgoing) {
+    final existingIndex = _offlineTextQueue.indexWhere(
+      (item) => item.messageId == outgoing.messageId,
+    );
+    if (existingIndex >= 0) {
+      _offlineTextQueue[existingIndex] = outgoing;
+      return;
+    }
+    _offlineTextQueue.add(outgoing);
+  }
+
+  Future<void> _flushOfflineTextQueue() async {
+    if (!isConnected || _offlineTextQueue.isEmpty) {
+      return;
+    }
+
+    final pending = List<_QueuedOutgoingText>.from(_offlineTextQueue);
+    _offlineTextQueue.clear();
+    var failed = false;
+
+    for (final item in pending) {
+      if (!isConnected) {
+        _pushOfflineTextQueue(item);
+        failed = true;
+        continue;
+      }
+      _setMessageLocalState(item.messageId, MessageLocalState.sending);
+      final sent = _sendQueuedTextEnvelope(item);
+      if (!sent) {
+        _setMessageLocalState(item.messageId, MessageLocalState.queued);
+        _pushOfflineTextQueue(item);
+        failed = true;
+      }
+    }
+
+    if (failed) {
+      _scheduleReconnectIfNeeded();
+    }
+    _safeNotify();
+  }
+
+  bool _sendQueuedTextEnvelope(_QueuedOutgoingText outgoing) {
+    final encryptedPayload = _encryptTextPayload(outgoing.text);
+    final outgoingText = encryptedPayload?.cipherText ?? outgoing.text;
+    return _sendEnvelope(
       type: 'message',
-      payload: {
-        'id': _nextId(),
+      payload: <String, dynamic>{
+        'id': outgoing.messageId,
         'text': outgoingText,
-        'chatId': _selectedChatId,
-        'mentions': mentions,
+        'chatId': outgoing.chatId,
+        'mentions': outgoing.mentions,
         if (encryptedPayload != null) 'encrypted': true,
         if (encryptedPayload != null)
           'encryption': <String, dynamic>{
             'method': encryptedPayload.method,
             'nonce': encryptedPayload.nonceBase64,
           },
-        if (replyTo != null) 'replyTo': _replyPayloadFromMessage(replyTo),
-        'createdAt': DateTime.now().toUtc().toIso8601String(),
+        if (outgoing.replyTo != null) 'replyTo': outgoing.replyTo,
+        'createdAt': outgoing.createdAtIso,
       },
     );
+  }
 
-    updateTypingStatus('');
+  void _setMessageLocalState(String messageId, MessageLocalState localState) {
+    final index = _messages.indexWhere((item) => item.id == messageId);
+    if (index < 0) {
+      return;
+    }
+    final current = _messages[index];
+    if (current.localState == localState) {
+      return;
+    }
+    _messages[index] = current.copyWith(localState: localState);
   }
 
   Future<String?> forwardMessage({
@@ -2632,17 +2813,23 @@ class ChatProvider extends ChangeNotifier {
     );
   }
 
-  void _sendEnvelope({
+  bool _sendEnvelope({
     required String type,
     required Map<String, dynamic> payload,
   }) {
     final envelope = {'type': type, 'payload': payload};
+    final channel = _channel;
+    if (channel == null) {
+      return false;
+    }
     try {
-      _channel?.sink.add(jsonEncode(envelope));
+      channel.sink.add(jsonEncode(envelope));
+      return true;
     } catch (_) {
       _lastError = 'Не удалось отправить событие: $type';
       _scheduledConfigError = _lastError;
       _isSavingScheduledConfig = false;
+      return false;
     }
   }
 
@@ -3249,9 +3436,6 @@ class ChatProvider extends ChangeNotifier {
     } catch (_) {
       return false;
     }
-
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_serverUrlKey, _serverUrl);
 
     if (_connectionStatus == ChatConnectionStatus.connecting) {
       await _closeSocket(sendTypingOff: false, notify: false);
@@ -4096,6 +4280,24 @@ class _MeshPendingMessage {
   final Map<String, dynamic>? replyTo;
   int attempts = 0;
   DateTime? lastAttemptAt;
+}
+
+class _QueuedOutgoingText {
+  const _QueuedOutgoingText({
+    required this.messageId,
+    required this.chatId,
+    required this.text,
+    required this.createdAtIso,
+    required this.mentions,
+    this.replyTo,
+  });
+
+  final String messageId;
+  final String chatId;
+  final String text;
+  final String createdAtIso;
+  final List<String> mentions;
+  final Map<String, dynamic>? replyTo;
 }
 
 class _EncryptedTextPayload {

@@ -8,6 +8,7 @@ set -euo pipefail
 #
 # Optional env overrides:
 #   CERT_IP=155.212.141.80 CERT_DAYS=825 bash /root/NetMax/deploy/deploy-from-root.sh
+#   BUILD_WEB=true bash /root/NetMax/deploy/deploy-from-root.sh
 
 PROJECT_DIR="/root/NetMax"
 BACKEND_DIR="${PROJECT_DIR}/backend"
@@ -18,6 +19,7 @@ CERT_FILE="${CERT_DIR}/fullchain.pem"
 KEY_FILE="${CERT_DIR}/privkey.pem"
 CERT_IP="${CERT_IP:-155.212.141.80}"
 CERT_DAYS="${CERT_DAYS:-825}"
+BUILD_WEB="${BUILD_WEB:-false}"
 
 NGINX_CONF_SRC="${DEPLOY_NGINX_DIR}/netmax.conf"
 NGINX_CONF_DST="/etc/nginx/conf.d/netmax.conf"
@@ -59,6 +61,20 @@ ensure_paths() {
   [[ -f "${DEPLOY_NGINX_DIR}/openssl-selfsigned.cnf" ]] || die "OpenSSL config not found."
 }
 
+check_resources() {
+  if [[ -r /proc/meminfo ]]; then
+    local mem_kb
+    mem_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
+    if [[ -n "${mem_kb}" && "${mem_kb}" =~ ^[0-9]+$ ]]; then
+      if (( mem_kb < 3000000 )); then
+        warn "Detected low RAM (${mem_kb} KB)."
+        warn "On 2 GB servers Flutter web build often fails with OOM."
+        warn "Default BUILD_WEB=false is recommended for this host."
+      fi
+    fi
+  fi
+}
+
 install_backend_deps() {
   local dart_bin="$1"
   log "Installing backend dependencies..."
@@ -69,6 +85,11 @@ install_backend_deps() {
 }
 
 build_web_if_possible() {
+  if [[ "${BUILD_WEB}" != "true" ]]; then
+    log "Skipping web build (BUILD_WEB=${BUILD_WEB})."
+    return
+  fi
+
   if ! command -v flutter >/dev/null 2>&1; then
     warn "flutter not found. Web build step skipped."
     return
@@ -231,6 +252,7 @@ main() {
   [[ -n "${dart_bin}" ]] || die "Dart SDK not found in PATH."
 
   ensure_paths
+  check_resources
   install_backend_deps "${dart_bin}"
   build_web_if_possible
   ensure_self_signed_cert

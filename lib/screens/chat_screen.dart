@@ -26,6 +26,7 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   static const Duration _maxVoiceRecordingDuration = Duration(minutes: 3);
+  static const int _messagesPageSize = 80;
 
   final TextEditingController _messageController = TextEditingController();
   final TextEditingController _chatSearchController = TextEditingController();
@@ -39,6 +40,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   );
   final FocusNode _chatSearchFocusNode = FocusNode(
     debugLabel: 'chat_search_focus',
+  );
+  final FocusNode _messageSearchFocusNode = FocusNode(
+    debugLabel: 'message_search_focus',
   );
 
   int _lastMessageCount = 0;
@@ -57,6 +61,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   bool _scheduledEnabledDraft = false;
   String _scheduledTimeDraft = '09:00';
   String _scheduleSignature = '';
+  int _visibleMessageLimit = _messagesPageSize;
+  String _messageWindowSignature = '';
 
   @override
   void initState() {
@@ -80,6 +86,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _scrollController.dispose();
     _messageFocusNode.dispose();
     _chatSearchFocusNode.dispose();
+    _messageSearchFocusNode.dispose();
     super.dispose();
   }
 
@@ -108,6 +115,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     setState(() {});
     _scrollToBottom();
     _ensureMessageInputFocus(force: true);
+  }
+
+  Future<void> _reconnect(ChatProvider chatProvider) async {
+    if (chatProvider.isConnected) {
+      await chatProvider.disconnect();
+    }
+    await chatProvider.connect(force: true);
   }
 
   Future<void> _sendFile(ChatProvider chatProvider) async {
@@ -335,6 +349,22 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     chatProvider.updateTypingStatus(value);
     _updateMentionSuggestions(chatProvider);
     setState(() {});
+  }
+
+  void _syncMessageWindow(ChatProvider chatProvider) {
+    final signature =
+        '${chatProvider.selectedChatId}|${_messageSearchController.text.trim()}';
+    if (signature == _messageWindowSignature) {
+      return;
+    }
+    _messageWindowSignature = signature;
+    _visibleMessageLimit = _messagesPageSize;
+  }
+
+  void _showMoreMessages() {
+    setState(() {
+      _visibleMessageLimit += _messagesPageSize;
+    });
   }
 
   void _updateMentionSuggestions(ChatProvider chatProvider) {
@@ -872,6 +902,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     if (_chatSearchFocusNode.hasFocus) {
       return;
     }
+    if (_messageSearchFocusNode.hasFocus) {
+      return;
+    }
     if (!force && _messageFocusNode.hasFocus) {
       return;
     }
@@ -912,151 +945,245 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final messages = chatProvider.messages;
     final canSend = _messageController.text.trim().isNotEmpty;
 
+    _syncMessageWindow(chatProvider);
     _maybeScrollOnNewMessage(messages.length);
 
-    return Scaffold(
-      appBar: AppBar(
-        title: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              'NetMax Messenger',
-              style: TextStyle(fontWeight: FontWeight.w600, fontSize: 20),
-            ),
-            Text(
-              chatProvider.connectionStatusLine,
-              style: TextStyle(fontSize: 12, color: _statusColor(chatProvider)),
-            ),
-          ],
-        ),
-        actions: [
-          IconButton(
-            tooltip: 'Проверить обновления',
-            onPressed: chatProvider.isCheckingUpdates
-                ? null
-                : () => _checkForUpdates(chatProvider),
-            icon: Stack(
-              clipBehavior: Clip.none,
-              children: [
-                Icon(
-                  chatProvider.isCheckingUpdates
-                      ? Icons.sync_rounded
-                      : Icons.system_update_alt_rounded,
-                ),
-                if (chatProvider.isUpdateAvailable)
-                  Positioned(
-                    right: -4,
-                    top: -4,
-                    child: Container(
-                      width: 9,
-                      height: 9,
-                      decoration: BoxDecoration(
-                        color: Colors.redAccent,
-                        borderRadius: BorderRadius.circular(16),
-                      ),
-                    ),
-                  ),
-              ],
-            ),
+    return Shortcuts(
+      shortcuts: const <ShortcutActivator, Intent>{
+        SingleActivator(LogicalKeyboardKey.enter, control: true):
+            _SendShortcutIntent(),
+        SingleActivator(LogicalKeyboardKey.enter, meta: true):
+            _SendShortcutIntent(),
+        SingleActivator(LogicalKeyboardKey.escape):
+            _CancelReplyShortcutIntent(),
+        SingleActivator(LogicalKeyboardKey.keyK, control: true):
+            _FocusChatsShortcutIntent(),
+        SingleActivator(LogicalKeyboardKey.keyK, meta: true):
+            _FocusChatsShortcutIntent(),
+        SingleActivator(LogicalKeyboardKey.keyM, control: true):
+            _FocusMessageSearchShortcutIntent(),
+        SingleActivator(LogicalKeyboardKey.keyM, meta: true):
+            _FocusMessageSearchShortcutIntent(),
+        SingleActivator(LogicalKeyboardKey.keyA, control: true, shift: true):
+            _AttachFileShortcutIntent(),
+        SingleActivator(LogicalKeyboardKey.keyA, meta: true, shift: true):
+            _AttachFileShortcutIntent(),
+        SingleActivator(LogicalKeyboardKey.keyR, control: true, shift: true):
+            _ReconnectShortcutIntent(),
+        SingleActivator(LogicalKeyboardKey.keyR, meta: true, shift: true):
+            _ReconnectShortcutIntent(),
+      },
+      child: Actions(
+        actions: <Type, Action<Intent>>{
+          _SendShortcutIntent: CallbackAction<_SendShortcutIntent>(
+            onInvoke: (_) {
+              if (_selectedTab == 0 && canSend) {
+                _sendMessage(chatProvider);
+              }
+              return null;
+            },
           ),
-          IconButton(
-            tooltip: 'Настройки подключения',
-            onPressed: () => _openConnectionSheet(chatProvider),
-            icon: const Icon(Icons.cloud_outlined),
-          ),
-          IconButton(
-            tooltip: chatProvider.isConnected ? 'Отключиться' : 'Подключиться',
-            onPressed: chatProvider.isConnected
-                ? chatProvider.disconnect
-                : () => chatProvider.connect(force: true),
-            icon: Icon(
-              chatProvider.isConnected
-                  ? Icons.link_off_rounded
-                  : Icons.link_rounded,
-            ),
-          ),
-          IconButton(
-            tooltip: 'Уведомления',
-            onPressed: () => _openNotificationsSheet(chatProvider),
-            icon: Stack(
-              clipBehavior: Clip.none,
-              children: [
-                const Icon(Icons.notifications_outlined),
-                if (chatProvider.notificationCount > 0)
-                  Positioned(
-                    right: -4,
-                    top: -4,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 5,
-                        vertical: 2,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Theme.of(context).colorScheme.primary,
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: Text(
-                        chatProvider.notificationCount > 99
-                            ? '99+'
-                            : chatProvider.notificationCount.toString(),
-                        style: const TextStyle(
-                          fontSize: 10,
-                          color: Colors.white,
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                    ),
-                  ),
-              ],
-            ),
-          ),
-          PopupMenuButton<ThemeMode>(
-            tooltip: 'Тема',
-            initialValue: chatProvider.themeMode,
-            onSelected: chatProvider.setThemeMode,
-            icon: Icon(_themeIcon(chatProvider.themeMode)),
-            itemBuilder: (context) => const [
-              PopupMenuItem(
-                value: ThemeMode.light,
-                child: Text('Светлая тема'),
+          _CancelReplyShortcutIntent:
+              CallbackAction<_CancelReplyShortcutIntent>(
+                onInvoke: (_) {
+                  if (_selectedTab == 0) {
+                    _cancelReply();
+                  }
+                  return null;
+                },
               ),
-              PopupMenuItem(value: ThemeMode.dark, child: Text('Тёмная тема')),
-              PopupMenuItem(
-                value: ThemeMode.system,
-                child: Text('Как в системе'),
-              ),
-            ],
+          _FocusChatsShortcutIntent: CallbackAction<_FocusChatsShortcutIntent>(
+            onInvoke: (_) {
+              if (_selectedTab == 0) {
+                _chatSearchFocusNode.requestFocus();
+              }
+              return null;
+            },
           ),
-          const SizedBox(width: 8),
-        ],
-      ),
-      body: SafeArea(
-        child: _selectedTab == 0
-            ? _buildChatTab(chatProvider, chats, messages, canSend)
-            : _buildSettingsTab(chatProvider),
-      ),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _selectedTab,
-        onDestinationSelected: (index) {
-          setState(() {
-            _selectedTab = index;
-          });
-          if (index == 0) {
-            _ensureMessageInputFocus(force: true);
-          }
+          _FocusMessageSearchShortcutIntent:
+              CallbackAction<_FocusMessageSearchShortcutIntent>(
+                onInvoke: (_) {
+                  if (_selectedTab == 0) {
+                    _messageSearchFocusNode.requestFocus();
+                    _messageSearchController.selection = TextSelection(
+                      baseOffset: 0,
+                      extentOffset: _messageSearchController.text.length,
+                    );
+                  }
+                  return null;
+                },
+              ),
+          _AttachFileShortcutIntent: CallbackAction<_AttachFileShortcutIntent>(
+            onInvoke: (_) {
+              if (_selectedTab == 0) {
+                unawaited(_sendFile(chatProvider));
+              }
+              return null;
+            },
+          ),
+          _ReconnectShortcutIntent: CallbackAction<_ReconnectShortcutIntent>(
+            onInvoke: (_) {
+              unawaited(_reconnect(chatProvider));
+              return null;
+            },
+          ),
         },
-        destinations: const [
-          NavigationDestination(
-            icon: Icon(Icons.chat_bubble_outline_rounded),
-            selectedIcon: Icon(Icons.chat_bubble_rounded),
-            label: 'Чат',
+        child: Focus(
+          autofocus: true,
+          child: Scaffold(
+            appBar: AppBar(
+              title: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'NetMax Messenger',
+                    style: TextStyle(fontWeight: FontWeight.w600, fontSize: 20),
+                  ),
+                  Text(
+                    chatProvider.connectionStatusLine,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: _statusColor(chatProvider),
+                    ),
+                  ),
+                ],
+              ),
+              actions: [
+                IconButton(
+                  tooltip: 'Проверить обновления',
+                  onPressed: chatProvider.isCheckingUpdates
+                      ? null
+                      : () => _checkForUpdates(chatProvider),
+                  icon: Stack(
+                    clipBehavior: Clip.none,
+                    children: [
+                      Icon(
+                        chatProvider.isCheckingUpdates
+                            ? Icons.sync_rounded
+                            : Icons.system_update_alt_rounded,
+                      ),
+                      if (chatProvider.isUpdateAvailable)
+                        Positioned(
+                          right: -4,
+                          top: -4,
+                          child: Container(
+                            width: 9,
+                            height: 9,
+                            decoration: BoxDecoration(
+                              color: Colors.redAccent,
+                              borderRadius: BorderRadius.circular(16),
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+                IconButton(
+                  tooltip: 'Параметры входа',
+                  onPressed: () => _openConnectionSheet(chatProvider),
+                  icon: const Icon(Icons.cloud_outlined),
+                ),
+                IconButton(
+                  tooltip: chatProvider.isConnected
+                      ? 'Отключиться'
+                      : 'Подключиться',
+                  onPressed: chatProvider.isConnected
+                      ? chatProvider.disconnect
+                      : () => chatProvider.connect(force: true),
+                  icon: Icon(
+                    chatProvider.isConnected
+                        ? Icons.link_off_rounded
+                        : Icons.link_rounded,
+                  ),
+                ),
+                IconButton(
+                  tooltip: 'Уведомления',
+                  onPressed: () => _openNotificationsSheet(chatProvider),
+                  icon: Stack(
+                    clipBehavior: Clip.none,
+                    children: [
+                      const Icon(Icons.notifications_outlined),
+                      if (chatProvider.notificationCount > 0)
+                        Positioned(
+                          right: -4,
+                          top: -4,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 5,
+                              vertical: 2,
+                            ),
+                            decoration: BoxDecoration(
+                              color: Theme.of(context).colorScheme.primary,
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: Text(
+                              chatProvider.notificationCount > 99
+                                  ? '99+'
+                                  : chatProvider.notificationCount.toString(),
+                              style: const TextStyle(
+                                fontSize: 10,
+                                color: Colors.white,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+                PopupMenuButton<ThemeMode>(
+                  tooltip: 'Тема',
+                  initialValue: chatProvider.themeMode,
+                  onSelected: chatProvider.setThemeMode,
+                  icon: Icon(_themeIcon(chatProvider.themeMode)),
+                  itemBuilder: (context) => const [
+                    PopupMenuItem(
+                      value: ThemeMode.light,
+                      child: Text('Светлая тема'),
+                    ),
+                    PopupMenuItem(
+                      value: ThemeMode.dark,
+                      child: Text('Тёмная тема'),
+                    ),
+                    PopupMenuItem(
+                      value: ThemeMode.system,
+                      child: Text('Как в системе'),
+                    ),
+                  ],
+                ),
+                const SizedBox(width: 8),
+              ],
+            ),
+            body: SafeArea(
+              child: _selectedTab == 0
+                  ? _buildChatTab(chatProvider, chats, messages, canSend)
+                  : _buildSettingsTab(chatProvider),
+            ),
+            bottomNavigationBar: NavigationBar(
+              selectedIndex: _selectedTab,
+              onDestinationSelected: (index) {
+                setState(() {
+                  _selectedTab = index;
+                });
+                if (index == 0) {
+                  _ensureMessageInputFocus(force: true);
+                }
+              },
+              destinations: const [
+                NavigationDestination(
+                  icon: Icon(Icons.chat_bubble_outline_rounded),
+                  selectedIcon: Icon(Icons.chat_bubble_rounded),
+                  label: 'Чат',
+                ),
+                NavigationDestination(
+                  icon: Icon(Icons.settings_outlined),
+                  selectedIcon: Icon(Icons.settings_rounded),
+                  label: 'Настройки',
+                ),
+              ],
+            ),
           ),
-          NavigationDestination(
-            icon: Icon(Icons.settings_outlined),
-            selectedIcon: Icon(Icons.settings_rounded),
-            label: 'Настройки',
-          ),
-        ],
+        ),
       ),
     );
   }
@@ -1290,7 +1417,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     required bool canSend,
     VoidCallback? onOpenChats,
   }) {
-    final visibleMessages = _filteredMessagesForView(chatProvider, messages);
+    final allVisibleMessages = _filteredMessagesForView(chatProvider, messages);
+    final totalVisible = allVisibleMessages.length;
+    final startIndex = totalVisible > _visibleMessageLimit
+        ? totalVisible - _visibleMessageLimit
+        : 0;
+    final visibleMessages = startIndex == 0
+        ? allVisibleMessages
+        : allVisibleMessages.sublist(startIndex);
+    final hiddenCount = startIndex;
     final pinned = chatProvider.pinnedMessageForSelectedChat;
     final searchActive = _messageSearchController.text.trim().isNotEmpty;
 
@@ -1334,6 +1469,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
           child: TextField(
             controller: _messageSearchController,
+            focusNode: _messageSearchFocusNode,
             onChanged: (_) => setState(() {}),
             decoration: InputDecoration(
               hintText: 'Поиск по сообщениям в текущем чате',
@@ -1382,6 +1518,18 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     icon: const Icon(Icons.close_rounded, size: 18),
                   ),
                 ],
+              ),
+            ),
+          ),
+        if (hiddenCount > 0)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                onPressed: _showMoreMessages,
+                icon: const Icon(Icons.expand_less_rounded),
+                label: Text('Показать ещё ($hiddenCount)'),
               ),
             ),
           ),
@@ -1599,8 +1747,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       ),
                     ),
                     const SizedBox(height: 8),
-                    Text('Сервер: ${chatProvider.serverUrl}'),
-                    const SizedBox(height: 4),
                     Text('Пользователь: ${chatProvider.userName}'),
                     const SizedBox(height: 4),
                     Text(
@@ -1610,7 +1756,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     FilledButton.tonalIcon(
                       onPressed: () => _openConnectionSheet(chatProvider),
                       icon: const Icon(Icons.cloud_outlined),
-                      label: const Text('Изменить подключение'),
+                      label: const Text('Параметры входа'),
                     ),
                   ],
                 ),
@@ -1822,6 +1968,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         : ((reply.text ?? '').trim().isEmpty
               ? (reply.attachment?.name ?? 'Файл')
               : (reply.text ?? '').trim());
+    final queuedCount = chatProvider.queuedOutgoingTextCount;
+    final hasMessageSearch = _messageSearchController.text.trim().isNotEmpty;
+    final showQuickActions =
+        queuedCount > 0 ||
+        reply != null ||
+        hasMessageSearch ||
+        !chatProvider.isConnected;
 
     return Padding(
       padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
@@ -1920,6 +2073,58 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 ],
               ),
             ),
+          if (showQuickActions)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  if (reply != null)
+                    ActionChip(
+                      avatar: const Icon(Icons.reply_rounded, size: 16),
+                      label: const Text('Отменить ответ'),
+                      onPressed: _cancelReply,
+                    ),
+                  if (hasMessageSearch)
+                    ActionChip(
+                      avatar: const Icon(Icons.search_off_rounded, size: 16),
+                      label: const Text('Сбросить поиск'),
+                      onPressed: () {
+                        _messageSearchController.clear();
+                        setState(() {});
+                      },
+                    ),
+                  ActionChip(
+                    avatar: Icon(
+                      chatProvider.isConnected
+                          ? Icons.restart_alt_rounded
+                          : Icons.link_rounded,
+                      size: 16,
+                    ),
+                    label: Text(
+                      chatProvider.isConnected
+                          ? 'Переподключить'
+                          : 'Подключиться',
+                    ),
+                    onPressed: () => unawaited(_reconnect(chatProvider)),
+                  ),
+                  ActionChip(
+                    avatar: const Icon(
+                      Icons.vertical_align_bottom_rounded,
+                      size: 16,
+                    ),
+                    label: const Text('Вниз'),
+                    onPressed: _scrollToBottom,
+                  ),
+                  if (queuedCount > 0)
+                    Chip(
+                      avatar: const Icon(Icons.cloud_upload_rounded, size: 16),
+                      label: Text('В очереди: $queuedCount'),
+                    ),
+                ],
+              ),
+            ),
           Row(
             children: [
               IconButton.filledTonal(
@@ -1975,7 +2180,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   decoration: InputDecoration(
                     hintText: chatProvider.isConnected
                         ? 'Сообщение в ${chatProvider.selectedChatTitle}'
-                        : 'Сначала подключитесь к серверу',
+                        : 'Сообщение в ${chatProvider.selectedChatTitle} (уйдет в очередь)',
                   ),
                 ),
               ),
@@ -1993,9 +2198,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _openConnectionSheet(ChatProvider chatProvider) {
-    final serverController = TextEditingController(
-      text: chatProvider.serverUrl,
-    );
     final subscriptionController = TextEditingController(
       text: chatProvider.subscriptionSourcesText,
     );
@@ -2038,21 +2240,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const Text(
-                    'Подключение к серверу',
+                    'Параметры входа',
                     style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
                   ),
                   const SizedBox(height: 8),
-                  const Text('Укажите адрес сервера и способ авторизации.'),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: serverController,
-                    keyboardType: TextInputType.url,
-                    decoration: const InputDecoration(
-                      labelText: 'Server URL',
-                      hintText: 'wss://155.212.141.80/ws',
-                    ),
+                  const Text(
+                    'Выберите способ авторизации и параметры аккаунта.',
                   ),
-                  const SizedBox(height: 10),
+                  const SizedBox(height: 12),
                   DropdownButtonFormField<ChatAuthMode>(
                     key: ValueKey<ChatAuthMode>(selectedAuthMode),
                     initialValue: selectedAuthMode,
@@ -2203,7 +2398,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                                   try {
                                     final info = await chatProvider
                                         .requestEmailAuthCode(
-                                          serverUrl: serverController.text,
                                           phone: phoneController.text,
                                           email: emailController.text,
                                         );
@@ -2292,7 +2486,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                           onPressed: () async {
                             try {
                               await chatProvider.applyConnectionSettings(
-                                serverUrl: serverController.text,
                                 userName: userController.text,
                                 password: passwordController.text,
                                 subscriptionSources:
@@ -2339,7 +2532,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       },
     );
     return future.whenComplete(() {
-      serverController.dispose();
       subscriptionController.dispose();
       proxySubscriptionController.dispose();
       userController.dispose();
@@ -2478,4 +2670,28 @@ class _MentionQueryContext {
   final int start;
   final int end;
   final String query;
+}
+
+class _SendShortcutIntent extends Intent {
+  const _SendShortcutIntent();
+}
+
+class _CancelReplyShortcutIntent extends Intent {
+  const _CancelReplyShortcutIntent();
+}
+
+class _FocusChatsShortcutIntent extends Intent {
+  const _FocusChatsShortcutIntent();
+}
+
+class _FocusMessageSearchShortcutIntent extends Intent {
+  const _FocusMessageSearchShortcutIntent();
+}
+
+class _AttachFileShortcutIntent extends Intent {
+  const _AttachFileShortcutIntent();
+}
+
+class _ReconnectShortcutIntent extends Intent {
+  const _ReconnectShortcutIntent();
 }

@@ -355,17 +355,34 @@ class MessageBubble extends StatelessWidget {
                 ],
                 if (isMine && !message.isDeleted) ...[
                   const SizedBox(width: 6),
-                  Icon(
-                    message.readBy.length > 1
-                        ? Icons.done_all_rounded
-                        : (message.deliveredTo.length > 1
-                              ? Icons.done_all_rounded
-                              : Icons.done_rounded),
-                    size: 15,
-                    color: message.readBy.length > 1
-                        ? Colors.lightBlueAccent
-                        : textColor.withAlpha(170),
-                  ),
+                  switch (message.localState) {
+                    MessageLocalState.sending => Icon(
+                      Icons.schedule_rounded,
+                      size: 15,
+                      color: textColor.withAlpha(170),
+                    ),
+                    MessageLocalState.queued => Icon(
+                      Icons.cloud_upload_rounded,
+                      size: 15,
+                      color: Colors.orangeAccent,
+                    ),
+                    MessageLocalState.failed => Icon(
+                      Icons.error_outline_rounded,
+                      size: 15,
+                      color: Colors.redAccent,
+                    ),
+                    _ => Icon(
+                      message.readBy.length > 1
+                          ? Icons.done_all_rounded
+                          : (message.deliveredTo.length > 1
+                                ? Icons.done_all_rounded
+                                : Icons.done_rounded),
+                      size: 15,
+                      color: message.readBy.length > 1
+                          ? Colors.lightBlueAccent
+                          : textColor.withAlpha(170),
+                    ),
+                  },
                 ],
               ],
             ),

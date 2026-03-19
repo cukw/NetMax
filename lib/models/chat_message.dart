@@ -22,6 +22,28 @@ extension MessageTypeX on MessageType {
   }
 }
 
+enum MessageLocalState { none, sending, queued, failed }
+
+extension MessageLocalStateX on MessageLocalState {
+  String get value {
+    return switch (this) {
+      MessageLocalState.none => 'none',
+      MessageLocalState.sending => 'sending',
+      MessageLocalState.queued => 'queued',
+      MessageLocalState.failed => 'failed',
+    };
+  }
+
+  static MessageLocalState fromValue(String raw) {
+    return switch (raw.toLowerCase()) {
+      'sending' => MessageLocalState.sending,
+      'queued' => MessageLocalState.queued,
+      'failed' => MessageLocalState.failed,
+      _ => MessageLocalState.none,
+    };
+  }
+}
+
 class MessageAttachment {
   const MessageAttachment({
     required this.name,
@@ -158,6 +180,7 @@ class ChatMessage {
     this.readBy = const <String>[],
     this.isEncrypted = false,
     this.encryption,
+    this.localState = MessageLocalState.none,
     this.text,
     this.attachment,
     this.replyTo,
@@ -232,6 +255,9 @@ class ChatMessage {
           : json['encryption'] is Map
           ? (json['encryption'] as Map).cast<String, dynamic>()
           : null,
+      localState: MessageLocalStateX.fromValue(
+        json['localState']?.toString() ?? 'none',
+      ),
       text: json['text']?.toString(),
       attachment: attachmentJson is Map<String, dynamic>
           ? MessageAttachment.fromJson(attachmentJson)
@@ -349,6 +375,7 @@ class ChatMessage {
   final List<String> readBy;
   final bool isEncrypted;
   final Map<String, dynamic>? encryption;
+  final MessageLocalState localState;
   final String? text;
   final MessageAttachment? attachment;
   final MessageReplyInfo? replyTo;
@@ -386,6 +413,7 @@ class ChatMessage {
     List<String>? readBy,
     bool? isEncrypted,
     Map<String, dynamic>? encryption,
+    MessageLocalState? localState,
     String? text,
     MessageAttachment? attachment,
     MessageReplyInfo? replyTo,
@@ -410,6 +438,7 @@ class ChatMessage {
       readBy: readBy ?? this.readBy,
       isEncrypted: isEncrypted ?? this.isEncrypted,
       encryption: encryption ?? this.encryption,
+      localState: localState ?? this.localState,
       text: text ?? this.text,
       attachment: attachment ?? this.attachment,
       replyTo: replyTo ?? this.replyTo,
@@ -437,6 +466,7 @@ class ChatMessage {
       'readBy': readBy,
       'encrypted': isEncrypted,
       'encryption': encryption,
+      'localState': localState.value,
       'text': text,
       'attachment': attachment?.toJson(),
       'replyTo': replyTo?.toJson(),
