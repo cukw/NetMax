@@ -21,6 +21,7 @@ import '../models/app_notification.dart';
 import '../models/chat_message.dart';
 import '../models/chat_thread.dart';
 import '../models/chat_user.dart';
+import '../services/http_client_factory.dart';
 import '../services/mesh_transport_service.dart';
 import '../services/mesh_transport_service_base.dart';
 import '../services/proxy_transport_service.dart';
@@ -73,6 +74,10 @@ class ChatProvider extends ChangeNotifier {
   );
   static const bool _meshFallbackEnabled = bool.fromEnvironment(
     'NETMAX_ENABLE_MESH_FALLBACK',
+    defaultValue: false,
+  );
+  static const bool _allowSelfSignedCert = bool.fromEnvironment(
+    'NETMAX_ALLOW_SELF_SIGNED_CERT',
     defaultValue: false,
   );
   static const String _defaultSubscriptionSourcesRaw = String.fromEnvironment(
@@ -1075,19 +1080,27 @@ class ChatProvider extends ChangeNotifier {
     }
 
     final uri = _emailCodeRequestUriFromServerUrl(_serverUrl);
-    final response = await http
-        .post(
-          uri,
-          headers: const {
-            'accept': 'application/json',
-            'content-type': 'application/json',
-          },
-          body: jsonEncode(<String, dynamic>{
-            'phone': normalizedPhone,
-            'email': normalizedEmail,
-          }),
-        )
-        .timeout(const Duration(seconds: 10));
+    final client = createNetMaxHttpClient(
+      allowBadCertificates: _allowSelfSignedCert,
+    );
+    late final http.Response response;
+    try {
+      response = await client
+          .post(
+            uri,
+            headers: const {
+              'accept': 'application/json',
+              'content-type': 'application/json',
+            },
+            body: jsonEncode(<String, dynamic>{
+              'phone': normalizedPhone,
+              'email': normalizedEmail,
+            }),
+          )
+          .timeout(const Duration(seconds: 10));
+    } finally {
+      client.close();
+    }
 
     Map<String, dynamic> payload = <String, dynamic>{};
     try {
@@ -1247,6 +1260,7 @@ class ChatProvider extends ChangeNotifier {
       final session = await _proxyTransport.openWebSocket(
         uri: uri,
         proxy: proxy,
+        allowBadCertificates: _allowSelfSignedCert,
       );
       _channelResourceDisposer = session.dispose;
       _channel = session.channel;
@@ -2421,13 +2435,18 @@ class ChatProvider extends ChangeNotifier {
     required String caption,
     required Map<String, dynamic> forwardedFrom,
   }) async {
+    final client = createNetMaxHttpClient(
+      allowBadCertificates: _allowSelfSignedCert,
+    );
     late final http.Response response;
     try {
-      response = await http.get(
+      response = await client.get(
         _attachmentUri(attachment, forceDownload: false),
       );
     } catch (_) {
       return 'Не удалось загрузить файл для пересылки.';
+    } finally {
+      client.close();
     }
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
@@ -3401,6 +3420,7 @@ class ChatProvider extends ChangeNotifier {
         healthUri: healthUri,
         timeout: _subscriptionProbeTimeout,
         proxy: proxy,
+        allowBadCertificates: _allowSelfSignedCert,
       );
       return _ServerProbeResult(
         serverUrl: serverUrl,
@@ -4098,9 +4118,17 @@ class ChatProvider extends ChangeNotifier {
   }
 
   Future<Map<String, dynamic>> _loadJson(Uri uri) async {
-    final response = await http
-        .get(uri, headers: const {'accept': 'application/json'})
-        .timeout(const Duration(seconds: 10));
+    final client = createNetMaxHttpClient(
+      allowBadCertificates: _allowSelfSignedCert,
+    );
+    late final http.Response response;
+    try {
+      response = await client
+          .get(uri, headers: const {'accept': 'application/json'})
+          .timeout(const Duration(seconds: 10));
+    } finally {
+      client.close();
+    }
 
     if (response.statusCode != 200) {
       throw Exception(

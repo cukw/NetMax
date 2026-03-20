@@ -14,6 +14,7 @@ env:
   FLUTTER_VERSION: 3.38.5
   BUILD_NUMBER: ${{ github.run_number }}
   DEFAULT_SERVER_URL: wss://155.212.141.80/ws
+  DEFAULT_ALLOW_SELF_SIGNED_CERT: "false"
 
 permissions:
   contents: write
@@ -75,10 +76,14 @@ jobs:
       - name: Build APK
         run: |
           SERVER_URL="${{ vars.NETMAX_SERVER_URL }}"
+          ALLOW_SELF_SIGNED_CERT="${{ vars.NETMAX_ALLOW_SELF_SIGNED_CERT }}"
           if [ -z "${SERVER_URL}" ]; then
             SERVER_URL="${{ env.DEFAULT_SERVER_URL }}"
           fi
-          flutter build apk --release --build-number=${{ env.BUILD_NUMBER }} --dart-define=NETMAX_SERVER_URL="${SERVER_URL}"
+          if [ -z "${ALLOW_SELF_SIGNED_CERT}" ]; then
+            ALLOW_SELF_SIGNED_CERT="${{ env.DEFAULT_ALLOW_SELF_SIGNED_CERT }}"
+          fi
+          flutter build apk --release --build-number=${{ env.BUILD_NUMBER }} --dart-define=NETMAX_SERVER_URL="${SERVER_URL}" --dart-define=NETMAX_ALLOW_SELF_SIGNED_CERT="${ALLOW_SELF_SIGNED_CERT}"
 
       - name: Upload Android Artifact
         uses: actions/upload-artifact@v4
@@ -115,10 +120,14 @@ jobs:
       - name: Build Linux
         run: |
           SERVER_URL="${{ vars.NETMAX_SERVER_URL }}"
+          ALLOW_SELF_SIGNED_CERT="${{ vars.NETMAX_ALLOW_SELF_SIGNED_CERT }}"
           if [ -z "${SERVER_URL}" ]; then
             SERVER_URL="${{ env.DEFAULT_SERVER_URL }}"
           fi
-          flutter build linux --release --build-number=${{ env.BUILD_NUMBER }} --dart-define=NETMAX_SERVER_URL="${SERVER_URL}"
+          if [ -z "${ALLOW_SELF_SIGNED_CERT}" ]; then
+            ALLOW_SELF_SIGNED_CERT="${{ env.DEFAULT_ALLOW_SELF_SIGNED_CERT }}"
+          fi
+          flutter build linux --release --build-number=${{ env.BUILD_NUMBER }} --dart-define=NETMAX_SERVER_URL="${SERVER_URL}" --dart-define=NETMAX_ALLOW_SELF_SIGNED_CERT="${ALLOW_SELF_SIGNED_CERT}"
 
       - name: Package Linux Artifact
         run: tar -czf netmax-linux-x64.tar.gz -C build/linux/x64/release bundle
@@ -153,10 +162,14 @@ jobs:
       - name: Build Windows
         run: |
           $serverUrl = "${{ vars.NETMAX_SERVER_URL }}"
+          $allowSelfSignedCert = "${{ vars.NETMAX_ALLOW_SELF_SIGNED_CERT }}"
           if ([string]::IsNullOrWhiteSpace($serverUrl)) {
             $serverUrl = "${{ env.DEFAULT_SERVER_URL }}"
           }
-          flutter build windows --release --build-number=${{ env.BUILD_NUMBER }} --dart-define=NETMAX_SERVER_URL=$serverUrl
+          if ([string]::IsNullOrWhiteSpace($allowSelfSignedCert)) {
+            $allowSelfSignedCert = "${{ env.DEFAULT_ALLOW_SELF_SIGNED_CERT }}"
+          }
+          flutter build windows --release --build-number=${{ env.BUILD_NUMBER }} --dart-define=NETMAX_SERVER_URL=$serverUrl --dart-define=NETMAX_ALLOW_SELF_SIGNED_CERT=$allowSelfSignedCert
 
       - name: Package Windows Artifact
         shell: pwsh
@@ -192,10 +205,14 @@ jobs:
       - name: Build macOS
         run: |
           SERVER_URL="${{ vars.NETMAX_SERVER_URL }}"
+          ALLOW_SELF_SIGNED_CERT="${{ vars.NETMAX_ALLOW_SELF_SIGNED_CERT }}"
           if [ -z "${SERVER_URL}" ]; then
             SERVER_URL="${{ env.DEFAULT_SERVER_URL }}"
           fi
-          flutter build macos --release --build-number=${{ env.BUILD_NUMBER }} --dart-define=NETMAX_SERVER_URL="${SERVER_URL}"
+          if [ -z "${ALLOW_SELF_SIGNED_CERT}" ]; then
+            ALLOW_SELF_SIGNED_CERT="${{ env.DEFAULT_ALLOW_SELF_SIGNED_CERT }}"
+          fi
+          flutter build macos --release --build-number=${{ env.BUILD_NUMBER }} --dart-define=NETMAX_SERVER_URL="${SERVER_URL}" --dart-define=NETMAX_ALLOW_SELF_SIGNED_CERT="${ALLOW_SELF_SIGNED_CERT}"
 
       - name: Package macOS Artifact
         run: ditto -c -k --sequesterRsrc --keepParent "build/macos/Build/Products/Release/netmax_messenger.app" "netmax-macos.app.zip"
@@ -203,10 +220,14 @@ jobs:
       - name: Build iOS (Unsigned)
         run: |
           SERVER_URL="${{ vars.NETMAX_SERVER_URL }}"
+          ALLOW_SELF_SIGNED_CERT="${{ vars.NETMAX_ALLOW_SELF_SIGNED_CERT }}"
           if [ -z "${SERVER_URL}" ]; then
             SERVER_URL="${{ env.DEFAULT_SERVER_URL }}"
           fi
-          flutter build ios --release --no-codesign --build-number=${{ env.BUILD_NUMBER }} --dart-define=NETMAX_SERVER_URL="${SERVER_URL}"
+          if [ -z "${ALLOW_SELF_SIGNED_CERT}" ]; then
+            ALLOW_SELF_SIGNED_CERT="${{ env.DEFAULT_ALLOW_SELF_SIGNED_CERT }}"
+          fi
+          flutter build ios --release --no-codesign --build-number=${{ env.BUILD_NUMBER }} --dart-define=NETMAX_SERVER_URL="${SERVER_URL}" --dart-define=NETMAX_ALLOW_SELF_SIGNED_CERT="${ALLOW_SELF_SIGNED_CERT}"
 
       - name: Package iOS Artifact
         run: |
@@ -253,10 +274,14 @@ jobs:
       - name: Build Web
         run: |
           SERVER_URL="${{ vars.NETMAX_SERVER_URL }}"
+          ALLOW_SELF_SIGNED_CERT="${{ vars.NETMAX_ALLOW_SELF_SIGNED_CERT }}"
           if [ -z "${SERVER_URL}" ]; then
             SERVER_URL="${{ env.DEFAULT_SERVER_URL }}"
           fi
-          flutter build web --release --base-href / --build-number=${{ env.BUILD_NUMBER }} --dart-define=NETMAX_SERVER_URL="${SERVER_URL}"
+          if [ -z "${ALLOW_SELF_SIGNED_CERT}" ]; then
+            ALLOW_SELF_SIGNED_CERT="${{ env.DEFAULT_ALLOW_SELF_SIGNED_CERT }}"
+          fi
+          flutter build web --release --base-href / --build-number=${{ env.BUILD_NUMBER }} --dart-define=NETMAX_SERVER_URL="${SERVER_URL}" --dart-define=NETMAX_ALLOW_SELF_SIGNED_CERT="${ALLOW_SELF_SIGNED_CERT}"
 
       - name: Package Web Artifact
         run: cd build/web && zip -r ../../netmax-web.zip .

@@ -41,10 +41,12 @@ abstract class ProxyTransportServiceBase {
     required Uri healthUri,
     required Duration timeout,
     ProxyEndpoint? proxy,
+    bool allowBadCertificates = false,
   });
 
   Future<ProxyWebSocketSession> openWebSocket({
     required Uri uri,
     ProxyEndpoint? proxy,
+    bool allowBadCertificates = false,
   });
 }

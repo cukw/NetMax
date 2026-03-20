@@ -21,8 +21,12 @@ class _IoProxyTransportService implements ProxyTransportServiceBase {
     required Uri healthUri,
     required Duration timeout,
     ProxyEndpoint? proxy,
+    bool allowBadCertificates = false,
   }) async {
-    final client = await _buildClient(proxy);
+    final client = await _buildClient(
+      proxy,
+      allowBadCertificates: allowBadCertificates,
+    );
     try {
       final started = DateTime.now();
       final request = await client.getUrl(healthUri).timeout(timeout);
@@ -43,15 +47,12 @@ class _IoProxyTransportService implements ProxyTransportServiceBase {
   Future<ProxyWebSocketSession> openWebSocket({
     required Uri uri,
     ProxyEndpoint? proxy,
+    bool allowBadCertificates = false,
   }) async {
-    if (proxy == null) {
-      return ProxyWebSocketSession(
-        channel: IOWebSocketChannel.connect(uri),
-        dispose: () async {},
-      );
-    }
-
-    final client = await _buildClient(proxy);
+    final client = await _buildClient(
+      proxy,
+      allowBadCertificates: allowBadCertificates,
+    );
     final channel = IOWebSocketChannel.connect(uri, customClient: client);
     return ProxyWebSocketSession(
       channel: channel,
@@ -61,8 +62,15 @@ class _IoProxyTransportService implements ProxyTransportServiceBase {
     );
   }
 
-  Future<HttpClient> _buildClient(ProxyEndpoint? proxy) async {
+  Future<HttpClient> _buildClient(
+    ProxyEndpoint? proxy, {
+    required bool allowBadCertificates,
+  }) async {
     final client = HttpClient();
+    if (allowBadCertificates) {
+      client.badCertificateCallback =
+          (X509Certificate cert, String host, int port) => true;
+    }
     if (proxy == null) {
       return client;
     }

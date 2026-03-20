@@ -19,6 +19,7 @@ class _StubProxyTransportService implements ProxyTransportServiceBase {
     required Uri healthUri,
     required Duration timeout,
     ProxyEndpoint? proxy,
+    bool allowBadCertificates = false,
   }) async {
     if (proxy != null) {
       return null;
@@ -39,6 +40,7 @@ class _StubProxyTransportService implements ProxyTransportServiceBase {
   Future<ProxyWebSocketSession> openWebSocket({
     required Uri uri,
     ProxyEndpoint? proxy,
+    bool allowBadCertificates = false,
   }) async {
     final channel = WebSocketChannel.connect(uri);
     return ProxyWebSocketSession(channel: channel, dispose: () async {});
