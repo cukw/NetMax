@@ -383,7 +383,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git pull --rebase origin main
 
           git add backend/config/update_manifest.json
           if git diff --cached --quiet; then
@@ -392,6 +391,7 @@ jobs:
           fi
 
           git commit -m "chore(ci): update update_manifest for ${TAG} [skip ci]"
+          git pull --rebase origin main
           git push origin HEAD:main || {
             echo "First push failed, retry after rebase..."
             git pull --rebase origin main
