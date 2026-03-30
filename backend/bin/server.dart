@@ -678,6 +678,11 @@ Future<void> _loadMessagesFromNoSqlToMemory() async {
   for (final row in rows) {
     final id = (row['_id']?.toString() ?? '').trim();
     final parsed = _asMap(row['payload']);
+    final payloadCreatedAt = (parsed['createdAt']?.toString() ?? '').trim();
+    final rowCreatedAt = (row['created_at']?.toString() ?? '').trim();
+    if (payloadCreatedAt.isEmpty && rowCreatedAt.isNotEmpty) {
+      parsed['createdAt'] = rowCreatedAt;
+    }
 
     final normalized = _normalizeLoadedMessage(parsed);
     if (normalized == null) {
@@ -758,12 +763,20 @@ Future<void> _upsertMessageInNoSql(Map<String, dynamic> message) async {
 
 Map<String, dynamic> _messageRecordFromPayload(Map<String, dynamic> message) {
   final id = _normalizeMessageId(message['id']);
+  final createdAtSource =
+      message['createdAt'] ??
+      message['created_at'] ??
+      message['createdAtIso'] ??
+      message['timestamp'];
+  final normalizedCreatedAt = _normalizeIsoTimestamp(createdAtSource);
+  final payload = Map<String, dynamic>.from(message);
+  payload['createdAt'] = normalizedCreatedAt;
   return <String, dynamic>{
     '_id': id,
-    'created_at': _normalizeIsoTimestamp(message['createdAt']),
+    'created_at': normalizedCreatedAt,
     'chat_id': (message['chatId']?.toString() ?? _defaultGroupChatId).trim(),
     'chat_type': (message['chatType']?.toString() ?? 'group').trim(),
-    'payload': message,
+    'payload': payload,
   };
 }
 
@@ -1284,7 +1297,12 @@ Map<String, dynamic>? _normalizeLoadedMessage(Map<String, dynamic> raw) {
     raw['senderName']?.toString() ?? '',
     maxLength: 80,
   );
-  final createdAt = _normalizeIsoTimestamp(raw['createdAt']);
+  final createdAtSource =
+      raw['createdAt'] ??
+      raw['created_at'] ??
+      raw['createdAtIso'] ??
+      raw['timestamp'];
+  final createdAt = _normalizeIsoTimestamp(createdAtSource);
   final type = (raw['type']?.toString() ?? 'text').trim();
   final isEncrypted = raw['encrypted'] == true || raw['isEncrypted'] == true;
   final textRaw = (raw['text']?.toString() ?? '').trim();

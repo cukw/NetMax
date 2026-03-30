@@ -193,6 +193,11 @@ class ChatMessage {
     final forwardedJson = json['forwardedFrom'];
     final reactionsJson = json['reactions'];
     final editHistoryRaw = json['editHistory'];
+    final createdAtRaw =
+        json['createdAt'] ??
+        json['created_at'] ??
+        json['createdAtIso'] ??
+        json['timestamp'];
 
     return ChatMessage(
       id: json['id']?.toString() ?? '',
@@ -200,8 +205,7 @@ class ChatMessage {
       senderId: json['senderId']?.toString() ?? '',
       senderName: json['senderName']?.toString() ?? 'Unknown',
       createdAt:
-          DateTime.tryParse(json['createdAt']?.toString() ?? '') ??
-          DateTime.now(),
+          DateTime.tryParse(createdAtRaw?.toString() ?? '') ?? DateTime.now(),
       type: MessageTypeX.fromValue(json['type']?.toString() ?? 'text'),
       isScheduled: json['scheduled'] == true,
       isEdited: json['edited'] == true || json['isEdited'] == true,
