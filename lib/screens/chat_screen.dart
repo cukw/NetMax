@@ -367,6 +367,74 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     });
   }
 
+  List<_ConversationTimelineItem> _buildConversationTimeline(
+    List<ChatMessage> messages,
+  ) {
+    final items = <_ConversationTimelineItem>[];
+    DateTime? previousDate;
+
+    for (final message in messages) {
+      final createdAt = message.createdAt.toLocal();
+      final messageDate = DateTime(
+        createdAt.year,
+        createdAt.month,
+        createdAt.day,
+      );
+      if (previousDate == null ||
+          !DateUtils.isSameDay(previousDate, messageDate)) {
+        items.add(
+          _ConversationTimelineItem.date(
+            _formatMessageDateDividerLabel(createdAt),
+          ),
+        );
+        previousDate = messageDate;
+      }
+      items.add(_ConversationTimelineItem.message(message));
+    }
+    return items;
+  }
+
+  String _formatMessageDateDividerLabel(DateTime dateTime) {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final target = DateTime(dateTime.year, dateTime.month, dateTime.day);
+    final dayDiff = today.difference(target).inDays;
+
+    if (dayDiff == 0) {
+      return 'Сегодня';
+    }
+    if (dayDiff == 1) {
+      return 'Вчера';
+    }
+    return DateFormat('d MMMM yyyy', 'ru').format(target);
+  }
+
+  Widget _buildDateDivider(String label) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Row(
+        children: [
+          const Expanded(child: Divider(height: 1)),
+          Container(
+            margin: const EdgeInsets.symmetric(horizontal: 10),
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            decoration: BoxDecoration(
+              color: Theme.of(context).colorScheme.surfaceContainerHighest,
+              borderRadius: BorderRadius.circular(999),
+            ),
+            child: Text(
+              label,
+              style: Theme.of(
+                context,
+              ).textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w600),
+            ),
+          ),
+          const Expanded(child: Divider(height: 1)),
+        ],
+      ),
+    );
+  }
+
   void _updateMentionSuggestions(ChatProvider chatProvider) {
     final text = _messageController.text;
     final selection = _messageController.selection;
@@ -1425,6 +1493,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final visibleMessages = startIndex == 0
         ? allVisibleMessages
         : allVisibleMessages.sublist(startIndex);
+    final timelineItems = _buildConversationTimeline(visibleMessages);
     final hiddenCount = startIndex;
     final pinned = chatProvider.pinnedMessageForSelectedChat;
     final searchActive = _messageSearchController.text.trim().isNotEmpty;
@@ -1537,9 +1606,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           child: ListView.builder(
             controller: _scrollController,
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-            itemCount: visibleMessages.length,
+            itemCount: timelineItems.length,
             itemBuilder: (context, index) {
-              final message = visibleMessages[index];
+              final timelineItem = timelineItems[index];
+              if (timelineItem.isDateDivider) {
+                return _buildDateDivider(timelineItem.dateLabel!);
+              }
+              final message = timelineItem.message!;
               final isMine = chatProvider.isMyMessage(message);
               final voicePlaybackUrl =
                   message.isVoiceMessage && message.attachment != null
@@ -2670,6 +2743,17 @@ class _MentionQueryContext {
   final int start;
   final int end;
   final String query;
+}
+
+class _ConversationTimelineItem {
+  const _ConversationTimelineItem.date(this.dateLabel) : message = null;
+
+  const _ConversationTimelineItem.message(this.message) : dateLabel = null;
+
+  final String? dateLabel;
+  final ChatMessage? message;
+
+  bool get isDateDivider => dateLabel != null;
 }
 
 class _SendShortcutIntent extends Intent {
