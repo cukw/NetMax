@@ -120,7 +120,7 @@ class ChatProvider extends ChangeNotifier {
       return override;
     }
 
-    return 'wss://155.212.141.80/ws';
+    return 'wss://155.212.141.80:8443/ws';
   }
 
   static String? _resolveServerUrlFromBrowserHost() {
@@ -891,7 +891,7 @@ class ChatProvider extends ChangeNotifier {
     try {
       _serverUrl = _normalizeServerUrl(_defaultServerUrl);
     } catch (_) {
-      _serverUrl = 'wss://155.212.141.80/ws';
+      _serverUrl = 'wss://155.212.141.80:8443/ws';
     }
 
     final storedSourcesRaw =
