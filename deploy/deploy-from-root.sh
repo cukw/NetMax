@@ -233,7 +233,7 @@ health_checks() {
   curl -fsS "http://127.0.0.1:8080/health" >/dev/null
 
   log "Checking HTTPS health through Nginx..."
-  curl -kfsS "https://127.0.0.1/health" >/dev/null
+  curl -kfsS "https://127.0.0.1:8443/health" >/dev/null
 
   systemctl is-active --quiet netmax-backend.service || die "netmax-backend.service is not active."
   systemctl is-active --quiet nginx.service || die "nginx.service is not active."
@@ -264,7 +264,7 @@ main() {
   health_checks
 
   log "Deploy completed successfully."
-  log "Public endpoint: wss://${CERT_IP}/ws"
+  log "Public endpoint: wss://${CERT_IP}:8443/ws"
   log "Note: with self-signed cert, clients must trust the certificate."
 }
 

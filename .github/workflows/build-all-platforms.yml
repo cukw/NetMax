@@ -13,7 +13,7 @@ concurrency:
 env:
   FLUTTER_VERSION: 3.38.5
   BUILD_NUMBER: ${{ github.run_number }}
-  DEFAULT_SERVER_URL: wss://155.212.141.80/ws
+  DEFAULT_SERVER_URL: wss://155.212.141.80:8443/ws
   DEFAULT_ALLOW_SELF_SIGNED_CERT: "false"
 
 permissions:

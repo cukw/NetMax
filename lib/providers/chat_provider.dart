@@ -66,6 +66,7 @@ class ChatProvider extends ChangeNotifier {
       'dismissed_update_signature';
   static const String _favoriteMessageIdsKey = 'favorite_message_ids';
   static const String _pinnedByChatKey = 'pinned_by_chat';
+  static const String _fallbackServerUrl = 'wss://155.212.141.80:8443/ws';
 
   static final String _defaultServerUrl = _resolveDefaultServerUrl();
   static const String _serverUrlOverride = String.fromEnvironment(
@@ -120,7 +121,7 @@ class ChatProvider extends ChangeNotifier {
       return override;
     }
 
-    return 'wss://155.212.141.80:8443/ws';
+    return _fallbackServerUrl;
   }
 
   static String? _resolveServerUrlFromBrowserHost() {
@@ -891,7 +892,7 @@ class ChatProvider extends ChangeNotifier {
     try {
       _serverUrl = _normalizeServerUrl(_defaultServerUrl);
     } catch (_) {
-      _serverUrl = 'wss://155.212.141.80:8443/ws';
+      _serverUrl = _fallbackServerUrl;
     }
 
     final storedSourcesRaw =
